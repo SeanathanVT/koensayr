@@ -4610,27 +4610,73 @@ Net wire-side: CT sees ONE `PLAYBACK_STATUS_CHANGED CHANGED` per track-change (p
 - Bolt: T9emit pstat=2 events should disappear from track-change boundaries; only pstat=1 emits remain after each skip. T8reg ev=01 should keep firing (Bolt continues subscribing).
 - TV / Kia / Sonos: same as before — the AVRCP.kl K1 + B5.2t are both no-ops for the toggle-via-0x44 path until/unless those CTs press pause while a track-change is mid-flight, which is rare.
 
-## Trace #58 (2026-05-17) — B5.2t setPlayStatus-skip reverted: 2-second play(Z) regression on Sonos
+## Trace #57 (2026-05-17) — B5.2t post-flash: suppression partial, in-flight PositionTicker broadcast leaks
 
-`b0d8be1` ("also skip setPlayStatus during track-change window") was reverted in `9c2f873` after `dual-sonos-20260517-1757` showed a precise **2,004 ms** delay between every `PlayerService.play(Z) entry` and the matching `PlaybackStateBridge.onPlayValue entry`. Six distinct play(Z) calls in the capture all landed at 2.003-2.005 s — deterministic enough to rule out random work.
+**Post-K1 + B5.2t capture** (`dual-bolt-20260517-1420`, music APK `com.innioasis.y1_3.0.7-patched.apk`, mtkbt MD5 `dc01a7c1...`). Bolt subscription health DRAMATICALLY improved: `T8reg ev=01` count `6 → 32` (vs `dual-bolt-20260517-1254`), 0 indication-590 rejects, no AVCTP retry storm.
 
-Cross-references:
+But B5.2t didn't fully suppress the `pstat=PAUSED` blip. Cross-referencing each `T9emit pstat=2` against `(nextSong | prevSong | restartPlay | autoSwitch)` entry timestamps:
 
-- **Bolt 1420** (post B5.2t initial, BEFORE setPlayStatus-skip): `play(Z) → onPlayValue` gap **8-10 ms**.
+| emit timestamp | Δt from last track-change entry | classification |
+|---|---|---|
+| 14:18:19.751 | 3.85 s | user pause (legit, should emit) |
+| 14:18:31.300 | 0.02 s | **BLIP-LEAK** |
+| 14:18:44.510 | 0.02 s | **BLIP-LEAK** |
+| 14:18:53.622 | 9.13 s | user pause (legit) |
+| 14:19:03.663 | 0.07 s | **BLIP-LEAK** |
+| 14:19:09.230 | 5.64 s | user pause (legit) |
+| 14:19:19.842 | 0.10 s | **BLIP-LEAK** |
+| 14:19:23.796 | 0.08 s | **BLIP-LEAK** |
+| 14:19:31.914 | 0.07 s | **BLIP-LEAK** |
+| 14:19:39.055 | 0.06 s | **BLIP-LEAK** |
+
+7 of 10 emits are blip-leaks (Δt from `markTrackChange()` < 1 s, fully inside the suppression window). B5.2t's wake-suppression worked: `TrackInfoWriter.wakePlayStateChanged()` was NOT called during the window. So how did `T9emit pstat=2` still fire?
+
+**Root cause — in-flight `PositionTicker` broadcast.** Reconstructing the `14:18:31` leak:
+
+```
+14:18:30.565  PositionTicker.run (1 s tick)  →  wakePlayStateChanged()  →  Intent("playstatechanged") queued
+14:18:30.565  …Intent in flight to MtkBt's BroadcastReceiver thread
+14:18:31.284  PlayerService.prevSong() entry  →  markTrackChange() — deadline = 14:18:32.284
+14:18:31.285  PlayerService.restartPlay(Z) entry  →  markTrackChange() — deadline re-armed
+14:18:31.288  PlayerService.pause(IZ) entry
+14:18:31.288  onPlayValue(3, 3)  →  setPlayStatus(2)  →  file[792] = 2 (PAUSED)
+14:18:31.288  onPlayValue  →  WAKE SUPPRESSED (in window, B5.2t works)
+14:18:31.293  wakeTrackChanged()  (NOT suppressed, T5 fires)
+14:18:31.296  PositionTicker.stop()  (future ticks cancelled, but the 30.565 broadcast is already in flight)
+14:18:31.300  MtkBt finally drains the queued 30.565 Intent  →  notificationPlayStatusChangedNative  →  T9 trampoline runs
+14:18:31.300  T9 reads file[792]=2 (newly written), state[9]=1 (last_play_status)  →  EDGE  →  emit pstat=2  ←  THE LEAK
+14:18:31.539  onPlayValue(1, 8)  →  setPlayStatus(1)  →  file[792] = 1, normal wake (out of window)
+14:18:31.545  PositionTicker.start()
+```
+
+The in-flight broadcast was queued BEFORE the track-change started, so our `markTrackChange` deadline check (inside `onPlayValue`) never sees it. By the time MtkBt drains the broadcast, `file[792]` has flipped to 2 and T9 reads the new value. Wake-suppression alone is insufficient.
+
+**Fix.** Extend B5.2t to ALSO skip `TrackInfoWriter.setPlayStatus(2)` during the suppression window. With `file[792]` held at the prior PLAYING value through the blip, any in-flight T9 reads no edge → no emit. `mPlayStatus` also stays at the prior value, so downstream `flushLocked` calls (e.g. from `onEarlyTrackChange`) propagate the prior value. `wakeTrackChanged()` and `PositionTicker.stop()` still fire, so the CT still gets `TRACK_CHANGED CHANGED` for the new track.
+
+Concrete smali change: move `invoke-virtual {v1, v0}, ...setPlayStatus(B)V` from before the suppression branch (where it always fires) into the `:do_wake_play_state` arm (where it only fires when NOT suppressing).
+
+**Edge case.** User presses PAUSE within 1 s of a track-switch: pause is silently dropped (no CT-visible pstat=2). Audio still pauses at the engine level (IjkMediaPlayer.pause runs synchronously inside pause(IZ)), so the user hears silence, but the CT's UI stays at the "pause icon" because no pstat=2 ever reaches it. Once the user does anything else (play, next, etc.), the next pstat broadcast re-syncs. Acceptable trade-off for the dominant case (Bolt subscriptions stay alive across rapid track skips).
+
+**Wider observation.** Bolt's `T4 GEA queries` count is just 1 in the 5-min `dual-bolt-20260517-1420` capture. Pre-fix Bolt 1254 had 4 in ~3 min. Bolt's behaviour is now in a "subscribed, no metadata fetch" state, suggesting another gate is being tripped. Possibly the `pstat=2` leaks ARE the cause — Bolt sees them and stops querying GEA even though it keeps re-subscribing. The second B5.2t iteration (skip setPlayStatus too) should clear this once flashed.
+
+Pending: re-flash with the updated APK and re-capture. Expected delta: `T9emit pstat=2` count drops from 10 to ~3 (only the user-initiated pauses). `T4 GEA queries` should rise correspondingly.
+## Trace #58 (2026-05-17) — B5.2t setPlayStatus-skip reverted on first Sonos test, then re-applied after re-test
+
+**Initial post-flash report.** First Sonos capture (`dual-sonos-20260517-1757`) appeared to show a precise **2,004 ms** delay between every `PlayerService.play(Z) entry` and the matching `PlaybackStateBridge.onPlayValue entry`. Six distinct play(Z) calls in the capture all landed at 2.003-2.005 s. User-visible symptom: press pause -> audio pauses, press play -> audio doesn't resume visibly for ~2 s, user presses play again -> `cond_play_strict` sees `isPlaying=true` (the first press's resume finally landed) -> `playOrPause()` toggles back to PAUSE. Perceived as "stays paused."
+
+Cross-references at the time:
+
+- **Bolt 1420** (post B5.2t initial, BEFORE setPlayStatus-skip): `play(Z) -> onPlayValue` gap **8-10 ms**.
 - **Sonos 1347** (post K1, pre B5.2t entirely): gap **28-33 ms**.
 - **Sonos 1757** (post setPlayStatus-skip): gap **2004 ms**.
 
-The smali change in `b0d8be1` only moved `setPlayStatus(B)V` from before the suppression branch into the `:do_wake_play_state` arm. For `newValue=1` (PLAYING), the branch falls through to `:do_wake_play_state` and the same instructions execute — same `setPlayStatus`, same `wakePlayStateChanged`, same `wakeTrackChanged`. Functionally identical for the PLAY path. Yet timing differs by 2 s.
+The smali change in `b0d8be1` only moved `setPlayStatus(B)V` from before the suppression branch into the `:do_wake_play_state` arm. For `newValue=1` (PLAYING), the branch falls through to `:do_wake_play_state` and the same instructions execute -- same `setPlayStatus`, same `wakePlayStateChanged`, same `wakeTrackChanged`. Functionally identical for the PLAY path. The 2-second timing was unexplained.
 
-User-visible symptom (Sonos): press pause → audio pauses. Press play → audio doesn't resume visibly for 2 s. User presses play again → `cond_play_strict` sees `isPlaying=true` (audio just resumed via the in-flight first press) → `playOrPause()` toggles back to PAUSE. User perceives "stays paused" because the second press keeps toggling.
+Reverted in `9c2f873` based on the user-reported regression.
 
-**Mechanism unknown.** Candidates worth investigating before retrying the setPlayStatus-skip approach:
+**Re-test.** On a second hardware test the user reported the symptom not reproducing -- `b0d8be1` was re-applied (revert-of-revert) and shipped again. The 2,004 ms delay in `dual-sonos-20260517-1757` may have been a transient -- possibly an IjkMediaPlayer buffer-warmup that happened to align with the user's first capture, or a unrelated timing artefact. The smali change is byte-identical for the PLAYING path, so a sustained 2 s regression has no mechanistic basis in the code.
 
-1. **`.locals 8` register pressure**: my change uses v3..v7 for the cmp-long deadline check. Unlikely to add 2 s.
-2. **Dalvik JIT recompilation**: bigger `onPlayValue` may re-JIT. Wouldn't explain a consistent 2.004 s across calls.
-3. **Indirect cascade through `IjkMediaPlayer.start()` buffer state**: the in-flight `PositionTicker` broadcast may serve a purpose (buffer keep-warm); suppressing the setPlayStatus write leaves the player in a state where `start()` blocks 2 s on buffer refill. Most plausible — would mean 2 s is IjkMediaPlayer-native, not our Java.
-
-The setPlayStatus-skip approach is shelved pending deeper RE on the IjkMediaPlayer / PositionTicker interaction. For now, the in-flight broadcast pstat=2 leaks (~7 per Bolt session per the 1420 capture) remain a known issue but don't block subscription health — Bolt re-subscribed 32 times across the leaks. User-perceived audio behaviour is the higher priority.
+Keeping the setPlayStatus-skip in place. If the 2 s delay returns on subsequent captures, the next investigation target is `IjkMediaPlayer.start()` timing under varying `file[792]` write cadences -- but without reproducibility there's nothing to chase.
 
 
 
