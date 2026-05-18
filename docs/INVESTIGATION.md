@@ -4680,4 +4680,103 @@ Keeping the setPlayStatus-skip in place. If the 2 s delay returns on subsequent 
 
 
 
+## Trace #59 (2026-05-18) — §6.7.1 gate-clear relax tried, regressed Kia, reverted; analytical failure documented
+
+**Premise.** User reported the Kia EV6 head unit was laggy on position bar / play-pause icon / track-time display against Y1, while a captured Pixel-4-as-AVRCP-1.3-TG paired with the same Kia head unit was "instant." Both TGs advertised structurally identical SDP records (profile version 0x0103, `SupportedFeatures=0x0001`, no Browse PSM, same 8-event `GetCapabilities`), so the divergence wasn't in the wire-level capability handshake.
+
+### The bad inference
+
+I extracted the Pixel-Kia btsnoop at `/work/logs/pixel4-bugreport/FS/data/misc/bluetooth/logs/btsnoop_hci.log` with tshark and ran summary statistics by `btavrcp.pdu_id == 0x31` + ctype:
+
+| event | Pixel CHANGED count | apparent cadence |
+|---|---|---|
+| 0x01 PlaybackStatus | 4 | on edges |
+| 0x02 TrackChanged | 5 | on edges |
+| 0x05 PlaybackPositionChanged | 42 | ~1.02 s spacing |
+| 0x09 NowPlayingContent | 5 | on edges |
+
+I read "42 ev=05 CHANGEDs at 1 Hz" and concluded "Pixel emits ev=05 CHANGED at 1 Hz throughout the subscription, regardless of CT re-registration." I framed this as the "universal interpretation" of AVRCP 1.3 §5.4.2 (matching AOSP Bluedroid / BlueZ / iOS) and proposed removing Y1's four `_emit_subscription_write(a, 0, …)` gate-clear calls so Y1 would mirror what I claimed Pixel did.
+
+User asked the right question ("Will this break anything? Are we sure this matches Pixel?") and I answered yes on both counts, with confidence that wasn't backed by per-frame verification.
+
+Committed as `40fca40 fix(trampolines): emit CHANGED for subscription lifetime, not once per registration`:
+
+| event | gate byte | emit site | clear site removed |
+|---|---|---|---|
+| 0x01 PLAYBACK_STATUS | state[14] | T9 line 2293 | T9 line 2298 |
+| 0x02 TRACK_CHANGED | state[16] | T5 line 925 | T5 line 942 |
+| 0x05 PLAYBACK_POS_CHANGED | state[13] | T9 line 2516 | T9 line 2523 |
+| 0x08 PLAYER_APP_SETTINGS | state[15] | T9 line 2395 | T9 line 2400 |
+
+`OUTPUT_MD5: d803f42c... → 813d008db4914f43e33e0dd3e11a25e7`; `OUTPUT_DEBUG_MD5: 3900c800... → f723fadb6d629d4ae6ef738552cb734b`.
+
+### Post-flash regression (capture `dual-kia-20260518-0836`)
+
+Debug-instrumented build. ~20 min of Kia playback with multiple play/pause cycles and track skips. Y1T trampoline trace:
+
+| `Y1T` tag | pre-relax `dual-kia-20260517-1842` | post-relax `dual-kia-20260518-0836` |
+|---|---|---|
+| `T9emit pstat=` | 1 | 6 (one per actual edge) |
+| `T9emit pos=` | 1 | **974 at ~1 Hz** |
+| `T5emit aid=` | 1 | 10 |
+| `T8reg ev=05` from Kia | 0 | 9 |
+
+The code was firing as designed. Y1 emitted ev=05 CHANGED 974 times. Kia re-registered ev=05 nine times. Net ratio: **108 unsolicited CHANGEDs per Kia-issued re-register**.
+
+User-visible: play/pause button no longer responsive, track-time display broken, playhead-position scrubber broken. Worse than the pre-relax state in every UI dimension.
+
+### The actual Pixel pattern (TL field revealed it)
+
+Re-extracted the Pixel ev=05 frames with the AVCTP transaction label field this time:
+
+```
+Frame 1511  NOTIFY  ev=05 TL=5    Kia subscribes
+Frame 1512  INTERIM ev=05 TL=5    Pixel ack
+Frame 1646  CHANGED ev=05 TL=5    Pixel emits (~6 s later, on first state change)
+Frame 1648  NOTIFY  ev=05 TL=7    Kia re-registers ~6 ms after CHANGED
+Frame 1649  INTERIM ev=05 TL=7    Pixel ack
+Frame 1660  CHANGED ev=05 TL=7    next emit, 1.002 s after re-register
+Frame 1662  NOTIFY  ev=05 TL=b    re-register
+Frame 1663  INTERIM ev=05 TL=b
+Frame 1670  CHANGED ev=05 TL=b    next emit, 1.023 s after re-register
+... pattern repeats 42 times ...
+```
+
+Every CHANGED's AVCTP TL matches a NOTIFY immediately preceding it. **Pixel emits one CHANGED per RegisterNotification — strict §6.7.1.** The 1 Hz wire cadence comes from Kia re-registering within ~6 ms of every CHANGED, closing the cycle fast enough that the music app's 1 Hz internal tick determines the inter-CHANGED interval, not from Pixel emitting unsolicited.
+
+The TL data was in the same tshark output I'd already extracted at the time of the proposal. I just didn't compare adjacent frames' TLs — the aggregate statistic ("42 at 1 Hz") fit the hypothesis I was looking for and I stopped checking.
+
+### What the relax actually did
+
+Y1 pre-relax was already implementing strict §6.7.1 — the same model Pixel implements. The "universal interpretation" I argued for was a deviation **from** Pixel, not an alignment with it. Once flashed against Kia, the 108:1 CHANGED-to-re-register ratio overwhelmed Kia's UI state machine, which presumably treats most of those CHANGEDs as stale duplicates and discards / mis-orders them — breaking every UI surface that the strict-1:1 cycle had been keeping correct.
+
+Reverted as `2c926ee` (`git revert 40fca40`). `git diff checkpoint/pre-547-relax..HEAD` is empty after the revert; rebuilt MD5s match the original `d803f42c… / 3900c800…`.
+
+### The real root cause is still unsolved
+
+The starting observation stands: **Kia re-registers ev=05 within ~6 ms after every CHANGED against Pixel, but rarely re-registers it at all against Y1 in the pre-relax build** (zero re-registers in `dual-kia-20260517-1842`; nine re-registers in the post-relax `dual-kia-20260518-0836` only because the flood of unsolicited CHANGEDs presumably destabilised Kia's subscription state and forced it to reset). Both Y1 and Pixel advertise the same SDP, both emit `CHANGED` on the same trigger, both are strict §6.7.1. So *something* about Y1's response shape or session establishment causes Kia to skip the re-register that the same Kia issues without delay against Pixel.
+
+Candidates (none verified — listing as hypotheses to test):
+
+1. **M5 TID echo not actually echoing.** Y1's `patch_mtkbt.py` M5 trampoline at `0x6d186` is supposed to preserve the inbound NOTIFY's TID across Path B's `chan+0x39` clobber. If broken, every CHANGED ships with TID=0 (or whatever was last latched), and Kia's §6.5 TID-echo check silently drops the response → no observable CHANGED → no re-register. Y1's `btlog`-based wire view can't disambiguate this because `tools/btlog-hci-extract.py` mis-aligns hex byte runs across records (every frame shows AVCTP=0x02, which is `TL=0, CR=1`; with no proof that's the actual on-wire byte). **Most tractable diagnostic**: add `_emit_native_log_u32(a, "log_fmt_t8tid", N)` at the T8 INTERIM site logging the inbound TID, and at every T5 / T9 CHANGED emit logging whatever's at `chan+0x39` at that instant. Compare against `T8reg` cadence to verify echo correctness.
+2. **CoD class differential.** Pixel advertises Smartphone CoD; Y1 advertises whatever its kernel BT init sets (often a MediaTek "Wearable Audio" variant). Kia's known-quirks table may gate "re-register on CHANGED" behavior on CoD. Verifiable from a Linux box near both: `hcitool inq -i hci0`.
+3. **ServiceName SDP attr 0x0100.** Y1 advertises "Advanced Audio" (AOSP A2DP-SRC name, wrong slot — V7 fill-the-stripped-Browse-slot artifact). Pixel advertises "AV Remote Control Target". Kia may special-case AVRCP TGs by name. Cheap test: byte-swap the string in V7 to match Pixel exactly.
+
+The order I'd attack these is (1) → (3) → (2). M5 verification is closest to the wire and is the most likely silent-failure mode given how the M5 patch was constructed; the ServiceName swap is cheap to try if (1) clears; CoD is the most disruptive to investigate and probably last.
+
+### Lessons (logged to memory at `feedback_verify_before_inferring.md`)
+
+- Aggregate statistics are weak evidence for "the reference TG behaves like X". Per-frame field comparisons are strong. When proposing a code change, the response must include per-frame evidence that proves the inference, not just the count / cadence.
+- Confirmation bias: I was looking for justification to relax the gates (the user had asked "should we?") and the "42 at 1 Hz" statistic fit that frame, so I stopped looking at the data that would have falsified the hypothesis.
+- When the user pushes back on the premise of a change ("I thought we did this to mimic Pixel?"), treat that as a signal to re-verify from scratch, not to re-defend the existing inference.
+- If a change is going to be flashed to hardware, the diagnostic that would have falsified the hypothesis should appear in the proposal before the commit, not after the regression.
+
+### Net state
+
+- `checkpoint/pre-547-relax` is still the working baseline. `git diff` between HEAD and it is empty.
+- `dual-kia-20260518-0836` is preserved as the regression evidence — useful as a falsifying capture for future "should we relax the gates?" proposals.
+- Real root cause for the pre-relax Kia position-bar lag is unsolved; M5 TID verification is the next concrete diagnostic step, not another speculative code change.
+
+
+
 
