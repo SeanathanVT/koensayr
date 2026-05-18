@@ -646,15 +646,17 @@ Two new classes routed to `smali_classes2/` (secondary DEX) because `classes.dex
 
 Tail with `adb logcat -s Y1Patch:*` to observe the metadata pipeline live; pipe to a file for post-test analysis.
 
-**Trampoline-side native debug instrumentation (`Y1T :` logcat tag).** `patch_libextavrcp_jni.py`'s `--debug` build branch wires native `__android_log_print(INFO, "Y1T", ...)` calls into the dynamic trampoline blob at every wire-emit site. These surface as `Y1T : <text>` lines in `adb logcat -s Y1T:*` and pair with the Y1Patch traces above for end-to-end visibility from Java broadcast → trampoline emit → mtkbt IPC.
+**Trampoline-side native debug instrumentation (`Y1T :` logcat tag).** Both `patch_libextavrcp_jni.py` and `patch_mtkbt.py` (the latter only when M5 TID-echo verification is active) wire native `__android_log_print(INFO, "Y1T", ...)` calls into their respective binaries' wire-emit sites under `KOENSAYR_DEBUG=1`. These surface as `Y1T : <text>` lines in `adb logcat -s Y1T:*` and pair with the Y1Patch traces above for end-to-end visibility from Java broadcast → JNI trampoline emit → mtkbt IPC → AVCTP wire.
 
 | Tag (format string) | Site | Value |
 |---|---|---|
 | `T8reg ev=%02x` | `_emit_t8` entry | inbound `RegisterNotification` `event_id` (8-bit). Counts CT subscription requests per event. |
 | `T5emit aid=%08x` | `t5_track_changed` before `track_changed_rsp` | high 32 bits of the `y1-track-info[0..7]` audio_id about to be sent in `TRACK_CHANGED` CHANGED. |
 | `T9emit pstat=%u` | `t9_play_status_changed` before `reg_notievent_playback_rsp` | `play_status` byte (0=STOPPED, 1=PLAYING, 2=PAUSED) about to be sent in PLAYBACK_STATUS_CHANGED CHANGED. |
+| `T9tid c17=%02x` | `t9_play_status_changed` immediately after `T9emit pstat` | byte at `conn[+17]` — the JNI response builder's TID source. Paired with `M5wire c39` to verify M5 TID-echo end-to-end (Trace #59 followup). |
 | `T9emit pos=%u` | `t9_pos_changed` before `reg_notievent_pos_changed_rsp` | live-extrapolated position in milliseconds about to be sent in PLAYBACK_POS_CHANGED CHANGED. |
 | `T4a=%08x` | `t4_req_loop` before each `get_element_attributes_rsp` PLT call | packed `(attr_id<<16) | strlen` per attribute in the request-driven GEA response loop. `tools/avrcp-wire-trace.py` parses these to reconstruct the total wire-frame size and predicts whether mtkbt's `fcn.0xed50` will fragment the response (wire size > 502 B). |
+| `M5wire c39=%02x` | `patch_mtkbt.py` D1 cave at `0xf36a0`, hooked from `fcn.0xae418:0xae448` | byte at `chan+0x39` immediately before mtkbt's AVCTP wire-frame builder encodes it as the outbound TL nibble. Paired with `T9tid c17` to verify M5's strb-skip on outbound is preserving the inbound-latched TID. Fires once per outbound AVCTP frame (every RegNotif response). |
 
 Tail with `adb logcat -s Y1T:*` and pipe through `tools/avrcp-wire-trace.py` for the GEA wire-size analysis. Pair with `tools/btlog-parse.py --avrcp` on the simultaneously-captured `btlog.bin` for mtkbt internal log surfaces (`avctpCB`, `[AVCTP]`, `avrcp:` lines).
 

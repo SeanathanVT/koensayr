@@ -4831,6 +4831,48 @@ Each `T9tid c17=NN` line is paired with a `T9emit pstat=N` line on the immediate
 
 Kia captures will also produce `T9tid c17` data, but only one sample per AVRCP session (strict §6.7.1 + Kia not re-registering). TV is the higher-sample-rate source and the recommended capture target for this diagnostic.
 
+### Followup: D1 mtkbt-side wire-source log (`c39`) added to disambiguate `c17`
+
+The JNI-side `T9tid c17=NN` log captured 11 samples across one TV session, all `00`. By itself this is ambiguous: it could mean the JNI response builder's `conn[17]` slot is unrelated to the AVCTP TL the wire actually carries (in which case `c17=00` is harmless and M5 is still working), or it could mean M5 is broken end-to-end. The two interpretations bear on the next hypothesis: if M5 is working we move on (ServiceName SDP / CoD differential); if M5 is broken we fix M5 first.
+
+The disambiguating measurement is the byte at `chan+0x39` at the moment the AVCTP wire-frame builder is about to encode it as the outbound TL nibble. That site is `fcn.0xae418:0xae448` in mtkbt — `ldrb r6, [r4, #0x15]` with `r4 = chan+0x24`, so `[r4,#0x15] = chan+0x39`. The same byte that M5's cave at `0xf3680` writes from inbound packets via Path B's `strb.w r0, [r4, #0x29]` (where Path B's `r4 = chan+0x10`).
+
+**D1 / D1-CAVE** in `patch_mtkbt.py` (debug-only, gated on `KOENSAYR_DEBUG=1`) hooks that ldrb site with a `b.w` into a new 50-byte cave at `0xf36a0` (in the LOAD #1 padding region, past M5's cave). The cave logs `Y1T : M5wire c39=NN` via `__android_log_print` (PLT thunk at `0xaef8`), re-executes the two displaced ldrb instructions verbatim, and branches back to `0xae44c`. mtkbt's `OUTPUT_DEBUG_MD5 = c476b0dc17cf37723b7c256b27c9082c`; the release path stays at the pinned `OUTPUT_MD5 = dc01a7c1337ad2dc6573819bdc22834d`.
+
+The cave preserves the calling convention — `push {r0-r4, lr}` keeps sp 8-aligned at the blx (r4 is preserved through the call), and the 6-register push matches the function prologue's stack discipline. `pop.w {r0-r4, lr}` restores everything. r4 (the `chan+0x24` arg) is untouched. Net wire behaviour: identical to non-debug, plus one logcat line per outbound AVCTP frame.
+
+**Diagnostic pairing.** The JNI side already logs `T9tid c17=NN` on every play/pause edge (PLAYBACK_STATUS_CHANGED emit). The mtkbt side now logs `M5wire c39=NN` on every outbound AVCTP frame. Compare both streams from the same TV capture:
+
+| c17 (JNI conn[17]) | c39 (wire chan+0x39) | Interpretation |
+|---|---|---|
+| `00` constant | walks 0..0x0F matching `T8reg ev=01` cadence | M5 is working; `conn[17]` is an unrelated slot. Lag root cause is not M5. Move to next hypothesis. |
+| `00` constant | `00` constant across all emits | M5 is broken on the wire side too. The cave's discriminator at `[r5, #8]` is misfiring or the strb_w still clobbers chan+0x39 on outbound. Disassemble the running mtkbt at `0x6d186` + `0xf3680` to confirm landed bytes. |
+| `00` constant | non-zero constant | M5 latches once, never refreshes. Inbound-path strb predicate is wrong; subsequent inbounds aren't propagating their TID. |
+| matches c39 | matches c17 | `conn[17]` and `chan+0x39` track each other; the JNI propagates the same TID source the wire builder uses. M5 working. |
+
+Diagnostic build / pull / grep flow:
+
+```
+# (on dev box)
+KOENSAYR_DEBUG=1 ./apply.bash    # produces debug-instrumented mtkbt + libextavrcp_jni
+# (on Y1 flash box, after pulling latest)
+KOENSAYR_DEBUG=1 ./apply.bash
+adb reboot
+# play music on Y1, pair to TV, let it run for a few minutes
+adb logcat -d | grep 'Y1T' | grep -E 'M5wire c39|T9tid c17|T9emit pstat|T8reg ev=01'
+```
+
+The expected per-emit ordering inside a single AVRCP session against TV:
+
+```
+Y1T : T8reg ev=01 reason=0F     (TV re-registers, fresh inbound TL = N)
+Y1T : T9emit pstat=2            (next play/pause edge fires T9)
+Y1T : T9tid c17=NN              (JNI builder reads conn[17] just before sending)
+Y1T : M5wire c39=NN             (mtkbt wire builder reads chan+0x39 immediately after)
+```
+
+If `c39` walks 0..0x0F across the session and matches the prior `T8reg`'s implied TL, M5 is verified end-to-end and the Kia lag is **not** a TID-echo issue. If `c39` stays `00`, M5 is broken on the wire and needs revisiting.
+
 
 
 

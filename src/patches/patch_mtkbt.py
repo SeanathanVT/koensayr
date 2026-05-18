@@ -28,19 +28,36 @@ import struct
 import sys
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _thumb2asm import Asm
+
 STOCK_MD5         = "3af1d4ad8f955038186696950430ffda"
 OUTPUT_MD5        = "dc01a7c1337ad2dc6573819bdc22834d"
 
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = OUTPUT_MD5
+OUTPUT_DEBUG_MD5  = "c476b0dc17cf37723b7c256b27c9082c"
 
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
+
+# PLT thunk for libc/liblog's __android_log_print. Resolved by walking
+# mtkbt's standard 12-byte ARM PLT: rel.plt entry 76 (0-based 75) for symbol
+# __android_log_print → JUMP_SLOT at 0xf9de0 → PLT thunk at 0xab74 + 12*75 =
+# 0xaef8. Encoding verified as `add ip,pc,#0x600000; add ip,ip,#0xee000;
+# ldr pc,[ip,#0xfe0]!` = GOT 0xf9de0.
+PLT_android_log_print = 0xaef8
+
+# LOAD #1 sizing. Stock filesz = 0xf366c (16 bytes before M5's cave end). M5
+# extends to 0xf3690. The DEBUG cave adds a TID-source wire-frame log past
+# that and the segment must be extended further to cover it.
+LOAD1_STOCK_END      = 0xf366c
+LOAD1_RELEASE_END    = 0xf3690
+DEBUG_CAVE_VADDR     = 0xf36a0
 
 # 12-byte descriptor table entry: attrID:LE16, len:LE16, ptr:LE32, zeros:LE32
 def entry(attr_id: int, length: int, ptr: int) -> bytes:
     return struct.pack("<HHII", attr_id, length, ptr, 0)
 
-PATCHES = [
+BASE_PATCHES = [
     {
         "name":   "[V1] AVRCP 1.0->1.3 LSB  Group D ProfileDescList (served)",
         "offset": 0x0eba58,
@@ -391,23 +408,96 @@ PATCHES = [
             0x79, 0xf7, 0x7e, 0xbd,        # b.w 0x6d18c
         ]),
     },
-    {
-        # LOAD #1 phdr is at file 0x74 (the 3rd phdr: PHDR, INTERP, LOAD).
-        # filesz is the 5th field (offset +16 = file 0x84).
-        "name":   "[M5-FILESZ] LOAD #1 filesz: 0xf366c → 0xf3690",
-        "offset": 0x84,
-        "before": (0xf366c).to_bytes(4, "little"),
-        "after":  (0xf3690).to_bytes(4, "little"),
-    },
-    {
-        # memsz is the 6th field (offset +20 = file 0x88). Must match
-        # filesz so the loader maps the cave bytes into the segment.
-        "name":   "[M5-MEMSZ] LOAD #1 memsz: 0xf366c → 0xf3690",
-        "offset": 0x88,
-        "before": (0xf366c).to_bytes(4, "little"),
-        "after":  (0xf3690).to_bytes(4, "little"),
-    },
+    # LOAD #1 filesz / memsz entries are emitted by build_patches() so the
+    # cave end can shift between release and debug builds.
 ]
+
+
+def build_debug_cave_blob(cave_vaddr: int) -> bytes:
+    """Assemble the D1 TID-source wire-frame log cave (KOENSAYR_DEBUG=1 only).
+
+    Hooked from fcn.0xae418's `ldrb r6, [r4, #0x15]` site at file 0xae448
+    (where r4 = chan+0x24, so [r4,#0x15] = chan+0x39 — the byte the AVCTP
+    wire-frame builder is about to encode as transId). The hook replaces
+    the two ldrb insns at 0xae448..0xae44b with a `b.w` into this cave; the
+    cave logs the value, then re-executes both displaced insns and branches
+    back to 0xae44c.
+
+    Args: r0=ANDROID_LOG_INFO (4), r1="Y1T", r2=fmt, r3=chan[0x39].
+
+    push {r0-r4, lr} = 6-reg = 24 B → keeps sp 8-aligned at the blx call
+    boundary (AAPCS). r4 is preserved by the push even though we don't
+    write it — included only for alignment.
+    """
+    a = Asm(cave_vaddr)
+    a.raw(bytes([0x1f, 0xb5]))                  # push {r0-r4, lr}
+    a.raw(bytes([0x63, 0x7d]))                  # ldrb r3, [r4, #0x15]
+    a.movs_imm8(0, 4)                            # movs r0, #4 (ANDROID_LOG_INFO)
+    a.adr_w(1, "log_tag")                        # r1 = &"Y1T"
+    a.adr_w(2, "log_fmt")                        # r2 = &fmt
+    a.blx_imm(PLT_android_log_print)
+    a.raw(bytes([0xbd, 0xe8, 0x1f, 0x40]))      # pop.w {r0-r4, lr}
+    a.raw(bytes([0x66, 0x7d]))                  # ldrb r6, [r4, #0x15] (displaced)
+    a.raw(bytes([0xa2, 0x7d]))                  # ldrb r2, [r4, #0x16] (displaced)
+    a.labels["ret"] = 0xae44c                    # rejoin after displaced insns
+    a.b_w("ret")
+    a.align(2)
+    a.label("log_tag")
+    a.asciiz("Y1T")
+    a.label("log_fmt")
+    a.asciiz("M5wire c39=%02x")
+    return a.resolve()
+
+
+def build_patches(debug: bool) -> list[dict]:
+    patches = list(BASE_PATCHES)
+    load1_end = LOAD1_RELEASE_END
+
+    if debug:
+        blob = build_debug_cave_blob(DEBUG_CAVE_VADDR)
+        debug_end = DEBUG_CAVE_VADDR + len(blob)
+        load1_end = max(load1_end, (debug_end + 3) & ~3)
+
+        hook = Asm(0xae448)
+        hook.labels["cave"] = DEBUG_CAVE_VADDR
+        hook.b_w("cave")
+        hook_bytes = hook.resolve()
+
+        patches.extend([
+            {
+                "name":   f"[D1] TID-source wire log: hook fcn.0xae418 @ 0xae448 → b.w 0x{DEBUG_CAVE_VADDR:x}",
+                "offset": 0xae448,
+                "before": bytes([0x66, 0x7d, 0xa2, 0x7d]),  # ldrb r6,[r4,#0x15]; ldrb r2,[r4,#0x16]
+                "after":  hook_bytes,
+            },
+            {
+                "name":   f"[D1-CAVE] TID-source wire log blob @ 0x{DEBUG_CAVE_VADDR:x} ({len(blob)} B in LOAD #1 padding)",
+                "offset": DEBUG_CAVE_VADDR,
+                "before": bytes([0x00] * len(blob)),
+                "after":  blob,
+            },
+        ])
+
+    patches.extend([
+        {
+            # LOAD #1 phdr is at file 0x74 (the 3rd phdr: PHDR, INTERP, LOAD).
+            # filesz is the 5th field (offset +16 = file 0x84).
+            "name":   f"[M5-FILESZ] LOAD #1 filesz: 0x{LOAD1_STOCK_END:x} → 0x{load1_end:x}",
+            "offset": 0x84,
+            "before": LOAD1_STOCK_END.to_bytes(4, "little"),
+            "after":  load1_end.to_bytes(4, "little"),
+        },
+        {
+            # memsz is the 6th field (offset +20 = file 0x88). Must match
+            # filesz so the loader maps the cave bytes into the segment.
+            "name":   f"[M5-MEMSZ] LOAD #1 memsz: 0x{LOAD1_STOCK_END:x} → 0x{load1_end:x}",
+            "offset": 0x88,
+            "before": LOAD1_STOCK_END.to_bytes(4, "little"),
+            "after":  load1_end.to_bytes(4, "little"),
+        },
+    ])
+
+    return patches
 
 
 
@@ -415,9 +505,9 @@ def md5(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
-def verify(data: bytes, mode: str) -> tuple[bool, list[dict]]:
+def verify(data: bytes, mode: str, patches: list[dict]) -> tuple[bool, list[dict]]:
     results = []
-    for p in PATCHES:
+    for p in patches:
         expected = p[mode]
         actual = bytes(data[p["offset"]: p["offset"] + len(expected)])
         results.append({**p, "actual": actual, "ok": actual == expected})
@@ -496,14 +586,16 @@ def main():
     # sufficient: alternate stock build (--skip-md5) or development mode
     # where the expected output MD5 isn't pinned yet. On the normal happy
     # path the input-MD5 and output-MD5 checks cover every byte in the file.
+    patches = build_patches(debug=DEBUG_LOGGING)
+
     show_sites = args.skip_md5 or EXPECTED_OUTPUT_MD5 is None
 
     if show_sites:
-        pre_ok, pre_results = verify(data, "before")
+        pre_ok, pre_results = verify(data, "before", patches)
         print_results("Pre-patch verification (stock)", pre_results, "before")
 
         if not pre_ok:
-            post_ok, post_results = verify(data, "after")
+            post_ok, post_results = verify(data, "after", patches)
             print_results("Already-patched check", post_results, "after")
             if post_ok:
                 print("\nBinary is already patched. Nothing to do.")
@@ -515,7 +607,7 @@ def main():
         print("\nVerify-only — no output written.")
         sys.exit(0)
 
-    for p in PATCHES:
+    for p in patches:
         data[p["offset"]: p["offset"] + len(p["after"])] = p["after"]
 
     output_md5 = md5(data)
@@ -525,7 +617,7 @@ def main():
     # site-aware mode (developer / alternate stock) or as a diagnostic when
     # the produced output doesn't hash to the pinned expected value.
     if show_sites or output_md5_mismatch:
-        post_ok, post_results = verify(data, "after")
+        post_ok, post_results = verify(data, "after", patches)
         print_results("Post-patch verification", post_results, "after")
         if not post_ok:
             print("\nERROR: post-patch verification failed — output not written.")
