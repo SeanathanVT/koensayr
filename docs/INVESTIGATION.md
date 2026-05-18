@@ -10,7 +10,7 @@ Current shipped patches by binary:
 
 | Binary | Patches |
 |---|---|
-| `mtkbt` | V1 (AVRCP 1.0→1.3 SDP byte on legacy served record), V2 (AVCTP 1.0→1.2 SDP byte), V3 (A2DP 1.0→1.3 SDP byte), V4 (AVDTP 1.0→1.3 SDP byte), V5 (AVDTP sig 0x0c TBH-table alias to sig 0x02 handler — best-effort workaround for GAVDP 1.3 ICS Acceptor row 9), V6 (internal `activeVersion` 10→14 — routes the SDP record builder to the AVRCP 1.3 served record so the wire-served record matches the F1-surfaced version), V7 (drop AVRCP 1.4 attr 0x000d Browse PSM advertisement on the AVRCP 1.3 record — swap entry slot to 0x0100 ServiceName), V8 (clear stock GroupNavigation bit 5 from SupportedFeatures byte stream so mask = 0x0001), S1 (0x0311 SupportedFeatures → 0x0100 ServiceName attr-table swap on legacy record), P1 (force VENDOR_DEPENDENT through PASSTHROUGH-emit so the JNI sees the frame), M1 / M1b / M1c (three sites in fn 0x379e0 flipped 0x0D→0x0F so trampoline-emitted RegNotif responses get AV/C ctype INTERIM on the wire instead of CHANGED — see Trace #34), M2 (NOP `beq 0x6d0e0` at `0x6d06e` — bypass the outbound-frame builder's list-contains drop gate on Path A, the fragmented multi-frame path for `msg=540` GetElementAttributes), M3 (NOP `strb.w r0, [r4, #0xf2]` at `0x6df42` — disable the chip-busy flag SET on Path A so the gate at `0x6df3a` never trips; both M2 and M3 derived in Trace #40 to eliminate the silent ~80% drop of T9 CHANGED emits under A2DP saturation), M4 (NOP `beq 0x6d19c` at `0x6d116` — bypass the structurally-identical list-contains drop gate on Path B `fcn.0x6d0f0`, the short single-PDU path for `msg=544` RegNotif INTERIM/CHANGED that the dispatcher at `fcn.0xf0bc` selects via `cbz r3, 0xf186` when IPC `byte[9]==0`; see Trace #41 — addresses the subscription-class CT retry-storm where `msg=544` was delivering at ~6% on the wire while `msg=540` on Path A was at ~100%) |
+| `mtkbt` | V1 (AVRCP 1.0→1.3 SDP byte on legacy served record), V2 (AVCTP 1.0→1.2 SDP byte), V3 (A2DP 1.0→1.3 SDP byte), V4 (AVDTP 1.0→1.3 SDP byte), V5 (AVDTP sig 0x0c TBH-table alias to sig 0x02 handler — best-effort workaround for GAVDP 1.3 ICS Acceptor row 9), V6 (internal `activeVersion` 10→14 — routes the SDP record builder to the AVRCP 1.3 served record so the wire-served record matches the F1-surfaced version), V7 (drop AVRCP 1.4 attr 0x000d Browse PSM advertisement on the AVRCP 1.3 record — swap entry slot to 0x0100 ServiceName), V8 (clear stock GroupNavigation bit 5 from SupportedFeatures byte stream so mask = 0x0001), S1 (0x0311 SupportedFeatures → 0x0100 ServiceName attr-table swap on legacy record), P1 (force VENDOR_DEPENDENT through PASSTHROUGH-emit so the JNI sees the frame), M1 (widen the RegNotif INTERIM/CHANGED dispatcher cmp at `fcn.0x121d8:0x12230` from `cmp r1, 1` to `cmp r1, 0xF` so wire ctype matches the JNI's reasonCode arg — see Trace #37), M6 (NOP the hardcoded `movs r1, 0xD` at `fcn.0x121d8:0x12244` so the CHANGED branch becomes a pure pass-through for any non-INTERIM AV/C ctype value the JNI sets in `ipc[8]` — companion to M1; static-verified end-to-end in Trace #60), M2 (NOP `beq 0x6d0e0` at `0x6d06e` — bypass the outbound-frame builder's list-contains drop gate on Path A, the fragmented multi-frame path for `msg=540` GetElementAttributes), M3 (NOP `strb.w r0, [r4, #0xf2]` at `0x6df42` — disable the chip-busy flag SET on Path A so the gate at `0x6df3a` never trips; both M2 and M3 derived in Trace #40 to eliminate the silent ~80% drop of T9 CHANGED emits under A2DP saturation), M4 (NOP `beq 0x6d19c` at `0x6d116` — bypass the structurally-identical list-contains drop gate on Path B `fcn.0x6d0f0`, the short single-PDU path for `msg=544` RegNotif INTERIM/CHANGED that the dispatcher at `fcn.0xf0bc` selects via `cbz r3, 0xf186` when packetFrame[9]==0 (i.e. ctype>6, response direction); see Trace #41 — addresses the subscription-class CT retry-storm where `msg=544` was delivering at ~6% on the wire while `msg=540` on Path A was at ~100%) |
 | `libextavrcp_jni.so` | R1 (msg=519 redirect into trampoline-chain entry) + T1 / T2-stub / extended_T2 / T4 / T5 / T_charset / T_battery / T_continuation / T6 / T8 / T9 trampolines hosted in LOAD #1 page-padding extension; U1 (NOP `UI_SET_EVBIT(EV_REP)` to defang kernel auto-repeat on the AVRCP virtual keyboard). T1 advertises `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}` — events 0x09-0x0c are 1.4+ event IDs INTERIM-acked with zero payload via existing `libextavrcp.so` builders (no CHANGED ever fires; Y1 has one player, no Now Playing folder, no UID database). Mirrors Pixel-as-TG; what unblocks strict CT metadata-pane render (see Trace #32). |
 | `MtkBt.odex` | F1 (`getPreferVersion()`=14 unblocks 1.3+ Java dispatch), F2 (`disable()` resets `sPlayServiceInterface`), 2 cardinality NOPs (TRACK_CHANGED + PLAYBACK_STATUS_CHANGED switch arms in `BTAvrcpMusicAdapter.handleKeyMessage`) |
 | `com.innioasis.y1*.apk` | A / B / C (Artist→Album navigation), E (discrete PASSTHROUGH PLAY/PAUSE/STOP/NEXT/PREV per AV/C Panel Subunit Spec), H / H′ / H″ (foreground-activity propagation of unhandled discrete media keys + framework-synthetic-repeat filter) |
@@ -4973,5 +4973,93 @@ Open question: how to emit a NOT_IMPLEMENTED RegisterNotification response for e
 3. **Find the JNI's actual "unknown event_id" handler** — the stock JNI may have a path that emits NOT_IMPLEMENTED for unsupported PDU 0x31 event_ids. We haven't located it yet.
 
 Of these, option 1 is the cheapest experiment (no mtkbt change, no new RE) — worth a small instrumented diagnostic flash to discover what wire ctype the reject path actually emits.
+
+### Option 1 disqualified by disassembly
+
+`btmtk_avrcp_send_reg_notievent_track_changed_rsp` (libextavrcp.so:0x2458) and the structurally identical helpers (`reached_end_rsp` 0x24c8, `reached_start_rsp` 0x2528, `pos_changed_rsp` 0x2588, `battery_status_changed_rsp` 0x25f0, `system_status_changed_rsp` 0x2658, `now_playing_content_changed_rsp` 0x26c0, `player_appsettings_changed_rsp` 0x2720, `availplayers_changed_rsp` 0x27b0, `addredplayer_changed_rsp` 0x2810, `uids_changed_rsp` 0x2880, `volume_changed_rsp` 0x28e8) all share the same shape:
+
+```
+cbnz r5, reject_branch    ; r5 = caller's r1 (status/success arg)
+                          ; r1 == 0 → success path:
+                          ;   strb r7 (=r2 reasonCode), [sp, 0xc]  ; ipc[8] = reasonCode
+                          ;   strb event_id_const,      [sp, 0xd]  ; ipc[9] = event_id
+                          ;   (event-specific payload write)
+                          ; r1 != 0 → reject path:
+                          ;   strb r5 (=r1 status),     [sp, 0xb]  ; ipc[7] = status
+                          ;   strb 1,                   [sp, 0xa]  ; ipc[6] = 1
+                          ;   (NO write to sp[0xc] — ipc[8] stays memset zero)
+common_tail:
+mov.w r1, 0x220           ; msg_id = 544 (same as success!)
+bl AVRCP_SendMessage
+```
+
+Both paths send `msg=544`. The reject path leaves `ipc[8] = 0` (memset zero, never overwritten). Mtkbt's M1-widened dispatcher at `fcn.0x121d8:0x12230` does `cmp ctxt[8], 0x0F` — `0 != 0x0F` → falls through to the CHANGED branch — emits AV/C ctype `0x0D` on the wire. Wire result is a malformed CHANGED, not NOT_IMPLEMENTED.
+
+Conclusion: option 1 cannot emit NOT_IMPLEMENTED on the wire without an mtkbt-side patch.
+
+### Option 2 (M6) static verification
+
+End-to-end chain of an `ipc[8] = 0x08` IPC payload through mtkbt, walked by disassembly with no empirical step required:
+
+```
+JNI helper: ipc[8] = caller's r2 (= 0x08)
+mtkbt fcn.0x67768 → 0x518ac (msg_id tbb) → 0x12478 (event_id tbb)
+fcn.0x12478 [0x124a0] ldrb r3, [r4, 9]            ; r3 = event_id
+            [0x124a8] tbb [0x124b0]               ; dispatch per-event
+            verified: events 0x01-0x0D all dispatch to handlers (122cc /
+            122e4 / 12324 / 12354 / 12390 / 12270 / 123f8 / 1243c / 123c4)
+            that all `bl 0x121d8` (10/10 checked, within 40 instructions of
+            entry)
+fcn.0x121d8 [0x1222e] ldrb r1, [r4, 8]            ; r1 = ctxt[8] = 0x08
+            [0x12230] cmp  r1, 0x0F               ; M1 widened (0x01 → 0x0F)
+            [0x12232] bne  0x12240                ; 0x08 ≠ 0x0F → CHANGED branch
+            [0x12244] (was: movs r1, 0xD; with M6: nop)                ← M6
+            [0x1224e] bl   fcn.0x11894            ; r1 still 0x08
+fcn.0x11894 [0x11906] cmp r6, 6                    ; r6 = r1 (caller's) = 0x08
+            [0x1190a] ite hi
+            [0x1190c-0x1190e] r2 = (r6 > 6) ? 0 : 1
+            [0x11912] strb r2, [r4, 9]            ; packetFrame[9] = 0 (response;
+                                                  ;   for ctype > 6)
+            [0x11922] strb r6, [r4, 0xb]          ; packetFrame[0xb] = 0x08
+            [0x11906] (also: bl 0xf0bc with r1 = packetFrame)
+fcn.0xf0bc  [0xf12a] ldrb r3, [r6, 9]             ; r3 = packetFrame[9] = 0
+            [0xf138] cbz  r3, 0xf186              ; taken → Path B
+Path B:
+fcn.0xef08  [0xef5e] ldrb r2, [r5, 0xb]           ; r2 = packetFrame[0xb] = 0x08
+            [0xef68] strb r2, [r4]                ; wire_buf[0] = 0x08    ← KEY
+            (no other use of packetFrame[0xb] in body; wire_buf[3] = 0
+             hardcoded from fcn.0x11894:0x11926)
+fcn.0x6d0f0 (M4 site, list-check bypassed)
+            [0x6d118] ldrb r3, [r5]               ; r3 = wire_buf[0] = 0x08
+            [0x6d11e] cmp  r3, 0x0F               ; ≠ 0x0F
+            [0x6d122] (ne) strb 1, [r4, 0xf0]     ; non-INTERIM flag SET
+            [0x6d126] bne  common-path            ; skips INTERIM-specific
+                                                  ; wire_buf[3] check
+            (common path: builds AVCTP TID nibble + packet_type into
+             [r4, 0xe0..0xf0], then b.w 0xae5e4 L2CAP_SendData)
+fcn.0xae5e4 reads packetFrame [9, 0x12, 0x16, 0x1c] (NOT wire_buf[0]);
+            fragmentation + chip-level send
+fcn.0xae418 AVCTP header builder writes TID/packet_type into AVCTP layer
+            (wire_buf is the L2CAP payload below this — opaque)
+WIRE: AV/C frame byte 0 = 0x08 (NOT_IMPLEMENTED)
+```
+
+Single reader of `[r4, 0xf0]` (the non-INTERIM flag set at 0x6d122) is at `0x7ecf4` inside `ittt eq` block — passive status retrieval, not a drop gate. Confirmed by `/x f00094f8` byte-pattern search across the binary.
+
+Backward-compatibility audit for M6: every current call site to `reg_notievent_*_rsp` (T2 / extended_T2, T5, T8, T9, T_papp) passes `r2 ∈ {0x0F INTERIM, 0x0D CHANGED}`.
+- `r2 = 0x0F`: cmp at 0x12230 equal → INTERIM branch → r1 = 0x0F via movs at 0x12238 (unchanged by M6) → wire 0x0F ✓
+- `r2 = 0x0D`: cmp ≠ → CHANGED branch → M6 NOP → r1 retains 0x0D from ldrb at 0x1222e → wire 0x0D ✓ (production-equivalent)
+
+M6 is a pure no-op for the existing call sites; only changes wire behaviour when a caller deliberately passes a non-0x0F-and-non-0x0D value.
+
+### Step 1 commit: M6 alone (no T8 changes)
+
+Commit lands M6 only — single-byte patch at mtkbt file offset `0x12244` (`0d 21 → 00 bf`). No JNI / T8 changes. Production wire behaviour is byte-identical to pre-M6 for every CT in the matrix.
+
+Verification predictions:
+- TV / Sonos / Kia / Bolt / Pixel: no wire-level change. Metadata-pane, PASSTHROUGH, position cadence — all identical to pre-M6.
+- mtkbt MD5 change confirms the M6 byte landed.
+
+If any post-flash regression appears, M6 is wrong and reverts with a one-byte change. Step 2 (T8 r2-value change to 0x08 for events 0x09-0x0C) lands only after Step 1 is verified clean on all CTs.
 
 

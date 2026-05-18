@@ -6,7 +6,7 @@ Byte-level reference for the patches currently shipped by this repo. Each sectio
 
 | ID(s) | Binary | Site / effect |
 |---|---|---|
-| **V1, V2, V3, V4, V5, V6, V7, V8, S1, P1, M1, M2, M3, M4, M5** | `mtkbt` | SDP shape (AVRCP 1.0→1.3, AVCTP 1.0→1.2, A2DP/AVDTP 1.0→1.3, sig 0x0c→0x02 alias, internal `activeVersion` 10→14 to route the dispatcher to the AVRCP 1.3 served record, drop AdditionalProtocolDescriptorList Browse-PSM advertisement (AVRCP 1.4 §8 Table 8.2 introduced; absent from AVRCP 1.3 §6 Table 6.2), clear stock GroupNavigation feature bit (Y1 doesn't implement the Group Navigation PASSTHROUGH PDUs), ServiceName-for-SupportedFeatures swap, force-PASSTHROUGH-emit op_code dispatch, RegNotif INTERIM/CHANGED dispatch cmp constant widened from 1 to 0x0F so wire ctype matches the JNI trampoline's reasonCode, three NOPs across the two outbound-frame builders that remove the chip-readiness list-contains check on each path + the chip-busy flag SET on the multi-frame path so the matching CHECK never trips, and a code-cave trampoline in Path B that conditional-stores `chan[+0x29]` so outbound responses echo the inbound AV/C transId per AVCTP V13 §6.5 / §6.7.2 instead of clobbering to 0). |
+| **V1, V2, V3, V4, V5, V6, V7, V8, S1, P1, M1, M2, M3, M4, M5, M6** | `mtkbt` | SDP shape (AVRCP 1.0→1.3, AVCTP 1.0→1.2, A2DP/AVDTP 1.0→1.3, sig 0x0c→0x02 alias, internal `activeVersion` 10→14 to route the dispatcher to the AVRCP 1.3 served record, drop AdditionalProtocolDescriptorList Browse-PSM advertisement (AVRCP 1.4 §8 Table 8.2 introduced; absent from AVRCP 1.3 §6 Table 6.2), clear stock GroupNavigation feature bit (Y1 doesn't implement the Group Navigation PASSTHROUGH PDUs), ServiceName-for-SupportedFeatures swap, force-PASSTHROUGH-emit op_code dispatch, RegNotif INTERIM/CHANGED dispatch cmp constant widened from 1 to 0x0F so wire ctype matches the JNI trampoline's reasonCode plus a paired NOP of the hardcoded CHANGED-ctype write so the response builder's CHANGED branch becomes a pure pass-through for any non-0x0F AV/C ctype, three NOPs across the two outbound-frame builders that remove the chip-readiness list-contains check on each path + the chip-busy flag SET on the multi-frame path so the matching CHECK never trips, and a code-cave trampoline in Path B that conditional-stores `chan[+0x29]` so outbound responses echo the inbound AV/C transId per AVCTP V13 §6.5 / §6.7.2 instead of clobbering to 0). |
 | **R1, T1, T2 stub, extended_T2, T4, T5, T_charset, T_battery, T_continuation, T6, T8, T9, U1** | `libextavrcp_jni.so` | Trampoline chain in `_Z17saveRegEventSeqIdhh` + LOAD #1 page-padding extension + uinput EV_REP NOP. Synthesises AVRCP 1.3 metadata responses directly from C, bypassing the no-op Java AVRCP TG. |
 | **F1, F2** | `MtkBt.odex` | `getPreferVersion()=14` to unblock 1.3+ command dispatch through MtkBt's Java layer; `disable()` resets `sPlayServiceInterface`. |
 | **odex cardinality NOPs** (×2) | `MtkBt.odex` | NOP the `if-eqz v5` cardinality gates in `BTAvrcpMusicAdapter.handleKeyMessage` for events 0x02 (TRACK_CHANGED, sswitch_1a3) and 0x01 (PLAYBACK_STATUS_CHANGED, sswitch_18a) so the JNI natives fire on every `metachanged` / `playstatechanged` broadcast. Pairs with T5 / T9 in `libextavrcp_jni.so`. |
@@ -100,6 +100,25 @@ Stock mtkbt's RegNotif response packetFrame builder dispatch at fn `0x121d8` rea
 M1 widens the cmp constant from `1` to `0x0F`. After M1: `ctxt[8] == 0x0F` (T2 / extended_T2 / T8 first-response INTERIM arms) → INTERIM branch → wire ctype `0x0F` INTERIM. `ctxt[8] != 0x0F` (T5 / T9 edge emits, where r2 = REASON_CHANGED = `0x0D`) → CHANGED branch → wire ctype `0x0D` CHANGED. Spec-compliant per AVRCP 1.3 §6.7.1 (INTERIM on first response per registration, CHANGED on subsequent value updates without re-registration).
 
 End-to-end byte chain: IPC msg=544 → `fcn.00067768` (sets ctxt ptr at msg+0x1c) → `fcn.000518ac` case 44 → `fcn.00012478` event_id tbb → per-event response builder → `fcn.000121d8` (M1 site at `0x12230`) → `fcn.00011894` strb ctype to packetFrame[0xb] → `fcn.0000f0bc` queue → `fcn.0000ef08` strb to wire `buf[0]`. Full radare2 trace in `docs/INVESTIGATION.md`.
+
+**M6 — RegNotif CHANGED-branch ctype pass-through: NOP movs r1, 0xD** at file `0x12244` (1 site, 2 bytes):
+
+| site | bytes (before → after) | mnemonic |
+|---|---|---|
+| `0x12244` | `0d 21` → `00 bf` | `movs r1, 0xD` → `nop` |
+
+Companion to M1. After M1 widens the discriminator cmp from `cmp r1, 1` to `cmp r1, 0xF`, the response builder at `fcn.0x121d8` reads `ctxt[8]` and branches:
+- `ctxt[8] == 0x0F` → INTERIM branch → `movs r1, 0xF` at `0x12238` sets wire ctype `0x0F`
+- `ctxt[8] != 0x0F` → CHANGED branch → `movs r1, 0xD` at `0x12244` hardcodes wire ctype `0x0D`
+
+M6 NOPs the `movs r1, 0xD` so the CHANGED branch retains whatever value `ctxt[8]` held from `ldrb r1, [r4, 8]` at `0x1222e`. Net wire behaviour:
+- `ctxt[8] == 0x0F` (INTERIM emit) → wire `0x0F` (unchanged from M1; M6's NOP is in the OTHER branch)
+- `ctxt[8] == 0x0D` (CHANGED emit) → wire `0x0D` (r1 retains 0x0D from `ldrb`; identical to stock CHANGED behaviour, only the instruction that produces it changed)
+- `ctxt[8] == any other valid AV/C ctype` → that value reaches the wire as AV/C ctype byte 0
+
+Pure no-op for the existing 0x0F / 0x0D call sites in `_trampolines.py` (T2, extended_T2, T5, T8, T9, T_papp) and `libextavrcp.so`'s `reg_notievent_*_rsp` helpers. M6 only changes wire behaviour when a future caller deliberately passes a non-0x0F-and-non-0x0D AV/C ctype value via the helper's `reasonCode` argument.
+
+End-to-end static verification of the chain (no ctype filtering anywhere downstream of `packetFrame[0xb]`): `docs/INVESTIGATION.md` Trace #60 "Option 2 (M6) static verification" walkthrough.
 
 **M2 — Outbound-frame drop bypass: NOP gate 1 list-contains check** at file `0x6d06e` (1 site, 2 bytes):
 

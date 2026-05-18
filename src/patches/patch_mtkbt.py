@@ -7,10 +7,13 @@ record to AVRCP 1.3 / AVCTP 1.2 (V1+V2), A2DP/AVDTP 1.3 (V3+V4), drops the
 bit (V8), inserts a 0x0100 ServiceName attribute (S1), reroutes the daemon
 to the v=14 SDP template (V6), force-emits PASSTHROUGH dispatch for all
 AV/C frames (P1), best-effort aliases AVDTP sig 0x0c → 0x02 (V5), widens
-the RegNotif INTERIM/CHANGED dispatch cmp from 1 to 0x0F (M1), and removes
-the outbound-frame builder's chip-readiness list-contains check + chip-busy
-flag SET (M2 + M3 — eliminate ambiguity in "did this CHANGED reach the
-wire?" by removing two gates whose practical wire-side effect couldn't be
+the RegNotif INTERIM/CHANGED dispatch cmp from 1 to 0x0F (M1), NOPs the
+hardcoded CHANGED-ctype write so non-INTERIM ctype values pass through to
+the wire (M6 — enables JNI-side trampolines to emit AV/C ctypes other
+than 0x0D for the RegNotif response path), and removes the outbound-frame
+builder's chip-readiness list-contains check + chip-busy flag SET (M2 +
+M3 — eliminate ambiguity in "did this CHANGED reach the wire?" by
+removing two gates whose practical wire-side effect couldn't be
 distinguished from btlog sampling under sustained traffic).
 
 Per-patch byte-level reference (offsets, before/after, rationale, ICS row
@@ -32,10 +35,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _thumb2asm import Asm
 
 STOCK_MD5         = "3af1d4ad8f955038186696950430ffda"
-OUTPUT_MD5        = "dc01a7c1337ad2dc6573819bdc22834d"
+OUTPUT_MD5        = "7493acdad352bc6d7f6d65fc3251e221"
 
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "c476b0dc17cf37723b7c256b27c9082c"
+OUTPUT_DEBUG_MD5  = "d603e68a263d6a3e46e42f0959b681cf"
 
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
@@ -226,6 +229,43 @@ BASE_PATCHES = [
         "offset": 0x12230,
         "before": bytes([0x01, 0x29]),  # cmp r1, 1
         "after":  bytes([0x0f, 0x29]),  # cmp r1, 0xF
+    },
+    {
+        # M6 — RegNotif response wire-ctype pass-through for the CHANGED branch
+        # of fcn.0x121d8.
+        #
+        # Companion to M1. Post-M1, fcn.0x121d8 reads ctxt[8] (= ipc payload
+        # byte 8 = caller's reasonCode arg to `reg_notievent_*_rsp`) and
+        # compares against 0x0F:
+        #   ctxt[8] == 0x0F → INTERIM branch at 0x12234..0x1223e
+        #                     → `movs r1, 0xF` at 0x12238 sets ctype = 0x0F
+        #   ctxt[8] != 0x0F → CHANGED branch at 0x12240..0x12248
+        #                     → `movs r1, 0xD` at 0x12244 overwrites ctype to 0x0D
+        # Both branches converge at 0x1224a and pass r1 to fcn.0x11894 which
+        # stores it into packetFrame[0xb]; downstream fcn.0xef08 then writes
+        # packetFrame[0xb] as wire byte 0 (the AV/C ctype). Trace #37 verified
+        # the full chain by single-stepping INTERIM and CHANGED on the wire.
+        #
+        # The stock CHANGED branch hardcodes ctype = 0x0D. M6 NOPs the
+        # `movs r1, 0xD` so the CHANGED branch retains whatever ctype value
+        # ctxt[8] held from the `ldrb r1, [r4, 8]` at 0x1222e. After M6:
+        #   ctxt[8] == 0x0F → INTERIM (movs at 0x12238 still sets 0x0F)
+        #   ctxt[8] == 0x0D → CHANGED (r1 retains 0x0D from ldrb, identical
+        #                     to stock CHANGED-emit behaviour)
+        #   ctxt[8] == any other AV/C ctype value → that value reaches the wire
+        #
+        # Pure pass-through for the existing 0x0F / 0x0D call sites — every
+        # current `reg_notievent_*_rsp` invocation in `_trampolines.py` and
+        # `libextavrcp.so` passes r2 ∈ {0x0F INTERIM, 0x0D CHANGED}, so
+        # production wire behaviour is byte-identical to pre-M6 for all
+        # CTs that don't subscribe to new ctype values.
+        #
+        # End-to-end static verification (no ctype filtering anywhere
+        # downstream): Trace #60 "M6 verification gap" walkthrough.
+        "name":   "[M6] RegNotif CHANGED-branch ctype pass-through: NOP movs r1, 0xD (mtkbt 0x12244)",
+        "offset": 0x12244,
+        "before": bytes([0x0d, 0x21]),  # movs r1, 0xD
+        "after":  bytes([0x00, 0xbf]),  # nop
     },
     {
         # M2 — TG-side outbound-frame drop gate at fcn.0x6d048.
