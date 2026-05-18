@@ -667,6 +667,18 @@ def _emit_extended_t2(a: Asm) -> None:
     a.b_w("T4")
 
     a.label("ext2_track_changed")
+    # --debug: log every inbound RegisterNotification(event_id=0x02
+    # TRACK_CHANGED). T8 already logs event_ids 0x01/0x03..0x0C via
+    # T8reg, but event 0x02 lands here in extended_T2 and never reaches
+    # T8 — without this log we have no visibility into whether a CT is
+    # subscribing to TRACK_CHANGED at all (state[16] arm + T5's TRACK_
+    # CHANGED CHANGED gate are both downstream of this point). r0
+    # holds the event_id (always 0x02 on this arm — verified by the
+    # cmp+beq at 0x657-0x658); _emit_native_log_u32 push/pops r0-r3
+    # internally so r0 survives.
+    if DEBUG_NATIVE_LOG:
+        _emit_native_log_u32(a, "log_fmt_t2reg", 0)
+
     # ---- allocate small frame: stack scratch for state-file write ----
     # sp+0..7  : track_id (read from y1-track-info)
     # sp+8     : transId (caller-supplied)
@@ -2656,6 +2668,9 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         a.align(4)
         a.label("log_fmt_t8reg")
         a.asciiz("T8reg ev=%02x")
+        a.align(4)
+        a.label("log_fmt_t2reg")
+        a.asciiz("T2reg ev=%02x")
         a.align(4)
         # T4 per-attribute emit. Packed value: high 16 = attr_id, low 16 = strlen.
         # tools/avrcp-wire-trace.py reconstructs total wire-frame size per GEA

@@ -669,7 +669,8 @@ Tail with `adb logcat -s Y1Patch:*` to observe the metadata pipeline live; pipe 
 
 | Tag (format string) | Site | Value |
 |---|---|---|
-| `T8reg ev=%02x` | `_emit_t8` entry | inbound `RegisterNotification` `event_id` (8-bit). Counts CT subscription requests per event. |
+| `T8reg ev=%02x` | `_emit_t8` entry | inbound `RegisterNotification` `event_id` for the dispatch in T8 (events 0x01 / 0x03..0x0C). Counts CT subscription requests per event. |
+| `T2reg ev=%02x` | `_emit_extended_t2` `ext2_track_changed` entry | inbound `RegisterNotification` `event_id` for the TRACK_CHANGED-handling arm in extended_T2 (event 0x02 only — distinct from T8). Surfaces whether a CT is actually subscribing to TRACK_CHANGED, which determines whether the downstream T5 CHANGED-emit gate (`state[16]`) gets armed. |
 | `T5emit aid=%08x` | `t5_track_changed` before `track_changed_rsp` | high 32 bits of the `y1-track-info[0..7]` audio_id about to be sent in `TRACK_CHANGED` CHANGED. |
 | `T9emit pstat=%u` | `t9_play_status_changed` before `reg_notievent_playback_rsp` | `play_status` byte (0=STOPPED, 1=PLAYING, 2=PAUSED) about to be sent in PLAYBACK_STATUS_CHANGED CHANGED. |
 | `T9tid c17=%02x` | `t9_play_status_changed` immediately after `T9emit pstat` | byte at `conn[+17]` — the JNI response builder's TID source. Paired with `M5wire c39` to verify M5 TID-echo end-to-end (Trace #59 followup). |
