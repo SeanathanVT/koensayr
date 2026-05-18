@@ -11,7 +11,7 @@ Current shipped patches by binary:
 | Binary | Patches |
 |---|---|
 | `mtkbt` | V1 (AVRCP 1.0→1.3 SDP byte on legacy served record), V2 (AVCTP 1.0→1.2 SDP byte), V3 (A2DP 1.0→1.3 SDP byte), V4 (AVDTP 1.0→1.3 SDP byte), V5 (AVDTP sig 0x0c TBH-table alias to sig 0x02 handler — best-effort workaround for GAVDP 1.3 ICS Acceptor row 9), V6 (internal `activeVersion` 10→14 — routes the SDP record builder to the AVRCP 1.3 served record so the wire-served record matches the F1-surfaced version), V7 (drop AVRCP 1.4 attr 0x000d Browse PSM advertisement on the AVRCP 1.3 record — swap entry slot to 0x0100 ServiceName), V8 (clear stock GroupNavigation bit 5 from SupportedFeatures byte stream so mask = 0x0001), S1 (0x0311 SupportedFeatures → 0x0100 ServiceName attr-table swap on legacy record), P1 (force VENDOR_DEPENDENT through PASSTHROUGH-emit so the JNI sees the frame), M1 / M1b / M1c (three sites in fn 0x379e0 flipped 0x0D→0x0F so trampoline-emitted RegNotif responses get AV/C ctype INTERIM on the wire instead of CHANGED — see Trace #34), M2 (NOP `beq 0x6d0e0` at `0x6d06e` — bypass the outbound-frame builder's list-contains drop gate on Path A, the fragmented multi-frame path for `msg=540` GetElementAttributes), M3 (NOP `strb.w r0, [r4, #0xf2]` at `0x6df42` — disable the chip-busy flag SET on Path A so the gate at `0x6df3a` never trips; both M2 and M3 derived in Trace #40 to eliminate the silent ~80% drop of T9 CHANGED emits under A2DP saturation), M4 (NOP `beq 0x6d19c` at `0x6d116` — bypass the structurally-identical list-contains drop gate on Path B `fcn.0x6d0f0`, the short single-PDU path for `msg=544` RegNotif INTERIM/CHANGED that the dispatcher at `fcn.0xf0bc` selects via `cbz r3, 0xf186` when IPC `byte[9]==0`; see Trace #41 — addresses the subscription-class CT retry-storm where `msg=544` was delivering at ~6% on the wire while `msg=540` on Path A was at ~100%) |
-| `libextavrcp_jni.so` | R1 (msg=519 redirect into trampoline-chain entry) + T1 / T2-stub / extended_T2 / T4 / T5 / T_charset / T_battery / T_continuation / T6 / T8 / T9 trampolines hosted in LOAD #1 page-padding extension; U1 (NOP `UI_SET_EVBIT(EV_REP)` to defang kernel auto-repeat on the AVRCP virtual keyboard). T1 advertises `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}` (mirrors Pixel-as-TG's GetCapabilities event list); T8 NOT_IMPLEMENTs RegisterNotification for events 0x09-0x0c on the wire (AVRCP 1.3 §5.4.2 Tbl 5.28 defines events 0x01-0x08 only, and the CapabilityID 0x03 advertisement is decoupled from the per-event RegisterNotification response per AV/C §6.7.1). |
+| `libextavrcp_jni.so` | R1 (msg=519 redirect into trampoline-chain entry) + T1 / T2-stub / extended_T2 / T4 / T5 / T_charset / T_battery / T_continuation / T6 / T8 / T9 trampolines hosted in LOAD #1 page-padding extension; U1 (NOP `UI_SET_EVBIT(EV_REP)` to defang kernel auto-repeat on the AVRCP virtual keyboard). T1 advertises `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}` — events 0x09-0x0c are 1.4+ event IDs INTERIM-acked with zero payload via existing `libextavrcp.so` builders (no CHANGED ever fires; Y1 has one player, no Now Playing folder, no UID database). Mirrors Pixel-as-TG; what unblocks strict CT metadata-pane render (see Trace #32). |
 | `MtkBt.odex` | F1 (`getPreferVersion()`=14 unblocks 1.3+ Java dispatch), F2 (`disable()` resets `sPlayServiceInterface`), 2 cardinality NOPs (TRACK_CHANGED + PLAYBACK_STATUS_CHANGED switch arms in `BTAvrcpMusicAdapter.handleKeyMessage`) |
 | `com.innioasis.y1*.apk` | A / B / C (Artist→Album navigation), E (discrete PASSTHROUGH PLAY/PAUSE/STOP/NEXT/PREV per AV/C Panel Subunit Spec), H / H′ / H″ (foreground-activity propagation of unhandled discrete media keys + framework-synthetic-repeat filter) |
 | `libaudio.a2dp.default.so` | AH1 (skip `a2dp_stop` in `standby_l` so AudioFlinger silence-timeout leaves the AVDTP source stream alive across pauses) |
@@ -4873,7 +4873,7 @@ Y1T : M5wire c39=NN             (mtkbt wire builder reads chan+0x39 immediately 
 
 If `c39` walks 0..0x0F across the session and matches the prior `T8reg`'s implied TL, M5 is verified end-to-end and the Kia lag is **not** a TID-echo issue. If `c39` stays `00`, M5 is broken on the wire and needs revisiting.
 
-## Trace #60 (2026-05-18) — Bolt's sequential-event-cursor model; T8 INTERIM-ack of 1.4+ events parks the cursor permanently
+## Trace #60 (2026-05-18) — Bolt's sequential-event-cursor model identified; NOT_IMPLEMENTED-via-UNKNOW_INDICATION fix attempted, reverted (UNKNOW_INDICATION at 0x65bc is actually the PASSTHROUGH response builder)
 
 ### Wire-level evidence from `dual-bolt-20260518-1507` (KOENSAYR_DEBUG=1 trampoline build)
 
@@ -4909,18 +4909,69 @@ Trace #32 added the four 1.4+ event IDs (0x09-0x0c) to T1's GetCapabilities adve
 
 Cross-checked against every CT in the matrix: TV / Sonos / Kia / Pixel all subscribe to ev=09 against the current INTERIM-only-never-CHANGED Y1 behavior and their UIs work — none of them depend on a CHANGED for ev=09-0c. The 1.4+ INTERIM-acks were load-bearing for nothing in the matrix; they were Bolt-specific harm.
 
-### Fix
+### Fix attempted (commit `e30dab0`, reverted in commit-after-this)
 
-`_emit_t8`'s `t8_check_8` `bne` now targets `t8_unknown_event` directly. The four arms for ev=0x09 / 0x0a / 0x0b / 0x0c are deleted. Any RegisterNotification with event_id ∉ {0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08} falls through to the existing AV/C NOT_IMPLEMENTED reject path (`UNKNOW_INDICATION` at `0x65bc`). state[20] (sub_now_playing_content) is no longer armed by any path; the T5 / T9 NowPlayingContent CHANGED emit branches remain in code but are dead (the gate is permanently zero).
+`_emit_t8`'s `t8_check_8` `bne` retargeted to `t8_unknown_event` directly. The four arms for ev=0x09 / 0x0a / 0x0b / 0x0c were deleted. Any RegisterNotification with event_id ∉ {0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08} fell through to `UNKNOW_INDICATION` at `0x65bc`. T1's GetCapabilities advertised set unchanged.
 
-T1's GetCapabilities advertised set is unchanged — still `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}` — so the SDP-vs-wire shape continues to mirror Pixel-as-TG. AV/C §6.7.1 explicitly decouples CapabilityID 0x03 advertisement from per-event RegisterNotification response, so a CT that subscribes to an advertised-but-unsupported event correctly handles NOT_IMPLEMENTED by not re-registering it; this is what every CT in the matrix already does for events Y1 doesn't advertise.
+### Post-flash result: MtkBt AVRCP service restarts every ~6 s
 
-### Expected post-flash outcomes
+`dual-bolt-20260518-1547` (post-flash capture):
 
-- **Bolt**: cursor receives NOT_IMPLEMENTED on ev=09, drops 0x09 from its retry set, advances. Same for 0x0a / 0x0b / 0x0c. Bolt should cycle back to ev=01 / ev=02 / ev=05 — the events Y1 fires CHANGED for — and metadata refresh resumes per track edge.
-- **TV / Sonos / Kia / Pixel**: stop re-registering 1.4+ events (less wire traffic). ev=01 / ev=02 / ev=05 / ev=08 cadence unchanged; their metadata-pane logic doesn't depend on 1.4+ CHANGEDs they never received anyway.
-- **Wire spec**: a 1.3-declared TG now returns NOT_IMPLEMENTED for events outside §5.4.2 Tbl 5.28 (events 0x01-0x08), restoring strict AVRCP 1.3 wire conformance.
+```
+15:46:32.996  JNI : MSG_ID_BT_AVRCP_CMD_FRAME_IND size:13 rawkey:0 data_len:13    ; inbound RegNotif ev=09
+15:46:32.997  Y1T : T8reg ev=09                                                    ; T8 entered
+15:46:32.999  JNI : AVRCP_SendMessage len=214
+15:46:33.000  JNI : msg=520, ptr=0x523AA9B0, size=214                              ; "NOT_IMPLEMENTED" IPC reply
+15:46:33.001  JNI : send msg success : 242
+            (no M5wire follows — mtkbt never emits the wire frame)
+15:46:37.415  EXT_AVRCP: BluetoothAvrcpService Constructor enable (NEW PID 1237)   ; mtkbt service restarted
+```
 
-The risk surface is small: TV / Sonos / Kia have been getting "INTERIM forever, never CHANGED" for ev=09-0c the entire v2.0+ trampoline-chain era and none of their UIs depend on the never-arriving CHANGED. Switching to NOT_IMPLEMENTED shortens their retry loops but doesn't disturb the ev=01 / ev=02 / ev=05 paths their UIs actually consume.
+Every `T8reg ev=09` is followed by a 4-second gap and a new BluetoothAvrcpService PID. The cycle repeats for every ev=09 RegisterNotification Bolt sends. mtkbt's AVRCP service is being killed by a watchdog timeout because the IPC frame we sent never makes it to the wire.
+
+### Root-cause: `UNKNOW_INDICATION (0x65bc)` is the PASSTHROUGH response builder
+
+`r2 -a arm -b 16 -m 0x6000 -c 's 0x65bc; pd 60' libextavrcp_jni.so` disassembly:
+
+```
+0x000065bc  4ff0090c  mov.w  ip, 9
+0x000065c0  0824      movs   r4, 8
+0x000065c2  0df5bd75  add.w  r5, sp, 0x17a
+0x000065c6  8de81010  stm.w  sp, {r4, ip}
+0x000065ca  0495      str    r5, [sp, 0x10]
+0x000065cc  0024      movs   r4, 0
+0x000065ce  dff83056  ldr.w  r5, [0x00006c00]   ; "8BluetoothAvrcpService_connectReqNativeP7_JNIEnv..."
+0x000065d2  54ae      add    r6, sp, 0x150
+0x000065d4  cdf80ce0  str.w  lr, [sp, 0xc]
+0x000065d8  06f12906  add.w  r6, r6, 0x29
+0x000065dc  0294      str    r4, [sp, 8]
+0x000065de  fdf722e8  blx    rsym.btmtk_avrcp_send_pass_through_rsp     ← PASSTHROUGH response emitter
+0x000065e2  3946      mov    r1, r7
+...
+```
+
+`0x65bc` is NOT a generic AV/C NOT_IMPLEMENTED dispatcher. It's the PASSTHROUGH-CMD response path: it stages a passthrough response in the JNI's per-conn buffer and calls `btmtk_avrcp_send_pass_through_rsp`. For PASSTHROUGH CMDs the inbound IPC frame has `rawkey != 0`; the builder reads that byte and constructs the response.
+
+T_charset (PDU 0x17) and T_continuation (PDU 0x40 / 0x41) happen to work through this path because their inbound IPC frames are structurally compatible with what the PASSTHROUGH builder reads. PDU 0x31 (RegisterNotification) has `rawkey == 0` and a 13-byte payload of `(PDU, RFU, params_length=5, event_id, playback_interval[4])` — the builder reads garbage from that, stages a malformed IPC reply, and the IPC send succeeds (mtkbt accepts the 242-byte datagram) but mtkbt's parser then chokes on the malformed frame and stalls. After ~4 s the system watchdog kills the AVRCP service and bluetoothd respawns it.
+
+### Why TV and Sonos didn't exhibit this in their post-flash captures
+
+TV and Sonos never sent `T8reg ev=09` in `dual-tv-20260518-1551` / equivalents — they subscribe to ev=09 in parallel bursts during early session connection only. By the time of the user's test play sessions, TV/Sonos had already armed their 1.4+ subscriptions and weren't re-registering them. So they never hit the broken t8_unknown_event path post-flash. Bolt's sequential cursor cycles through events every ~30 s; that's what exposed the bug.
+
+### Side-effect (interesting datapoint)
+
+User reported a progress bar appearing on Bolt's screen for the first time during this flash, even though metadata stayed broken. Likely explanation: between mtkbt restarts, Bolt receives a few `reg_notievent_pos_changed_rsp` CHANGED frames carrying the live position payload — enough to render a position bar briefly. The position didn't move correctly because the position-CHANGED cadence is interrupted by each mtkbt restart.
+
+### Fix reverted; next steps
+
+`_emit_t8` restored to its pre-Trace-#60-attempt state (INTERIM-acks for events 0x09-0x0c). MD5s rolled back to the pre-attempt values.
+
+Open question: how to emit a NOT_IMPLEMENTED RegisterNotification response for ev=09-0x0c without routing through the PASSTHROUGH builder. Candidate paths:
+
+1. **Call a `reg_notievent_*_rsp` PLT helper with r1 != 0** (the "reject" branch of the existing builder per Trace #34's RE: `cbnz r5, reject_path` on r1). What ctype that path emits on the wire is unknown without disassembling the helper at `libextavrcp.so:0x2458`.
+2. **Add a new mtkbt-side patch** to extend the per-event response builder at `fcn.000121d8` with a NOT_IMPLEMENTED branch keyed on a third sentinel value of `ctxt[8]` (current M1 widening picks INTERIM at 0x0F, falls through to CHANGED otherwise — could add 0x08 → NOT_IMPLEMENTED).
+3. **Find the JNI's actual "unknown event_id" handler** — the stock JNI may have a path that emits NOT_IMPLEMENTED for unsupported PDU 0x31 event_ids. We haven't located it yet.
+
+Of these, option 1 is the cheapest experiment (no mtkbt change, no new RE) — worth a small instrumented diagnostic flash to discover what wire ctype the reject path actually emits.
 
 

@@ -2020,7 +2020,7 @@ def _emit_t8(a: Asm) -> None:
 
     a.label("t8_check_8")
     a.cmp_imm8(0, 0x08)
-    a.bne("t8_unknown_event")
+    a.bne("t8_check_9")
     # 0x08 PLAYER_APPLICATION_SETTING_CHANGED INTERIM.
     # reg_notievent_player_appsettings_changed_rsp(
     #     conn, 0, REASON_INTERIM, n, *attr_ids, *values)
@@ -2042,6 +2042,62 @@ def _emit_t8(a: Asm) -> None:
 
     # Arm sub_papp bit (event 0x08) per AVRCP §6.7.1.
     _emit_subscription_write(a, 1, 15, T8_OFF_TIMESPEC_SEC, "t8_done")
+    a.b_w("t8_done")
+
+    # Events 0x09..0x0c — INTERIM ack; only 0x09 arms its gate
+    # (sub_now_playing_content). 0x0a / 0x0b / 0x0c stay INTERIM-only
+    # (Y1 has one player, no UID database). These events live OUTSIDE the
+    # AVRCP 1.3 §5.4.2 Tbl 5.28 set, but emitting NOT_IMPLEMENTED via the
+    # UNKNOW_INDICATION path at 0x65bc is unsafe: that's actually the
+    # PASSTHROUGH response builder, not a generic AV/C reject emitter.
+    # Feeding it a PDU=0x31 (RegisterNotification) inbound produces a
+    # malformed IPC frame that wedges mtkbt's parser and trips a 4 s
+    # watchdog kill of the AVRCP service. See Trace #60 follow-up.
+    a.label("t8_check_9")
+    a.cmp_imm8(0, 0x09)
+    a.bne("t8_check_a")
+    # 0x09 NOW_PLAYING_CONTENT_CHANGED — no payload.
+    a.movs_imm8(2, REASON_INTERIM)
+    a.movs_imm8(1, 0)
+    a.add_imm_t3(0, 5, 8)
+    a.blx_imm(PLT_reg_notievent_now_playing_content_rsp)
+
+    # Arm sub_now_playing_content (state[20]). T5 / T9 CHANGED emits gate on this.
+    _emit_subscription_write(a, 1, 20, T8_OFF_TIMESPEC_SEC, "t8_done")
+    a.b_w("t8_done")
+
+    a.label("t8_check_a")
+    a.cmp_imm8(0, 0x0A)
+    a.bne("t8_check_b")
+    # 0x0A AVAILABLE_PLAYERS_CHANGED — no payload.
+    a.movs_imm8(2, REASON_INTERIM)
+    a.movs_imm8(1, 0)
+    a.add_imm_t3(0, 5, 8)
+    a.blx_imm(PLT_reg_notievent_availplayers_rsp)
+    a.b_w("t8_done")
+
+    a.label("t8_check_b")
+    a.cmp_imm8(0, 0x0B)
+    a.bne("t8_check_c")
+    # 0x0B ADDRESSED_PLAYER_CHANGED — PlayerID u16 in r3, UidCounter u16
+    # at sp[0]. Both = 0 (Y1 has one player, no UID database).
+    a.movs_imm8(3, 0)
+    a.str_sp_imm(3, 0)                          # sp[0] = uid_counter (0)
+    a.movs_imm8(2, REASON_INTERIM)
+    a.movs_imm8(1, 0)
+    a.add_imm_t3(0, 5, 8)
+    a.blx_imm(PLT_reg_notievent_addredplayer_rsp)
+    a.b_w("t8_done")
+
+    a.label("t8_check_c")
+    a.cmp_imm8(0, 0x0C)
+    a.bne("t8_unknown_event")
+    # 0x0C UIDS_CHANGED — UidCounter u16 in r3.
+    a.movs_imm8(3, 0)
+    a.movs_imm8(2, REASON_INTERIM)
+    a.movs_imm8(1, 0)
+    a.add_imm_t3(0, 5, 8)
+    a.blx_imm(PLT_reg_notievent_uids_changed_rsp)
     a.b_w("t8_done")
 
     a.label("t8_unknown_event")
