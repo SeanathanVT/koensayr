@@ -4680,4 +4680,55 @@ Keeping the setPlayStatus-skip in place. If the 2 s delay returns on subsequent 
 
 
 
+## Trace #59 (2026-05-18) — §6.7.1 strict gate clears removed; aligning with Bluedroid's universal §5.4.2 reading
 
+**Premise.** User pushed back on the perceived metadata + position lag against the Kia EV6 head unit. Investigation against a captured Pixel-4 (AVRCP 1.3 mode, paired with the same Kia head unit) `/data/misc/bluetooth/logs/btsnoop_hci.log` revealed Pixel and Y1 advertise structurally identical AVRCP TG SDP records — Profile Version 0x0103, `SupportedFeatures=0x0001`, no Browse PSM, same 8-event GetCapabilities set `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}`. Yet Pixel→Kia is "instant" and Y1→Kia has multi-second position-bar + play-state-icon lag.
+
+**Wire-level evidence (Pixel→Kia, 100 s of capture):**
+
+| event | Pixel CHANGED count | Cadence | Kia re-registers? |
+|---|---|---|---|
+| 0x01 PlaybackStatus | 4 | on every play/pause edge | ✓ within ~3 ms |
+| 0x02 TrackChanged | 5 | on every track edge | ✓ |
+| 0x05 PlaybackPositionChanged | 42 | **~1.02 s spacing, sustained** | ✓ every time |
+| 0x09 NowPlayingContent | 5 | on every track edge | ✓ |
+
+Kia's NOTIFY for ev=05 explicitly negotiates `playback_interval = 1` (frame 1511); Pixel honours that contract throughout the subscription lifetime, emitting 42 absolute-position pushes at the requested cadence. Kia re-registers each emit (43 INTERIM responses) and the loop is self-sustaining.
+
+**Y1 behaviour against the same Kia (capture `dual-kia-20260517-1842`, debug-instrumented):**
+
+| Y1T tag | count |
+|---|---|
+| `T8reg ev=01,05,08,09,0a,0b,0c` | 7 (initial subscribe) |
+| `T8reg ev=02` | 0 — Kia skipped (separate issue, ev=02 subscription split, not load-bearing here) |
+| `T8reg ev=09` re-register | 1 (Kia re-registered NPC after first CHANGED) |
+| `T9emit pstat=` | **1** (single play-status edge ever delivered) |
+| `T9emit pos=` | **1** (single pos CHANGED ever delivered) |
+| `T5emit aid=` | 1 (single track-changed ever delivered) |
+
+After Y1's first CHANGED on each subscribed event, the trampoline cleared the gate byte and Kia — apparently not re-registering ev=01 or ev=05 (a documented difference vs ev=09 where Kia *does* re-register) — fell back to its built-in 5 s `GetPlayStatus` poll for play-state and position. The 5 s poll cadence is what the user feels as lag.
+
+**Root cause.** `src/patches/_trampolines.py` previously implemented AVRCP 1.3 §6.7.1 with the strict reading of §5.4.2 ("only one such notification shall be received as a response to a RegisterNotification command") — emit once, clear the gate, require CT to re-register for the next emit. Four sites:
+
+| event | gate byte | emit site | clear site |
+|---|---|---|---|
+| 0x01 PLAYBACK_STATUS | state[14] | T9 line 2293 | T9 line 2298 |
+| 0x02 TRACK_CHANGED | state[16] | T5 line 925 | T5 line 942 |
+| 0x05 PLAYBACK_POS_CHANGED | state[13] | T9 line 2516 | T9 line 2523 |
+| 0x08 PLAYER_APP_SETTINGS | state[15] | T9 line 2395 | T9 line 2400 |
+
+Four other events (0x03, 0x04, 0x06, 0x09) already implemented the relaxed model (no clear). The asymmetry was historical iteration, not principled design.
+
+**Decision.** AVRCP 1.3 §5.4.2's "only one such notification" is the same clause Bluedroid (AOSP), BlueZ, and iOS all interpret as "only one CHANGED per *event-occurrence*", not "only one CHANGED per *RegisterNotification command*". The Pixel btsnoop is direct evidence that this is what real-world AVRCP TGs do. CTs in the field are designed against that reading — both CTs that re-register proactively (Bluedroid-style) and CTs that subscribe once and rely on the TG to keep emitting work. Y1's strict reading was a defensible-but-isolated minority interpretation that produced UI lag against the second class.
+
+Removed the four `_emit_subscription_write(a, 0, …)` calls (G1-G4). T2 / T8 INTERIM arm bytes remain (gate is still set-once on subscription). T5 / T9 CHANGED emits still gate on the subscription byte; they just don't clear it. Result:
+
+- ev=05 now fires `pos_changed_rsp` at the music app's `playstatechanged` ~1 Hz tick for the subscription lifetime, matching Pixel's pattern exactly.
+- ev=01 / ev=02 / ev=08 fire on every actual state edge for the subscription lifetime.
+- CTs that subscribed but never re-register stay in sync with Y1's state.
+- CTs that re-register proactively see the same wire-side behaviour they did before (the gate is already armed; reads / re-arms are idempotent).
+- TV is unaffected for ev=05 (doesn't subscribe) and continues to receive the same edge-driven ev=01 / ev=09 emits it did before.
+
+`_emit_subscription_write` helper retained; only callers writing `byte_value=0` were removed. Helper docstring + schema-comment block at top of `_trampolines.py` updated to reflect the relaxed model. `docs/BT-COMPLIANCE.md` §2 notification-events table rewritten to match. `OUTPUT_MD5` updated: release `813d008db4914f43e33e0dd3e11a25e7`; debug `f723fadb6d629d4ae6ef738552cb734b`.
+
+Pre-flash, capture `dual-kia-20260517-1842` is tagged `checkpoint/pre-547-relax` as the known-good baseline. Post-flash testing will compare `T9emit pstat=` / `T9emit pos=` / `T5emit aid=` counts: expected pattern is ev=05 firing at ~1 Hz throughout playback, ev=01 firing on every play/pause edge, ev=02 firing on every track edge (when subscribed).

@@ -169,9 +169,12 @@ T8_EVENT_ID_OFF    = 386 + T8_FRAME        # caller-frame event_id, post-SUB-SP
 #   [21..23] padding (4-B align)
 #
 # Session-long gate semantics: T2 / T8 INTERIM arms a gate byte = 1; T5 / T9
-# CHANGED reads but does not clear. Strict CTs accept unsolicited CHANGED
-# following the first INTERIM; the strict §6.7.1 "single-shot per registration"
-# semantic stalled strict CTs that don't reliably re-register between changes.
+# CHANGED reads but does not clear. AVRCP 1.3 §5.4.2's "only one such
+# notification" is read the way AOSP Bluedroid (and BlueZ, iOS) read it:
+# emit on every event occurrence for the subscription lifetime, not once
+# per RegisterNotification command. CTs that proactively re-register and
+# CTs that don't both keep receiving CHANGEDs as the underlying state
+# changes.
 #
 # Single-writer regions (no read-modify-write race): T9 writes [9..12]
 # (4-B block at off 9), T5 writes [0..8] (9-B block at off 0), T2/T8 writes
@@ -739,10 +742,9 @@ def _emit_extended_t2(a: Asm) -> None:
     a.add_sp_imm(3, T2_OFF_TID)               # r3 = &sp[0] = audio_id (BE u64)
     a.blx_imm(PLT_track_changed_rsp)
 
-    # Arm sub_track_changed (event 0x02) per AVRCP §6.7.1. T5 emits CHANGED
-    # for events 0x02 / 0x03 / 0x04 on track edges; we gate each separately
-    # so strict CTs that subscribe to event 0x02 alone get exactly one
-    # INTERIM + one CHANGED per registration.
+    # Arm sub_track_changed (event 0x02). T5 emits CHANGED on every
+    # track edge for the subscription lifetime; the gate is set-once,
+    # not cleared on emit.
     _emit_subscription_write(a, 1, 16, T2_OFF_SUB_SCRATCH, "ext2_epilogue")
 
     a.label("ext2_epilogue")
@@ -914,7 +916,9 @@ def _emit_t5(a: Asm) -> None:
     # = y1-track-info[0..7] (audio_id BE u64). Strict 1.4+ CTs cache
     # GetElementAttributes keyed by Identifier; a per-track id forces
     # refresh on every track edge.
-    # sub_track_changed bit at state[16] (cleared after emit per §6.7.1).
+    # sub_track_changed bit at state[16] (armed by ext_T2 INTERIM, not
+    # cleared on emit — fires on every track edge for the subscription
+    # lifetime, matching Bluedroid's reading of §5.4.2).
     a.ldrb_w(0, 13, T5_OFF_STATE + 16)
     a.cmp_imm8(0, 0)
     a.beq("t5_skip_track_changed")
@@ -935,12 +939,6 @@ def _emit_t5(a: Asm) -> None:
         a.rev_lo_lo(6, 6)
         _emit_native_log_u32(a, "log_fmt_t5emit", 6)
     a.blx_imm(PLT_track_changed_rsp)
-
-    # AVRCP §6.7.1 strict: clear sub_track_changed (state[16]) after CHANGED.
-    # CT must re-RegisterNotification(0x02) for the next track-edge CHANGED.
-    # r4 holds struct ptr — use fd_reg=6.
-    _emit_subscription_write(a, 0, 16, T5_OFF_FILE + 0,
-                             "t5_skip_track_changed", fd_reg=6)
 
     a.label("t5_skip_track_changed")
 
@@ -1719,12 +1717,13 @@ def _emit_subscription_write(a: Asm, byte_value: int, state_byte_offset: int,
                              fd_reg: int = 4) -> None:
     """Write `byte_value` (0 or 1) to y1-trampoline-state[state_byte_offset].
 
-    Used by T2 / T8 to ARM (`byte_value=1`) and by T5 / T9 to CLEAR
-    (`byte_value=0`) per-event subscription gates for AVRCP §6.7.1
-    once-per-registration semantics. `fd_reg` (default 4) is the
-    callee-saved register cached as the open()'d fd across the lseek /
-    write / close PLT blx calls (callee-saved per AAPCS so the value
-    survives).
+    Used by T2 / T8 INTERIM to ARM (`byte_value=1`) per-event subscription
+    gates. T5 / T9 CHANGED paths read but no longer clear (aligned with
+    Bluedroid's universal reading of §5.4.2 — emit on every event
+    occurrence for the subscription lifetime, not once per registration).
+    `fd_reg` (default 4) is the callee-saved register cached as the
+    open()'d fd across the lseek / write / close PLT blx calls
+    (callee-saved per AAPCS so the value survives).
 
     Default fd_reg=4 keeps T2 / T8 callers untouched: they branch to a
     terminal label immediately after this helper returns, so r4 going
@@ -2274,9 +2273,9 @@ def _emit_t9(a: Asm) -> None:
     a.strb_w(0, 13, T9_STATE_LAST_PS_OFF)
     a.movs_imm8(5, 1)                         # any_change = 1
 
-    # Subscription gate (§6.7.1 strict): emit CHANGED only if T8 INTERIM has
-    # armed sub_play_status (state[14] = 1). Gate is cleared after emit
-    # below; CT must re-RegisterNotification(0x01) for the next CHANGED.
+    # Subscription gate: emit CHANGED only if T8 INTERIM has armed
+    # sub_play_status (state[14] = 1). Not cleared on emit — fires on
+    # every play_status edge for the subscription lifetime.
     a.ldrb_w(1, 13, T9_STATE_SUB_PLAY_OFF)
     a.cmp_imm8(1, 0)
     a.beq("t9_after_play_check")
@@ -2291,12 +2290,6 @@ def _emit_t9(a: Asm) -> None:
     if DEBUG_NATIVE_LOG:
         _emit_native_log_u32(a, "log_fmt_t9pstat", 3)
     a.blx_imm(PLT_reg_notievent_playback_rsp)
-
-    # AVRCP §6.7.1 strict: clear sub_play_status (state[14]) after CHANGED.
-    # CT must re-RegisterNotification(0x01) to receive the next emit.
-    # r4 holds struct ptr — use fd_reg=6.
-    _emit_subscription_write(a, 0, 14, T9_OFF_ARGS,
-                             "t9_after_play_check", fd_reg=6)
 
     # ---- emit NowPlayingContentChanged CHANGED on play-edge ----
     # Paired with PlaybackStatus + TrackChanged as a 3-frame burst on
@@ -2373,9 +2366,9 @@ def _emit_t9(a: Asm) -> None:
     a.strb_w(0, 13, T9_STATE_LAST_SHUFFLE_OFF)
     a.movs_imm8(5, 1)                         # any_change = 1
 
-    # Subscription gate (§6.7.1 strict): emit CHANGED only if T8 INTERIM has
-    # armed sub_papp (state[15] = 1). Cleared after emit; CT must
-    # re-RegisterNotification(0x08) to receive the next PApp CHANGED.
+    # Subscription gate: emit CHANGED only if T8 INTERIM has armed
+    # sub_papp (state[15] = 1). Not cleared on emit — fires on every
+    # repeat / shuffle setting edge for the subscription lifetime.
     a.ldrb_w(1, 13, T9_STATE_SUB_PAPP_OFF)
     a.cmp_imm8(1, 0)
     a.beq("t9_after_papp_check")
@@ -2393,12 +2386,6 @@ def _emit_t9(a: Asm) -> None:
     a.movs_imm8(2, REASON_CHANGED)
     a.movs_imm8(3, 2)                         # n
     a.blx_imm(PLT_reg_notievent_player_appsettings_rsp)
-
-    # AVRCP §6.7.1 strict: clear sub_papp (state[15]) after CHANGED.
-    # CT must re-RegisterNotification(0x08) for the next PApp CHANGED.
-    # r4 holds struct ptr — use fd_reg=6.
-    _emit_subscription_write(a, 0, 15, T9_OFF_ARGS,
-                             "t9_after_papp_check", fd_reg=6)
 
     a.label("t9_after_papp_check")
 
@@ -2456,10 +2443,10 @@ def _emit_t9(a: Asm) -> None:
     a.cmp_imm8(0, 1)                          # 1 = PLAYING (AVRCP §5.4.1 Tbl 5.26)
     a.bne("t9_done")
 
-    # Subscription gate (§6.7.1 strict): emit only if sub_pos armed
-    # (state[13] = 1). Cleared after emit; CT must re-register to receive
-    # the next CHANGED. Wire-side POS_CHANGED rate becomes
-    # min(PositionTicker 1 Hz, CT re-register rate).
+    # Subscription gate: emit only if sub_pos armed (state[13] = 1).
+    # Not cleared on emit — T9 fires this at the music-app's
+    # `playstatechanged` ~1 Hz tick for the subscription lifetime,
+    # which matches the `Interval: 1` second CTs typically negotiate.
     a.ldrb_w(0, 13, T9_STATE_SUB_POS_OFF)
     a.cmp_imm8(0, 0)
     a.beq("t9_done")
@@ -2514,13 +2501,6 @@ def _emit_t9(a: Asm) -> None:
     if DEBUG_NATIVE_LOG:
         _emit_native_log_u32(a, "log_fmt_t9pos", 3)
     a.blx_imm(PLT_reg_notievent_pos_changed_rsp)
-
-    # AVRCP §6.7.1 strict: clear sub_pos (state[13]) after CHANGED.
-    # CT must re-RegisterNotification(0x05) to receive the next emit.
-    # CT-side cadence of re-registers effectively sets the wire-side
-    # POS_CHANGED rate (≈1 Hz for Bolt-on-Pixel). r4 holds struct ptr —
-    # use fd_reg=6.
-    _emit_subscription_write(a, 0, 13, T9_OFF_ARGS, "t9_done", fd_reg=6)
 
     a.label("t9_done")
     # ---- epilogue: return jboolean true ----

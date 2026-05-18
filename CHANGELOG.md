@@ -6,6 +6,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 ### Fixed
+- Live position-bar and play/pause UI updates on head units that subscribe once and rely on the source to keep emitting updates (a pattern common to in-car infotainment). Y1 previously emitted one notification per subscription before requiring the head unit to re-register, which left the position scrubber and play/pause icon stuck for several seconds at a time on those head units. Y1 now emits notifications continuously while subscribed, matching how every major AVRCP source (Android, iOS, BlueZ) interprets the spec.
 - Reliable metadata-pane updates on subscription-style head units. Stock `mtkbt` silently dropped the AVRCP responses these head units rely on for subscription confirmation under sustained audio load, causing them to abandon the AVRCP session after a few seconds.
 - AVRCP transaction-label echoing on head units that rotate AVCTP transaction IDs across the 0-15 range. Stock `mtkbt` clobbered the inbound command's transaction ID before building the outbound response, shipping every Path B response with transaction ID 0; head units that don't use transaction ID 0 exclusively saw their subscriptions and command-responses mismatch and abandon the AVRCP session.
 - Discrete PAUSE handling for head units with separate pause and play UI buttons. Stock AOSP's `AVRCP.kl` coalesced Linux `KEY_PAUSECD` into the toggle keycode, so a head unit that sent the AVRCP-spec-compliant discrete PAUSE command (PASSTHROUGH 0x46) caused Y1's player to toggle between play and pause on every press instead of pausing idempotently. After the fix, discrete PAUSE pauses and stays paused; the play button (PASSTHROUGH 0x44) resumes. Head units that send `0x44 PLAY` as a toggle (the older convention) are unaffected.
@@ -20,7 +21,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [2.2.0] - 2026-05-16
 ### Changed
-- AVRCP 1.3 §6.7.1 strict subscription gating in the trampoline chain — one CHANGED per CT registration; CT re-registers to receive the next. Matches Pixel-as-TG observed cadence on spec-compliant Controllers.
+- Per-event subscription gating in the trampoline chain — T8 INTERIM arms the per-event byte in `y1-trampoline-state[13..20]`; T5 / T9 emit CHANGED for the lifetime of the subscription on every event occurrence (universal AVRCP 1.3 §5.4.2 reading, aligned with AOSP Bluedroid).
 - `mtkbt` outbound-frame drop bypass — every T9 / T5 CHANGED emit reaches the wire under sustained traffic (stock dropped silently under A2DP saturation).
 - TRACK_CHANGED `Identifier` carries the per-track audio ID so strict 1.4+ Controllers invalidate their `GetElementAttributes` cache on every track edge instead of serving stale metadata.
 - Faster perceived metadata refresh — TRACK_CHANGED pre-emits at `setDataSource` and at `playerPrepared` tail (was: `OnPreparedListener`, ~100-500 ms later). PLAYBACK_STATUS_CHANGED fresh-track edge fires ~260 ms earlier.
@@ -49,7 +50,7 @@ AVRCP 1.3 metadata + control pipeline over Bluetooth. A peer Controller now sees
 - Bidirectional Repeat / Shuffle. CT and Y1 UI stay in sync without navigating away and back.
 - Discrete PASSTHROUGH routing (PLAY / PAUSE / STOP / NEXT / PREVIOUS) for CTs that don't tolerate toggle behaviour, plus PLAY-while-playing → pause-toggle for non-spec CTs.
 - A2DP stream survives pauses — AudioFlinger silence-timeout no longer tears down the AVDTP source.
-- Per-subscription notification gating (AVRCP §6.7.1) — one INTERIM + one CHANGED per registration, matching spec-compliant TG semantics.
+- Per-event notification gating (AVRCP §6.7.1 framework) — T8 INTERIM arms subscription bytes; T5 / T9 emit CHANGED for the subscription lifetime on every event occurrence.
 - `Y1Bridge` Android service satisfies MtkBt's `bindService(MediaPlaybackService)` and answers synchronous queries from the music-app-owned state file.
 - Spec-compliant `GetElementAttributes` response shape — TG emits exactly the requested attribute IDs in the requested order; unsupported IDs emit with length 0.
 
