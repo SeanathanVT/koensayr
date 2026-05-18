@@ -41,12 +41,12 @@ NATIVE_TRACK_CHANGED_VADDR = 0x3bc0
 NATIVE_PLAY_STATUS_CHANGED_VADDR = 0x3c88
 
 STOCK_MD5         = "fd2ce74db9389980b55bccf3d8f15660"
-OUTPUT_MD5        = "d803f42c973bf9539f4d03ccb658cab3"
+OUTPUT_MD5        = "da3346fe7147324f8df718def8ac82f5"
 
 # --debug: splices __android_log_print calls into T5/T6/T8/T9 emit sites
 # (tag "Y1T"). Release builds remain byte-identical without the env var.
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "4995ca171d0c446b7ce8886022ba7b2c"
+OUTPUT_DEBUG_MD5  = "de8bf4f9d1c84c756b08c9849ca58a02"
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
 # ---------------------------------------------------------------- T1
@@ -54,8 +54,11 @@ EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 # T1 — GetCapabilities trampoline at 0x7308 (overwrites testparmnum, 40 of
 # 48 bytes). Advertised set: 0x01 PLAYBACK_STATUS, 0x02 TRACK_CHANGED,
 # 0x05 PLAYBACK_POS, 0x08 PLAYER_APPLICATION_SETTING_CHANGED, plus 1.4
-# IDs 0x09..0x0c (T8 INTERIM-only, no CHANGED). Strict CTs gate their
-# metadata-pane render on the 1.4 IDs being acked even from a 1.3 TG.
+# IDs 0x09..0x0c retained in the advertised list (mirrors Pixel-as-TG).
+# T8 NOT_IMPLEMENTs RegisterNotification for events 0x09-0x0c on the wire
+# (AVRCP 1.3 §5.4.2 Table 5.28 defines events 0x01-0x08 only); the
+# CapabilityID 0x03 advertisement is decoupled from the per-event
+# RegisterNotification response per AV/C §6.7.1.
 T1_TRAMPOLINE = bytes([
     0x9D, 0xF8, 0x7E, 0x01,                  # ldrb.w r0, [sp, #382]
     0x10, 0x28,                               # cmp r0, #0x10

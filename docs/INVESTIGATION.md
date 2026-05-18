@@ -11,7 +11,7 @@ Current shipped patches by binary:
 | Binary | Patches |
 |---|---|
 | `mtkbt` | V1 (AVRCP 1.0→1.3 SDP byte on legacy served record), V2 (AVCTP 1.0→1.2 SDP byte), V3 (A2DP 1.0→1.3 SDP byte), V4 (AVDTP 1.0→1.3 SDP byte), V5 (AVDTP sig 0x0c TBH-table alias to sig 0x02 handler — best-effort workaround for GAVDP 1.3 ICS Acceptor row 9), V6 (internal `activeVersion` 10→14 — routes the SDP record builder to the AVRCP 1.3 served record so the wire-served record matches the F1-surfaced version), V7 (drop AVRCP 1.4 attr 0x000d Browse PSM advertisement on the AVRCP 1.3 record — swap entry slot to 0x0100 ServiceName), V8 (clear stock GroupNavigation bit 5 from SupportedFeatures byte stream so mask = 0x0001), S1 (0x0311 SupportedFeatures → 0x0100 ServiceName attr-table swap on legacy record), P1 (force VENDOR_DEPENDENT through PASSTHROUGH-emit so the JNI sees the frame), M1 / M1b / M1c (three sites in fn 0x379e0 flipped 0x0D→0x0F so trampoline-emitted RegNotif responses get AV/C ctype INTERIM on the wire instead of CHANGED — see Trace #34), M2 (NOP `beq 0x6d0e0` at `0x6d06e` — bypass the outbound-frame builder's list-contains drop gate on Path A, the fragmented multi-frame path for `msg=540` GetElementAttributes), M3 (NOP `strb.w r0, [r4, #0xf2]` at `0x6df42` — disable the chip-busy flag SET on Path A so the gate at `0x6df3a` never trips; both M2 and M3 derived in Trace #40 to eliminate the silent ~80% drop of T9 CHANGED emits under A2DP saturation), M4 (NOP `beq 0x6d19c` at `0x6d116` — bypass the structurally-identical list-contains drop gate on Path B `fcn.0x6d0f0`, the short single-PDU path for `msg=544` RegNotif INTERIM/CHANGED that the dispatcher at `fcn.0xf0bc` selects via `cbz r3, 0xf186` when IPC `byte[9]==0`; see Trace #41 — addresses the subscription-class CT retry-storm where `msg=544` was delivering at ~6% on the wire while `msg=540` on Path A was at ~100%) |
-| `libextavrcp_jni.so` | R1 (msg=519 redirect into trampoline-chain entry) + T1 / T2-stub / extended_T2 / T4 / T5 / T_charset / T_battery / T_continuation / T6 / T8 / T9 trampolines hosted in LOAD #1 page-padding extension; U1 (NOP `UI_SET_EVBIT(EV_REP)` to defang kernel auto-repeat on the AVRCP virtual keyboard). T1 advertises `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}` — events 0x09-0x0c are 1.4+ event IDs INTERIM-acked with zero payload via existing `libextavrcp.so` builders (no CHANGED ever fires; Y1 has one player, no Now Playing folder, no UID database). Mirrors Pixel-as-TG; what unblocks strict CT metadata-pane render (see Trace #32). |
+| `libextavrcp_jni.so` | R1 (msg=519 redirect into trampoline-chain entry) + T1 / T2-stub / extended_T2 / T4 / T5 / T_charset / T_battery / T_continuation / T6 / T8 / T9 trampolines hosted in LOAD #1 page-padding extension; U1 (NOP `UI_SET_EVBIT(EV_REP)` to defang kernel auto-repeat on the AVRCP virtual keyboard). T1 advertises `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}` (mirrors Pixel-as-TG's GetCapabilities event list); T8 NOT_IMPLEMENTs RegisterNotification for events 0x09-0x0c on the wire (AVRCP 1.3 §5.4.2 Tbl 5.28 defines events 0x01-0x08 only, and the CapabilityID 0x03 advertisement is decoupled from the per-event RegisterNotification response per AV/C §6.7.1). |
 | `MtkBt.odex` | F1 (`getPreferVersion()`=14 unblocks 1.3+ Java dispatch), F2 (`disable()` resets `sPlayServiceInterface`), 2 cardinality NOPs (TRACK_CHANGED + PLAYBACK_STATUS_CHANGED switch arms in `BTAvrcpMusicAdapter.handleKeyMessage`) |
 | `com.innioasis.y1*.apk` | A / B / C (Artist→Album navigation), E (discrete PASSTHROUGH PLAY/PAUSE/STOP/NEXT/PREV per AV/C Panel Subunit Spec), H / H′ / H″ (foreground-activity propagation of unhandled discrete media keys + framework-synthetic-repeat filter) |
 | `libaudio.a2dp.default.so` | AH1 (skip `a2dp_stop` in `standby_l` so AudioFlinger silence-timeout leaves the AVDTP source stream alive across pauses) |
@@ -4873,6 +4873,54 @@ Y1T : M5wire c39=NN             (mtkbt wire builder reads chan+0x39 immediately 
 
 If `c39` walks 0..0x0F across the session and matches the prior `T8reg`'s implied TL, M5 is verified end-to-end and the Kia lag is **not** a TID-echo issue. If `c39` stays `00`, M5 is broken on the wire and needs revisiting.
 
+## Trace #60 (2026-05-18) — Bolt's sequential-event-cursor model; T8 INTERIM-ack of 1.4+ events parks the cursor permanently
 
+### Wire-level evidence from `dual-bolt-20260518-1507` (KOENSAYR_DEBUG=1 trampoline build)
+
+The 2026-05-18 Bolt capture shows the first ~4 track changes updating metadata correctly, then a hard cut-over: track #5 ("You Get Worked") and track #6 ("Title Holder") never refresh the Bolt screen's metadata pane. The shuffle UI also flickers briefly between tracks 4 and 5.
+
+Reconstructing the Y1-side timeline from `Y1Patch fL.id=` markers (music app track-id changes) cross-correlated against `Y1T T8reg ev=` markers (Bolt's RegisterNotification CMDs reaching the JNI):
+
+| Phase | Window | Bolt's RegisterNotification events |
+|---|---|---|
+| P0 | session start → 15:05:08 (30 s) | ev=01 every 3 s |
+| P1 | 15:05:18 (track #3 edge) | no T8reg |
+| P2 | 15:05:44 → 15:06:14 (33 s) | ev=05 every 3 s |
+| P3 boundary | **15:06:17.616** | first T8reg ev=09 (NOW_PLAYING_CONTENT_CHANGED, AVRCP 1.4+) |
+| P3 | 15:06:17 → 15:06:44 | ev=0a every 3 s |
+| P4 | 15:06:47 → 15:07:08 | ev=08 every 3 s |
+| (silent) | 15:07:08 → 15:08:15 | no T8reg |
+
+At any moment Bolt is subscribed to exactly **one** event_id and re-registers it every ~3 s until either Y1 fires a CHANGED or some internal trigger advances the cursor. This is fundamentally different from every other CT in the Y1 test matrix:
+
+| CT | Pattern | Evidence |
+|---|---|---|
+| Pixel 4 (reference) | Parallel: subscribes to {01,02,05,08,09,0a,0b,0c} in a 110 ms burst, re-registers each on its own CHANGED | `pixel4-bugreport/.../btsnoop_hci.log` frames 1498-1545 |
+| TV | Parallel: tight bursts of {01,08,09,0b,0c} every track edge + connection event | `dual-tv-20260518-1432`: 14:30:23.905-32.032 (5 events in 127 ms), repeats at 14:31:50 |
+| Sonos | Parallel: ev=01 + ev=09 interleaved within ms | `dual-sonos-20260517-1852`: 18:50:05.670 ev=01 → .673 ev=09 (3 ms gap) |
+| Kia | Mostly parallel, low cadence: single burst of {01,05,08,09,0a,0b,0c}, then ev=01 / ev=05 polling | `dual-kia-20260518-1131` |
+| **Bolt** | **Sequential cursor**, one event_id at any moment | This capture |
+
+Bolt's cursor advances away from an event only after that event delivers a CHANGED. Once parked on ev=0a (AVAILABLE_PLAYERS_CHANGED), Y1 INTERIM-acks but never emits CHANGED — ev=0a / ev=0b / ev=0c are 1.4+ events for which Y1 has no semantic source. The cursor stalls there indefinitely; Bolt stops re-registering ev=01 / ev=02 / ev=05 (the events Y1 actually drives) and the metadata pane freezes on whatever was playing when the cursor crossed into the 1.4+ band.
+
+### Why Trace #32's hypothesis turned out to invert here
+
+Trace #32 added the four 1.4+ event IDs (0x09-0x0c) to T1's GetCapabilities advertisement *and* to T8's INTERIM dispatch table because Pixel-as-TG (in `pixel4-bugreport/.../btsnoop_hci.log`) advertises that exact set from an AVRCP 1.3-declared TG. The hypothesis was that strict CTs gate metadata-pane render on the 1.4+ ack. Trace #33 immediately refuted the gating hypothesis for Bolt (post-flash pane still empty) and located the actual blocker at the InformDisplayableCharacterSet ACK path. The 1.4+ INTERIM-ack code stayed in tree from Trace #32 as inherited dead-end work.
+
+Cross-checked against every CT in the matrix: TV / Sonos / Kia / Pixel all subscribe to ev=09 against the current INTERIM-only-never-CHANGED Y1 behavior and their UIs work — none of them depend on a CHANGED for ev=09-0c. The 1.4+ INTERIM-acks were load-bearing for nothing in the matrix; they were Bolt-specific harm.
+
+### Fix
+
+`_emit_t8`'s `t8_check_8` `bne` now targets `t8_unknown_event` directly. The four arms for ev=0x09 / 0x0a / 0x0b / 0x0c are deleted. Any RegisterNotification with event_id ∉ {0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08} falls through to the existing AV/C NOT_IMPLEMENTED reject path (`UNKNOW_INDICATION` at `0x65bc`). state[20] (sub_now_playing_content) is no longer armed by any path; the T5 / T9 NowPlayingContent CHANGED emit branches remain in code but are dead (the gate is permanently zero).
+
+T1's GetCapabilities advertised set is unchanged — still `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}` — so the SDP-vs-wire shape continues to mirror Pixel-as-TG. AV/C §6.7.1 explicitly decouples CapabilityID 0x03 advertisement from per-event RegisterNotification response, so a CT that subscribes to an advertised-but-unsupported event correctly handles NOT_IMPLEMENTED by not re-registering it; this is what every CT in the matrix already does for events Y1 doesn't advertise.
+
+### Expected post-flash outcomes
+
+- **Bolt**: cursor receives NOT_IMPLEMENTED on ev=09, drops 0x09 from its retry set, advances. Same for 0x0a / 0x0b / 0x0c. Bolt should cycle back to ev=01 / ev=02 / ev=05 — the events Y1 fires CHANGED for — and metadata refresh resumes per track edge.
+- **TV / Sonos / Kia / Pixel**: stop re-registering 1.4+ events (less wire traffic). ev=01 / ev=02 / ev=05 / ev=08 cadence unchanged; their metadata-pane logic doesn't depend on 1.4+ CHANGEDs they never received anyway.
+- **Wire spec**: a 1.3-declared TG now returns NOT_IMPLEMENTED for events outside §5.4.2 Tbl 5.28 (events 0x01-0x08), restoring strict AVRCP 1.3 wire conformance.
+
+The risk surface is small: TV / Sonos / Kia have been getting "INTERIM forever, never CHANGED" for ev=09-0c the entire v2.0+ trampoline-chain era and none of their UIs depend on the never-arriving CHANGED. Switching to NOT_IMPLEMENTED shortens their retry loops but doesn't disturb the ev=01 / ev=02 / ev=05 paths their UIs actually consume.
 
 
