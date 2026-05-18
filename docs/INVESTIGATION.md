@@ -11,7 +11,7 @@ Current shipped patches by binary:
 | Binary | Patches |
 |---|---|
 | `mtkbt` | V1 (AVRCP 1.0→1.3 SDP byte on legacy served record), V2 (AVCTP 1.0→1.2 SDP byte), V3 (A2DP 1.0→1.3 SDP byte), V4 (AVDTP 1.0→1.3 SDP byte), V5 (AVDTP sig 0x0c TBH-table alias to sig 0x02 handler — best-effort workaround for GAVDP 1.3 ICS Acceptor row 9), V6 (internal `activeVersion` 10→14 — routes the SDP record builder to the AVRCP 1.3 served record so the wire-served record matches the F1-surfaced version), V7 (drop AVRCP 1.4 attr 0x000d Browse PSM advertisement on the AVRCP 1.3 record — swap entry slot to 0x0100 ServiceName), V8 (clear stock GroupNavigation bit 5 from SupportedFeatures byte stream so mask = 0x0001), S1 (0x0311 SupportedFeatures → 0x0100 ServiceName attr-table swap on legacy record), P1 (force VENDOR_DEPENDENT through PASSTHROUGH-emit so the JNI sees the frame), M1 (widen the RegNotif INTERIM/CHANGED dispatcher cmp at `fcn.0x121d8:0x12230` from `cmp r1, 1` to `cmp r1, 0xF` so wire ctype matches the JNI's reasonCode arg — see Trace #37), M6 (NOP the hardcoded `movs r1, 0xD` at `fcn.0x121d8:0x12244` so the CHANGED branch becomes a pure pass-through for any non-INTERIM AV/C ctype value the JNI sets in `ipc[8]` — companion to M1; static-verified end-to-end in Trace #60), M2 (NOP `beq 0x6d0e0` at `0x6d06e` — bypass the outbound-frame builder's list-contains drop gate on Path A, the fragmented multi-frame path for `msg=540` GetElementAttributes), M3 (NOP `strb.w r0, [r4, #0xf2]` at `0x6df42` — disable the chip-busy flag SET on Path A so the gate at `0x6df3a` never trips; both M2 and M3 derived in Trace #40 to eliminate the silent ~80% drop of T9 CHANGED emits under A2DP saturation), M4 (NOP `beq 0x6d19c` at `0x6d116` — bypass the structurally-identical list-contains drop gate on Path B `fcn.0x6d0f0`, the short single-PDU path for `msg=544` RegNotif INTERIM/CHANGED that the dispatcher at `fcn.0xf0bc` selects via `cbz r3, 0xf186` when packetFrame[9]==0 (i.e. ctype>6, response direction); see Trace #41 — addresses the subscription-class CT retry-storm where `msg=544` was delivering at ~6% on the wire while `msg=540` on Path A was at ~100%) |
-| `libextavrcp_jni.so` | R1 (msg=519 redirect into trampoline-chain entry) + T1 / T2-stub / extended_T2 / T4 / T5 / T_charset / T_battery / T_continuation / T6 / T8 / T9 trampolines hosted in LOAD #1 page-padding extension; U1 (NOP `UI_SET_EVBIT(EV_REP)` to defang kernel auto-repeat on the AVRCP virtual keyboard). T1 advertises `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}` — events 0x09-0x0c are 1.4+ event IDs INTERIM-acked with zero payload via existing `libextavrcp.so` builders (no CHANGED ever fires; Y1 has one player, no Now Playing folder, no UID database). Mirrors Pixel-as-TG; what unblocks strict CT metadata-pane render (see Trace #32). |
+| `libextavrcp_jni.so` | R1 (msg=519 redirect into trampoline-chain entry) + T1 / T2-stub / extended_T2 / T4 / T5 / T_charset / T_battery / T_continuation / T6 / T8 / T9 trampolines hosted in LOAD #1 page-padding extension; U1 (NOP `UI_SET_EVBIT(EV_REP)` to defang kernel auto-repeat on the AVRCP virtual keyboard). T1 advertises `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}` (mirrors Pixel-as-TG's GetCapabilities event list); T8 INTERIM-acks events 0x01-0x08 and rejects events 0x09-0x0c with AV/C ctype `0x08` NOT_IMPLEMENTED via M6's pass-through path on mtkbt. The CapabilityID 0x03 advertisement is decoupled from per-event RegisterNotification response per AV/C §6.7.1; CTs that subscribe to an advertised-but-unsupported event correctly handle NOT_IMPLEMENTED by dropping the event from their retry set. |
 | `MtkBt.odex` | F1 (`getPreferVersion()`=14 unblocks 1.3+ Java dispatch), F2 (`disable()` resets `sPlayServiceInterface`), 2 cardinality NOPs (TRACK_CHANGED + PLAYBACK_STATUS_CHANGED switch arms in `BTAvrcpMusicAdapter.handleKeyMessage`) |
 | `com.innioasis.y1*.apk` | A / B / C (Artist→Album navigation), E (discrete PASSTHROUGH PLAY/PAUSE/STOP/NEXT/PREV per AV/C Panel Subunit Spec), H / H′ / H″ (foreground-activity propagation of unhandled discrete media keys + framework-synthetic-repeat filter) |
 | `libaudio.a2dp.default.so` | AH1 (skip `a2dp_stop` in `standby_l` so AudioFlinger silence-timeout leaves the AVDTP source stream alive across pauses) |
@@ -5061,5 +5061,51 @@ Verification predictions:
 - mtkbt MD5 change confirms the M6 byte landed.
 
 If any post-flash regression appears, M6 is wrong and reverts with a one-byte change. Step 2 (T8 r2-value change to 0x08 for events 0x09-0x0C) lands only after Step 1 is verified clean on all CTs.
+
+## Trace #61 (2026-05-18) — M6 Step 1 verified clean on all 4 CTs; Step 2 (T8 r2=0x08 for events 0x09-0x0C) landed
+
+### Step 1 verification
+
+Post-flash captures against the M6-only build (mtkbt MD5 `7493acdad352bc6d7f6d65fc3251e221`):
+
+| CT | Capture | BluetoothAvrcpService restarts | T8reg events | Notes |
+|---|---|---|---|---|
+| Sonos | `dual-sonos-20260518-1656` | 0 | `01×5, 08×1, 09×9, 0b×1, 0c×1` | parallel-subscription pattern intact; 4×T5emit, 4×T9emit, 61×M5wire |
+| TV | `dual-tv-20260518-1705` | 0 | `01×3, 08×1, 09×3, 0b×1, 0c×1` | standard TV pattern; 127×M5wire, heavy T4a= GEA traffic |
+| Bolt | `dual-bolt-20260518-1726` | 0 | `01×43` only (cursor parked in Phase 1; session ended before advancing) | 5×T9emit, 1×T5emit, 73×M5wire |
+| Kia | `dual-kia-20260518-1730` | 0 | `01×1, 05×1, 08×1, 09×1, 0a×1, 0b×1, 0c×1` | parallel initial burst; 110×M5wire, GEA heavy |
+
+mtkbt PID (145) and Bluetooth service PID (697) stable across every session — no process churn. M6 confirmed byte-identical pass-through for production traffic (every current `reg_notievent_*_rsp` call passes `r2 ∈ {0x0F, 0x0D}`, and M6 only diverges from stock when `r2 ∉ {0x0F, 0x0D}`).
+
+### Bolt's no-metadata observation in `dual-bolt-20260518-1726`
+
+The Bolt session showed `T5emit aid=aacf122a` at 17:25:20 (Y1 emitted TRACK_CHANGED CHANGED on the wire) but **no GetElementAttributes query from Bolt followed**. Per AVRCP 1.3 §6.7.1 a CT receiving CHANGED is required to re-register `ev=02` and re-query GEA for the new track. Bolt did neither.
+
+Cross-checked via CPU-state diff: M6 produces identical `r1 / r2 / flags` at the `bl 0x11894` boundary for `ipc[8] = 0x0D` (the value T5emit's helper writes). Wire byte is `0x0D` pre- and post-M6 — same as every prior production CHANGED frame. This is the same intermittent Bolt-side state-machine gap previously observed in `dual-bolt-20260518-1507` ("first few tracks worked, then broke"). Independent of M6.
+
+### Step 2 — T8 r2-value change for events 0x09-0x0C
+
+`_emit_t8`'s arms for events 0x09 / 0x0a / 0x0b / 0x0c in `_trampolines.py` now call their `reg_notievent_*_rsp` PLT helpers with `r2 = REASON_NOT_IMPLEMENTED (0x08)` instead of `r2 = REASON_INTERIM (0x0F)`. Side effects:
+
+- Helper writes `ipc[8] = 0x08` (instead of `0x0F`).
+- Mtkbt's M1 + M6 dispatch reads `ipc[8] = 0x08`, post-M1 cmp fails (`!= 0x0F`), CHANGED branch entered, post-M6 NOP keeps `r1 = 0x08` from the prior `ldrb`.
+- `fcn.0x11894` stores `r1 = 0x08` to `packetFrame[0xb]`; `packetFrame[9] = 0` (response, ctype > 6).
+- `fcn.0xf0bc` `cbz packetFrame[9], 0xf186` taken → Path B (same path INTERIM/CHANGED takes in production).
+- `fcn.0xef08` writes `wire_buf[0] = packetFrame[0xb] = 0x08`.
+- Wire frame goes out with AV/C ctype `0x08` NOT_IMPLEMENTED.
+
+The `_emit_subscription_write(a, 1, 20, ...)` previously in `t8_check_9` (armed `state[20]` sub_now_playing_content) is removed — a CT that receives NOT_IMPLEMENTED is required not to re-register, so the gate is intentionally never armed. The T5 / T9 CHANGED-emit branches gated on `state[20]` remain in code but become unreachable (gate permanently zero); their PLT calls are dead but harmless.
+
+### Predicted behaviour changes per CT after Step 2
+
+- **Sonos / TV / Kia / Pixel-ref** (parallel-subscription model): they currently send `RegisterNotification(0x09)` (and 0x0a/0x0b/0x0c) speculatively and never receive a CHANGED for those events. With Step 2 they receive AV/C ctype `0x08` NOT_IMPLEMENTED on the response, drop those event_ids from their retry set per §6.7.1, and stop re-registering them. Net wire effect: less retry traffic, no change to ev=01/02/05/08 cadence (the events Y1 actually drives).
+- **Bolt** (sequential-cursor model): when the cursor reaches ev=09/0a/0b/0c, it receives NOT_IMPLEMENTED, drops the event, and advances. Cursor returns to ev=01/02/05 which Y1 fires CHANGED for. The intermittent Bolt-side "skip GEA after CHANGED" gap is *not* addressed by Step 2 (that's a separate Bolt-side state-machine issue, independent of M6).
+
+### Patcher state
+
+- `patch_mtkbt.py`: unchanged from Step 1.
+- `patch_libextavrcp_jni.py`: OUTPUT_MD5 `d803f42c` → `637e2f18d7947511c0ab0d4a78ea7003`. OUTPUT_DEBUG_MD5 `4995ca17` → `bbec7d68b70ca7973d1e2a14b8dd5fd2`.
+- New `REASON_NOT_IMPLEMENTED = 0x08` constant in `_trampolines.py` alongside `REASON_INTERIM` / `REASON_CHANGED`.
+
 
 

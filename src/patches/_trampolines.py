@@ -272,9 +272,15 @@ PAPP_SHUFFLE_OFF      = 0x01
 BATT_STATUS_NORMAL    = 0x00
 SYSTEM_STATUS_POWERED = 0x00
 
-# AVRCP TRACK_CHANGED reason codes
-REASON_INTERIM = 0x0F
-REASON_CHANGED = 0x0D
+# AVRCP RegisterNotification response AV/C ctype codes. The JNI helpers
+# in `libextavrcp.so` marshal the caller's r2 (this byte) into IPC
+# payload[8]; mtkbt's per-event response builder at `fcn.0x121d8` reads
+# ipc[8] and emits it as the wire AV/C ctype byte (M1 + M6 in
+# `patch_mtkbt.py` make this dispatch a pure pass-through for any value
+# the JNI side sets, beyond the original INTERIM-only special case).
+REASON_INTERIM         = 0x0F   # AV/C ctype 0x0F INTERIM
+REASON_CHANGED         = 0x0D   # AV/C ctype 0x0D CHANGED
+REASON_NOT_IMPLEMENTED = 0x08   # AV/C ctype 0x08 NOT_IMPLEMENTED (requires M6)
 
 # open(2) flags & modes (bionic / Linux generic).
 O_RDONLY = 0x0000
@@ -2044,33 +2050,38 @@ def _emit_t8(a: Asm) -> None:
     _emit_subscription_write(a, 1, 15, T8_OFF_TIMESPEC_SEC, "t8_done")
     a.b_w("t8_done")
 
-    # Events 0x09..0x0c — INTERIM ack; only 0x09 arms its gate
-    # (sub_now_playing_content). 0x0a / 0x0b / 0x0c stay INTERIM-only
-    # (Y1 has one player, no UID database). These events live OUTSIDE the
-    # AVRCP 1.3 §5.4.2 Tbl 5.28 set, but emitting NOT_IMPLEMENTED via the
-    # UNKNOW_INDICATION path at 0x65bc is unsafe: that's actually the
-    # PASSTHROUGH response builder, not a generic AV/C reject emitter.
-    # Feeding it a PDU=0x31 (RegisterNotification) inbound produces a
-    # malformed IPC frame that wedges mtkbt's parser and trips a 4 s
-    # watchdog kill of the AVRCP service. See Trace #60 follow-up.
+    # Events 0x09..0x0c — AVRCP 1.4+ event IDs outside the §5.4.2 Tbl 5.28
+    # set. Each arm calls the matching `reg_notievent_*_rsp` helper with
+    # `r2 = REASON_NOT_IMPLEMENTED (0x08)` instead of REASON_INTERIM. The
+    # helper writes ipc[8] = 0x08; mtkbt's M1 + M6 dispatch at fcn.0x121d8
+    # routes that ctype through the CHANGED branch (which post-M6 is a
+    # pass-through), and the wire AV/C frame goes out with ctype 0x08
+    # NOT_IMPLEMENTED. Per AV/C §6.7.1 the CT is then required to drop
+    # those event_ids from its retry set, so subscription-state side
+    # effects (state[20] arm for ev=09) are intentionally NOT performed —
+    # the CT won't re-register, the CHANGED branches gated on state[20]
+    # (T5:0x09 / T9:0x09) never need to fire.
+    #
+    # Wire-route considerations: msg=544 still selected (helper's
+    # AVRCP_SendMessage), Path B (`packetFrame[9] = 0` because ctype > 6
+    # = response direction). Same Path B as INTERIM/CHANGED responses,
+    # which is the production-validated path post-M4. Static-verified
+    # end-to-end in `docs/INVESTIGATION.md` Trace #60.
     a.label("t8_check_9")
     a.cmp_imm8(0, 0x09)
     a.bne("t8_check_a")
-    # 0x09 NOW_PLAYING_CONTENT_CHANGED — no payload.
-    a.movs_imm8(2, REASON_INTERIM)
+    # 0x09 NOW_PLAYING_CONTENT_CHANGED reject.
+    a.movs_imm8(2, REASON_NOT_IMPLEMENTED)
     a.movs_imm8(1, 0)
     a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_now_playing_content_rsp)
-
-    # Arm sub_now_playing_content (state[20]). T5 / T9 CHANGED emits gate on this.
-    _emit_subscription_write(a, 1, 20, T8_OFF_TIMESPEC_SEC, "t8_done")
     a.b_w("t8_done")
 
     a.label("t8_check_a")
     a.cmp_imm8(0, 0x0A)
     a.bne("t8_check_b")
-    # 0x0A AVAILABLE_PLAYERS_CHANGED — no payload.
-    a.movs_imm8(2, REASON_INTERIM)
+    # 0x0A AVAILABLE_PLAYERS_CHANGED reject.
+    a.movs_imm8(2, REASON_NOT_IMPLEMENTED)
     a.movs_imm8(1, 0)
     a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_availplayers_rsp)
@@ -2079,11 +2090,14 @@ def _emit_t8(a: Asm) -> None:
     a.label("t8_check_b")
     a.cmp_imm8(0, 0x0B)
     a.bne("t8_check_c")
-    # 0x0B ADDRESSED_PLAYER_CHANGED — PlayerID u16 in r3, UidCounter u16
-    # at sp[0]. Both = 0 (Y1 has one player, no UID database).
+    # 0x0B ADDRESSED_PLAYER_CHANGED reject. PlayerID u16 in r3,
+    # UidCounter u16 at sp[0]. Both = 0 (Y1 has one player, no UID
+    # database — the helper still writes these fields into the IPC
+    # frame, but the wire frame is a NOT_IMPLEMENTED reject so the
+    # payload bytes are spec-irrelevant; we set them to 0 for hygiene).
     a.movs_imm8(3, 0)
     a.str_sp_imm(3, 0)                          # sp[0] = uid_counter (0)
-    a.movs_imm8(2, REASON_INTERIM)
+    a.movs_imm8(2, REASON_NOT_IMPLEMENTED)
     a.movs_imm8(1, 0)
     a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_addredplayer_rsp)
@@ -2092,9 +2106,9 @@ def _emit_t8(a: Asm) -> None:
     a.label("t8_check_c")
     a.cmp_imm8(0, 0x0C)
     a.bne("t8_unknown_event")
-    # 0x0C UIDS_CHANGED — UidCounter u16 in r3.
+    # 0x0C UIDS_CHANGED reject. UidCounter u16 in r3 = 0.
     a.movs_imm8(3, 0)
-    a.movs_imm8(2, REASON_INTERIM)
+    a.movs_imm8(2, REASON_NOT_IMPLEMENTED)
     a.movs_imm8(1, 0)
     a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_uids_changed_rsp)

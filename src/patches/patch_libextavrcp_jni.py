@@ -41,12 +41,12 @@ NATIVE_TRACK_CHANGED_VADDR = 0x3bc0
 NATIVE_PLAY_STATUS_CHANGED_VADDR = 0x3c88
 
 STOCK_MD5         = "fd2ce74db9389980b55bccf3d8f15660"
-OUTPUT_MD5        = "d803f42c973bf9539f4d03ccb658cab3"
+OUTPUT_MD5        = "637e2f18d7947511c0ab0d4a78ea7003"
 
 # --debug: splices __android_log_print calls into T5/T6/T8/T9 emit sites
 # (tag "Y1T"). Release builds remain byte-identical without the env var.
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "4995ca171d0c446b7ce8886022ba7b2c"
+OUTPUT_DEBUG_MD5  = "bbec7d68b70ca7973d1e2a14b8dd5fd2"
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
 # ---------------------------------------------------------------- T1
