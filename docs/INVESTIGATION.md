@@ -4777,48 +4777,59 @@ The order I'd attack these is (1) → (3) → (2). M5 verification is closest to
 - `dual-kia-20260518-0836` is preserved as the regression evidence — useful as a falsifying capture for future "should we relax the gates?" proposals.
 - Real root cause for the pre-relax Kia position-bar lag is unsolved; M5 TID verification is the next concrete diagnostic step, not another speculative code change.
 
-### M5 TID-echo diagnostic landed in `a94abeb`
+### M5 TID-echo diagnostic landed in `a94abeb`, log site moved in followup
 
-Single new `Y1T : T9tid c17=NN` log at the PLAYBACK_POS_CHANGED CHANGED emit, just before `PLT_reg_notievent_pos_changed_rsp` is invoked. `NN` is the byte at `struct[+0x19] = conn[17]` — what mtkbt's response builder reads to populate the outbound AVCTP TL nibble per the M5 design at `patch_mtkbt.py:317-410`.
+Single new `Y1T : T9tid c17=NN` log at the PLAYBACK_STATUS_CHANGED CHANGED emit, just before `PLT_reg_notievent_playback_rsp` is invoked. `NN` is the byte at `struct[+0x19] = conn[17]` — what mtkbt's response builder reads to populate the outbound AVCTP TL nibble per the M5 design at `patch_mtkbt.py:317-410`.
+
+**Initial site was ev=05 (PLAYBACK_POS_CHANGED)**, picked because that was Kia's lag-relevant subscription. Empirical follow-up against captures `dual-kia-20260518-1131` and `dual-tv-20260518-1138` showed:
+- Kia: 1 `T9tid c17` line per session (gate-cleared then no re-register). Sample of `00`.
+- TV: 0 `T9tid c17` lines per session (TV doesn't subscribe to ev=05).
+
+One sample point can't distinguish "M5 echoes correctly but Kia's first NOTIFY had TL=0" from "M5 broken on outbound". Moved the log to ev=01 because:
+1. ev=01 PLAYBACK_STATUS_CHANGED routes through the same Path B outbound code as ev=05 — same M5 echo mechanism.
+2. TV subscribes to ev=01 and re-registers within ~17 ms after every CHANGED (textbook §6.7.1 tight loop). So TV captures produce `T9emit pstat=N` + `T9tid c17=NN` pairs on every actual play/pause edge — many samples per session, with the inbound TL cycling per Kia's NOTIFY cadence.
+
+If `T9tid c17=NN` cycles across the TV capture window matching the expected AVCTP TL rotation pattern (0-15 incrementing), M5 is verified working and the lag has a different root cause. If it stays at `00` across many emits, M5 is silently failing.
 
 `patch_libextavrcp_jni.py` headers:
 - `STOCK_MD5    = fd2ce74db9389980b55bccf3d8f15660`
 - `OUTPUT_MD5   = d803f42c973bf9539f4d03ccb658cab3` (release — byte-identical to the pre-instrumentation baseline)
-- `OUTPUT_DEBUG_MD5 = 6e8a437d36054cfa93190a41481b5530` (debug — has the new log)
+- `OUTPUT_DEBUG_MD5 = 4995ca171d0c446b7ce8886022ba7b2c` (debug — has the new log at the pstat emit)
 
 LOAD #1 padding budget had only 44 B headroom over the pre-instrumentation debug blob; the single log site consumes 40 of those bytes. A patcher-side bug surfaced during this work: `patch_libextavrcp_jni.py:160-251` writes the trampoline blob with no upper-bound check against LOAD #2's file start (0xbc08); over-budget blobs silently overwrite LOAD #2's relocation data. Out of scope here but worth a follow-up commit to add the guard.
 
-**Capture recipe (Kia + Y1):**
+**Capture recipe (TV + Y1, preferred):**
 
 ```bash
 # On the flash box
 git pull
 KOENSAYR_DEBUG=1 ./apply.bash --avrcp    # or whatever flag set rebuilds libextavrcp_jni.so
 # Verify the running binary post-flash matches OUTPUT_DEBUG_MD5
-adb shell md5sum /system/lib/libextavrcp_jni.so   # should print 6e8a437d36054cfa93190a41481b5530
+adb shell md5sum /system/lib/libextavrcp_jni.so   # should print 4995ca171d0c446b7ce8886022ba7b2c
 
-# Pair Y1 to Kia, start music playback, exercise play/pause + track skip + scrub
-./scripts/dual-capture.sh kia
+# Pair Y1 to TV, start music playback, exercise play/pause repeatedly (each
+# play/pause edge produces one T9emit pstat + one T9tid c17 sample).
+./scripts/dual-capture.sh tv
 ```
 
 **Analysis:**
 
 ```bash
-grep 'Y1T' /work/logs/dual-kia-<latest>/logcat.txt | grep -E 'T8reg ev=05|T9tid c17|T9emit pos'
+grep 'Y1T' /work/logs/dual-tv-<latest>/logcat.txt | grep -E 'T8reg ev=01|T9tid c17|T9emit pstat'
 ```
 
 Look at the `T9tid c17=NN` values across the capture window:
 
 | Pattern | Interpretation |
 |---|---|
-| `c17` cycles 0-0x0F matching the cadence of Kia's `T8reg ev=05` re-registrations | M5 is preserving the inbound TID across the outbound Path B traverse. The lag root cause is **not** TID echo — move to the next hypothesis (CoD class differential or ServiceName SDP byte swap). |
-| `c17=00` on every emit, regardless of `T8reg ev=05` cadence | M5 is silently failing on the outbound path. The cave's discriminator at `[r5, 8]` is wrong for this build / firmware combination, or the strb_w is still firing despite the `beq` skip. Investigate by disassembling `mtkbt:0x6d186` post-patch and confirming the cave bytes at `0xf3680` are what `patch_mtkbt.py` writes. |
+| `c17` walks a small-integer sequence (0-0x0F) matching the cadence of TV's `T8reg ev=01` re-registrations | M5 is preserving the inbound TID across the outbound Path B traverse. The lag root cause is **not** TID echo — move to the next hypothesis (CoD class differential or ServiceName SDP byte swap). |
+| `c17=00` on every emit, regardless of `T8reg ev=01` cadence | M5 is silently failing on the outbound path. The cave's discriminator at `[r5, 8]` is wrong for this build / firmware combination, or the strb_w is still firing despite the `beq` skip. Investigate by disassembling `mtkbt:0x6d186` post-patch and confirming the cave bytes at `0xf3680` are what `patch_mtkbt.py` writes. |
 | `c17=NN` where `NN` is constant and non-zero across many emits | M5 latches once but never refreshes — partial bug. The inbound-path strb at the cave should be re-firing on every subsequent CMD; if `c17` stays pinned to whatever value happened to be there at the first inbound, the cave's discriminator predicate is misfiring (treating subsequent inbounds as outbound). |
-| No `T9tid c17` lines at all but `T9emit pos` lines present | Build/flash issue — the patcher ran but the debug-instrumented blob didn't land. Re-verify `OUTPUT_DEBUG_MD5` against the running `/system/lib/libextavrcp_jni.so`. |
+| No `T9tid c17` lines at all but `T9emit pstat` lines present | Build/flash issue — the patcher ran but the debug-instrumented blob didn't land. Re-verify `OUTPUT_DEBUG_MD5` against the running `/system/lib/libextavrcp_jni.so`. |
 
-Compare each `T9tid c17=NN` against the most-recent preceding Kia NOTIFY for ev=05. There's no direct way to extract Kia's NOTIFY TL from Y1's `btlog` (under-samples + record alignment is broken in `tools/btlog-hci-extract.py`), but the *cadence* of `T8reg ev=05` lines tells us when Kia issued a fresh NOTIFY. If `T9tid c17=NN` fires (say) 1 second after the last `T8reg ev=05`, that TL value should be whatever TL Kia's most recent NOTIFY carried.
+Each `T9tid c17=NN` line is paired with a `T9emit pstat=N` line on the immediately preceding logcat row. The `T8reg ev=01` lines after each `T9tid c17` mark when TV re-registers — and that re-register carries a fresh AVCTP TL that should appear as the NEXT `T9tid c17` value (one emit later).
 
-The Pixel reference capture shows Kia uses sequential TLs: 5, 7, 0xb, 0xc, 0xd, 0xe, 0xf, wrap to a small value, repeat. If Y1's `T9tid c17` walks the same sequence (offset by whatever TL Kia happened to start with on this pairing), M5 is working as designed.
+Kia captures will also produce `T9tid c17` data, but only one sample per AVRCP session (strict §6.7.1 + Kia not re-registering). TV is the higher-sample-rate source and the recommended capture target for this diagnostic.
 
 
 

@@ -46,7 +46,7 @@ OUTPUT_MD5        = "d803f42c973bf9539f4d03ccb658cab3"
 # --debug: splices __android_log_print calls into T5/T6/T8/T9 emit sites
 # (tag "Y1T"). Release builds remain byte-identical without the env var.
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "6e8a437d36054cfa93190a41481b5530"
+OUTPUT_DEBUG_MD5  = "4995ca171d0c446b7ce8886022ba7b2c"
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
 # ---------------------------------------------------------------- T1

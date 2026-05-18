@@ -2290,6 +2290,15 @@ def _emit_t9(a: Asm) -> None:
     a.ldrb_w(3, 13, T9_OFF_FILE_PLAYFLAG)     # r3 = play_status
     if DEBUG_NATIVE_LOG:
         _emit_native_log_u32(a, "log_fmt_t9pstat", 3)
+        # TID-echo verification: log conn[17] right before the response
+        # builder reads it. r4 = struct ptr (preserved across the previous
+        # log call's push/pop); conn = r4+8; conn[17] = [r4, 0x19]. Placed
+        # at the pstat emit (not pos) because TV (gold-standard tight-loop
+        # CT) subscribes to ev=01 but not ev=05 — pstat fires many times
+        # per session against TV, giving us multiple TL samples to
+        # verify M5's cycle vs single-point readings.
+        a.ldrb_w(6, 4, 0x19)
+        _emit_native_log_u32(a, "log_fmt_t9tid_c17", 6)
     a.blx_imm(PLT_reg_notievent_playback_rsp)
 
     # AVRCP §6.7.1 strict: clear sub_play_status (state[14]) after CHANGED.
@@ -2513,11 +2522,6 @@ def _emit_t9(a: Asm) -> None:
     # r3 already = live_pos
     if DEBUG_NATIVE_LOG:
         _emit_native_log_u32(a, "log_fmt_t9pos", 3)
-        # TID-echo verification: log conn[17] right before the response
-        # builder reads it. r4 = struct ptr (preserved across the previous
-        # log call's push/pop); conn = r4+8; conn[17] = [r4, 0x19].
-        a.ldrb_w(6, 4, 0x19)
-        _emit_native_log_u32(a, "log_fmt_t9tid_c17", 6)
     a.blx_imm(PLT_reg_notievent_pos_changed_rsp)
 
     # AVRCP §6.7.1 strict: clear sub_pos (state[13]) after CHANGED.
@@ -2646,13 +2650,14 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         # TID-echo verification (Trace #59 follow-up). conn[17] =
         # struct[+0x19] is what libextavrcp.so's response builder reads to
         # populate the outbound AVCTP TL nibble. Per patch_mtkbt.py M5 it
-        # should track the most-recently-latched inbound TID. Logging it
-        # at the T9 ev=05 CHANGED emit (the event Kia subscribes to with
-        # `Interval: 1`) answers whether M5 is correctly preserving the
-        # inbound TID across the outbound traverse — without needing a
-        # Y1-side wire capture (which is unavailable). Only one log site
-        # to fit within the LOAD #1 padding budget (44 B headroom over
-        # the pre-instrumentation debug blob).
+        # should track the most-recently-latched inbound TID. Logged at
+        # the T9 ev=01 PLAYBACK_STATUS_CHANGED emit because TV (the
+        # gold-standard tight-loop CT in our matrix) subscribes to ev=01
+        # but not ev=05 — and ev=01 still routes through the same Path B
+        # outbound code in mtkbt, so this verifies the same M5 echo path
+        # while producing many samples per capture (every play_status
+        # edge → one emit). Only one log site to fit within the LOAD #1
+        # padding budget (44 B headroom over pre-instrumentation debug).
         a.label("log_fmt_t9tid_c17")
         a.asciiz("T9tid c17=%02x")
         a.align(4)
