@@ -5411,3 +5411,111 @@ If the "3 songs then wedge" symptom persists, it's no longer TID-related and we 
 ### Patcher state
 
 Unchanged from 293b382: mtkbt OUTPUT_MD5 `9c4e462241169c3a181574db157c8df7` / OUTPUT_DEBUG_MD5 `68faa7cfbb5c833d4f55c44ccfa98813`. patch_libextavrcp_jni.so unchanged from 252cd8a.
+
+## Trace #69 (2026-05-19) — Bolt session: M7 verified on wire but conn[+0x11] is not per-event; per-event TID storage at JNI level is the actual fix
+
+### Bolt 1009 data
+
+`dual-bolt-20260519-1009` (KOENSAYR_DEBUG=1 with the D2 cave from 293b382): 0 restarts, 585 Y1T lines, 4 GEA queries over 3 minutes.
+
+**Per-frame `M5wire c39` distribution shows Bolt's actual cycling TIDs:** `01` × 36, `0c` × 23, `07` × 21, `04` × 9, `0a` × 7, `06` × 7, `03` × 6, `00` × 6, `0f`/`0b`/`09`/`05`/`02` × 1 each. Bolt cycles across the full 0..0xf range — *not* the 100% TID=0 / 100% TID=9 profile of Sonos/TV/Kia.
+
+Per-frame `M5dbg ba9 == M5wire c39` in 100% of observed frames. M7 is working.
+
+**But T8reg subscription counts reveal the structural failure:**
+
+| event | T8reg count | observation |
+|---|---|---|
+| ev=01 | 27 | re-subscribing — works |
+| ev=05 | 16 | re-subscribing — works |
+| **ev=09** | **1** | one subscribe, then `T5ncc` fires 5× without Bolt re-subscribing |
+| ev=0a | 5 | low cadence |
+
+T5ncc × 5, T5emit × 3 — Y1 emitted 5 NowPlayingContent CHANGEDs and 3 TrackChanged CHANGEDs, but Bolt re-subscribed ev=09 zero times.
+
+### Static analysis: where TID actually flows in mtkbt's stock path
+
+Walking the call chain from JNI to wire builder:
+
+1. `libextavrcp.so::btmtk_avrcp_send_*_rsp` at `0x26c0` (NowPlaying) / `0x2458` (TrackChanged):
+   - reads `conn[+0x11]` → TID
+   - writes `msg[5] = TID`
+   - calls `AVRCP_SendMessage(conn, msg=0x220, &msg, msg_size)`
+
+2. mtkbt's IPC dispatcher `fcn.0x67768` → `fcn.0x518ac` (case `0x220` for msg=544) → `fcn.0x12478` (RegNotif sub-dispatcher) → `fcn.0x122cc` (per-event handler for ev=01) / similar → `fcn.0x121d8` (RegNotif response builder, M1+M6 patched) → `fcn.0x11894` (IPC packet allocator).
+
+3. `fcn.0x11894` at `0x11920/0x11928`:
+   ```
+   0x11920: ldrb r0, [r7, 1]   ; r0 = local_buf[+1] = msg[5] = TID
+   0x11928: strb r0, [r4, 0xa] ; packet[+0xa] = TID
+   ```
+
+4. `fcn.0xf0bc` (Path A/B selector) Path B branch at `0xf1a6/0xf1a8`:
+   ```
+   0xf1a6: ldrb r3, [r0, 0xa]    ; r3 = packet[+0xa] = TID
+   0xf1a8: strb.w r3, [r4, 0x31] ; chan+0x39 = TID
+   ```
+
+5. `fcn.0x6d0f0` (Path B, our M5+M7 cave hooks here): M5 writes 0 to chan+0x39 (strb always fires since `p8 ≠ 1`); M7 unconditionally rewrites chan+0x39 from chan+0xba9.
+
+6. `fcn.0xae418:0xae448` (wire builder): `ldrb r6, [r4, 0x15]` = chan+0x39 (post-M7 value).
+
+**So mtkbt's *stock* path was always writing the right TID to chan+0x39.** Step 4's `strb.w r3, [r4, 0x31]` is the real TID-echo mechanism. The M5 patch (commit `c5e93be`-era) mis-identified the failure mode — there was never a missing strb; the wire builder was already getting the JNI-provided TID via `msg[5]` → `packet[+0xa]` → `chan+0x39`.
+
+**Our M5+M7 cave is functionally redundant** with `fcn.0xf0bc:0xf1a8`. For most cases, M7's `chan+0xba9` source equals `packet[+0xa]` (both = latest inbound CMD TID), so M7 rewrites chan+0x39 to the same value. No harm but no value either.
+
+### The actual bug: `conn[+0x11]` is per-connection, not per-event
+
+`conn[+0x11]` in libextavrcp.so is the slot that JNI reads at every response-builder call. It's updated by the inbound-CMD path on every inbound AV/C cmd. So:
+
+- **INTERIM response** (immediate, in the same JNI dispatch context as the inbound RegNotif): `conn[+0x11]` = RegNotif's TID. ✓
+- **CHANGED response** (async, fired later from a music-app broadcast): `conn[+0x11]` = whatever the *most recent inbound CMD's* TID is, not the originating RegNotif's TID.
+
+For Bolt's TID-cycling pattern:
+- ev=01 / ev=05 CHANGEDs fire on tight loops (play-status edge / 1s position tick) — `conn[+0x11]` hasn't rotated between RegNotif and CHANGED.
+- ev=02 / ev=09 CHANGEDs fire on sparse track-edges — many intervening inbound CMDs rotate `conn[+0x11]`. Wire emits wrong TID. Bolt rejects.
+
+This is why Bolt's metadata pane updated for 3 songs (the runs where conn[+0x11] happened to still match the original RegNotif's TID at emit time) then wedged.
+
+### The fix: re-purpose subscription-gate bytes to store TID+1
+
+State file at `/data/data/com.innioasis.y1/files/y1-trampoline-state` currently uses bytes 13..20 as 0/1 subscription gates:
+
+| byte | event | currently | new semantics |
+|---|---|---|---|
+| state[13] | ev=05 sub_pos | 0/1 | 0 = not subscribed, 1..16 = TID+1 |
+| state[14] | ev=01 sub_play_status | 0/1 | same |
+| state[15] | ev=08 sub_papp | 0/1 | same |
+| state[16] | ev=02 sub_track_changed | 0/1 | same |
+| state[17] | ev=03 sub_track_reached_end | 0/1 | same |
+| state[18] | ev=04 sub_track_reached_start | 0/1 | same |
+| state[20] | ev=09 sub_now_playing_content | 0/1 | same |
+
+Existing gate checks (`cmp r0, 0; beq skip`) still work — state byte is nonzero when subscribed regardless of TID value.
+
+At INTERIM-emit sites (T8 arms + extended_T2's ev=02 INTERIM): instead of `_emit_subscription_write(a, 1, ...)`, save `conn[+0x11] + 1` to the state byte. The +1 encoding allows TID=0 to be distinguishable from "not subscribed".
+
+At CHANGED-emit sites (T5 NCC, T5 TrackChanged, T9 NCC): after the existing gate check (r0 now contains TID+1), subtract 1 and write to `conn[+0x11]` (= `[r4, 0x19]` where r4 = struct ptr in T5/T9). Then mtkbt's stock path picks up `conn[+0x11]` via `msg[5]` → `packet[+0xa]` → `chan+0x39`.
+
+Cost per site:
+- INTERIM: +2 bytes (ldrb + adds before the modified _emit_subscription_write)
+- CHANGED: +4 bytes (subs + strb inside the gate-check block)
+
+Narrow scope (ev=02 + ev=09 only, the wedge events): ~16 bytes of code growth.
+
+### Budget
+
+Debug build is at 4016 / 4020 bytes (4 bytes headroom — extremely tight). To fit 16 bytes of growth, drop one debug-log site that's no longer load-bearing:
+
+- `T9emit pos=%u` — least critical now that mtkbt-side `M5wire c39` covers wire-emit timing. Removing saves ~38 bytes (format string + inline emit).
+
+Net debug after change: 4016 - 38 + 16 = **3994 bytes (26 byte headroom)**.
+Net release after change: 3800 + 16 = **3816 bytes (204 byte headroom)**.
+
+### What about ev=01 / ev=05 / ev=08?
+
+ev=01 has 27 re-subscribes — already working. Same for ev=05 (16) and ev=08 (1). These have fast-enough CHANGEDs that conn[+0x11] doesn't rotate. **Leave them out of scope for the narrow fix**; revisit if the next Bolt capture shows residual issues.
+
+### Optional follow-up: simplify the M5+M7 cave
+
+Once per-event TID is in place, `fcn.0xf0bc:0xf1a8` writes the correct TID and M5+M7 just rewrite it to a stale value. M5+M7 could be removed entirely (revert `0x6d186` to stock ldrb+strb, drop the cave, drop the LOAD #1 filesz extension). Defer — non-load-bearing cleanup. Document the new understanding in `patch_mtkbt.py` comments when next touched.

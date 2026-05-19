@@ -746,11 +746,15 @@ def _emit_extended_t2(a: Asm) -> None:
     a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
     a.blx_imm(PLT_track_changed_rsp)
 
-    # Arm sub_track_changed (event 0x02) per AVRCP §6.7.1. T5 emits CHANGED
-    # for events 0x02 / 0x03 / 0x04 on track edges; we gate each separately
-    # so strict CTs that subscribe to event 0x02 alone get exactly one
-    # INTERIM + one CHANGED per registration.
-    _emit_subscription_write(a, 1, 16, T2_OFF_SUB_SCRATCH, "ext2_epilogue")
+    # Arm sub_track_changed (event 0x02) and save the inbound RegNotif TID
+    # for AVRCP §3.3.5 strict echo on the eventual T5 CHANGED. state[16]
+    # encoding: 0 = not subscribed, 1..16 = subscribed with TID = byte-1.
+    # The +1 makes "not subscribed" unambiguously distinguishable from
+    # "subscribed with TID=0". r5 = struct ptr here; conn = r5+8; TID is
+    # at conn[+0x11] = [r5, 0x19].
+    a.ldrb_w(0, 5, 0x19)                      # r0 = conn[+0x11] = inbound TID
+    a.raw(bytes([0x01, 0x30]))                # adds r0, #1 (Thumb T1, 2 B)
+    _emit_subscription_write(a, None, 16, T2_OFF_SUB_SCRATCH, "ext2_epilogue")
 
     a.label("ext2_epilogue")
     # Restore stack and branch to epilogue.
@@ -868,6 +872,15 @@ def _emit_t5(a: Asm) -> None:
     a.cmp_imm8(0, 0)
     a.beq("t5_skip_now_playing")
 
+    # Restore the per-event RegNotif TID into conn[+0x11] so mtkbt's
+    # stock wire path (libextavrcp::*_rsp reads conn[+0x11] → msg[5] →
+    # packet[+0xa] → fcn.0xf0bc:0xf1a8 → chan+0x39 → wire builder) emits
+    # the §3.3.5-correct echo TID even though the current inbound CMD's
+    # TID has rotated since the ev=0x09 RegNotif. state[20] encodes
+    # TID+1; subtract 1 before writing to conn[+0x11].
+    a.raw(bytes([0x01, 0x38]))                # subs r0, #1 (Thumb T1, 2 B)
+    a.raw(bytes([0x60, 0x76]))                # strb r0, [r4, 0x19] (= conn[+0x11])
+
     a.add_imm_t3(0, 4, 8)                     # r0 = conn
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
@@ -925,9 +938,16 @@ def _emit_t5(a: Asm) -> None:
     # CHANGED with non-zero Identifier and fall back to polling-only
     # metadata refresh. ICS Table 7 row 24 (Mandatory wire-level).
     # sub_track_changed bit at state[16] (cleared after emit per §6.7.1).
+    # Encoding: 0 = not subscribed, 1..16 = subscribed with TID = byte-1.
     a.ldrb_w(0, 13, T5_OFF_STATE + 16)
     a.cmp_imm8(0, 0)
     a.beq("t5_skip_track_changed")
+
+    # Restore the per-event RegNotif TID into conn[+0x11] for §3.3.5 echo
+    # (track-edge CHANGEDs can fire 30s+ after the originating RegNotif on
+    # CTs with sparse re-subscription — conn[+0x11] has rotated since).
+    a.raw(bytes([0x01, 0x38]))                # subs r0, #1 (Thumb T1, 2 B)
+    a.raw(bytes([0x60, 0x76]))                # strb r0, [r4, 0x19] (= conn[+0x11])
 
     a.add_imm_t3(0, 4, 8)                     # r0 = r4 + 8 (conn)
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
@@ -1724,13 +1744,28 @@ def _emit_t_papp(a: Asm) -> None:
     a.b_w("t4_to_epilogue")
 
 
-def _emit_subscription_write(a: Asm, byte_value: int, state_byte_offset: int,
+def _emit_subscription_write(a: Asm, byte_value, state_byte_offset: int,
                              scratch_sp_offset: int, fail_label: str,
                              fd_reg: int = 4) -> None:
-    """Write `byte_value` (0 or 1) to y1-trampoline-state[state_byte_offset].
+    """Write `byte_value` to y1-trampoline-state[state_byte_offset].
 
-    Used by T2 / T8 to ARM (`byte_value=1`) and by T5 / T9 to CLEAR
-    (`byte_value=0`) per-event subscription gates for AVRCP §6.7.1
+    `byte_value` is either:
+      - an `int` (0..255): emitted as `movs r0, #imm8` before the store.
+        Used for clear-after-CHANGED (byte_value=0) sites.
+      - `None`: caller has already set r0 to the byte to write. Used by
+        per-event TID-save sites that compute `conn[+0x11] + 1` into r0
+        before calling this helper (the +1 encoding makes `state[N] = 0`
+        unambiguously mean "not subscribed" even when the saved TID
+        itself is 0).
+
+    Gate-check semantics (`cmp r0, 0; beq skip` at CHANGED sites) work
+    identically for either encoding — a nonzero state byte means the
+    event is subscribed; the byte value (1 for the legacy encoding,
+    TID+1 for the per-event encoding) just carries extra information
+    that some CHANGED-emit sites unpack before calling their rsp helper.
+
+    Used by T2 / T8 to ARM (byte_value=1 or TID+1) and by T5 / T9 to
+    CLEAR (byte_value=0) per-event subscription gates for AVRCP §6.7.1
     once-per-registration semantics. `fd_reg` (default 4) is the
     callee-saved register cached as the open()'d fd across the lseek /
     write / close PLT blx calls (callee-saved per AAPCS so the value
@@ -1751,7 +1786,8 @@ def _emit_subscription_write(a: Asm, byte_value: int, state_byte_offset: int,
     adjacent state we still need. `fail_label` is the branch target if
     open() fails; the rest of the block falls through after close().
     """
-    a.movs_imm8(0, byte_value)
+    if byte_value is not None:
+        a.movs_imm8(0, byte_value)
     a.strb_w(0, 13, scratch_sp_offset)        # 1-byte store, no adjacent clobber
 
     a.adr_w(0, "path_state")
@@ -2076,9 +2112,14 @@ def _emit_t8(a: Asm) -> None:
     a.movs_imm8(1, 0)
     a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_now_playing_content_rsp)
-    # Arm sub_now_playing_content (state[20]) — T5/T9 emit CHANGED for
-    # ev=0x09 on every track/play edge gated on this byte.
-    _emit_subscription_write(a, 1, 20, T8_OFF_TIMESPEC_SEC, "t8_done")
+    # Arm sub_now_playing_content (state[20]) and save the inbound RegNotif
+    # TID for §3.3.5 strict echo on the eventual T5/T9 CHANGED. Encoding:
+    # 0 = not subscribed, 1..16 = subscribed with TID = byte-1. r5 = struct
+    # (preserved across the rsp blx by AAPCS callee-save); conn = r5+8;
+    # TID at conn[+0x11] = [r5, 0x19].
+    a.ldrb_w(0, 5, 0x19)                      # r0 = conn[+0x11] = inbound TID
+    a.raw(bytes([0x01, 0x30]))                # adds r0, #1 (Thumb T1, 2 B)
+    _emit_subscription_write(a, None, 20, T8_OFF_TIMESPEC_SEC, "t8_done")
     a.b_w("t8_done")
 
     a.label("t8_check_a")
@@ -2322,9 +2363,16 @@ def _emit_t9(a: Asm) -> None:
     # ---- emit NowPlayingContentChanged CHANGED on play-edge ----
     # Paired with PlaybackStatus + TrackChanged as a 3-frame burst on
     # play/pause edge. Gate is set-once at T8 INTERIM, never cleared.
+    # state[20] encodes TID+1 (0 = not subscribed, 1..16 = TID).
     a.ldrb_w(1, 13, T9_STATE_SUB_NOWPLAY_OFF)
     a.cmp_imm8(1, 0)
     a.beq("t9_after_play_check")
+
+    # Restore per-event RegNotif TID into conn[+0x11] for §3.3.5 echo on
+    # the eventual wire frame. r1 holds state[20] = TID+1; subtract 1
+    # and store to [r4, 0x19].
+    a.raw(bytes([0x49, 0x1e]))                # subs r1, r1, #1 (Thumb T1, 2 B)
+    a.raw(bytes([0x61, 0x76]))                # strb r1, [r4, 0x19] (= conn[+0x11])
 
     a.add_imm_t3(0, 4, 8)                     # r0 = conn
     a.movs_imm8(1, 0)                         # success
@@ -2531,9 +2579,10 @@ def _emit_t9(a: Asm) -> None:
     a.add_imm_t3(0, 4, 8)                     # r0 = conn (= struct + 8)
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
-    # r3 already = live_pos
-    if DEBUG_NATIVE_LOG:
-        _emit_native_log_u32(a, "log_fmt_t9pos", 3)
+    # r3 already = live_pos. Trampoline-side `T9emit pos=` log dropped
+    # 2026-05-19 to free budget for the per-event-TID restore code; the
+    # mtkbt-side `M5wire c39=` (D1 cave) covers wire-emit timing for
+    # position frames via the same logging window.
     a.blx_imm(PLT_reg_notievent_pos_changed_rsp)
 
     # AVRCP §6.7.1 strict: clear sub_pos (state[13]) after CHANGED.
@@ -2647,9 +2696,9 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         # log_fmt_t6pos / log_fmt_t6dur removed in tandem with the T6 dur/pos
         # emits — see "T6 GetPlayStatus debug logs ... removed 2026-05-17"
         # comment above for rationale.
-        a.label("log_fmt_t9pos")
-        a.asciiz("T9emit pos=%u")
-        a.align(4)
+        # log_fmt_t9pos dropped 2026-05-19; T9emit pos= no longer emitted.
+        # mtkbt-side D1 cave's M5wire c39= covers wire-emit timing for
+        # position frames.
         a.label("log_fmt_t9pstat")
         a.asciiz("T9emit pstat=%u")
         a.align(4)
