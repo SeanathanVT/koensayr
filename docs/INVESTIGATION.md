@@ -5188,3 +5188,50 @@ The Step 2 revert + `state[20]` arm + `T5 NowPlayingContent CHANGED` emit are st
 - Or shift the LOAD #1 padding boundary by re-laying out the ELF (high-risk, deferred).
 
 The Step 2 revert is re-landable without any *new* debug log if we accept that the chain verification has to happen via existing `T8reg ev=09` logs alone.
+
+## Trace #65 (2026-05-19) — Step 2 revert re-landed in budget-aware shape
+
+c85ed7b reverted the NOT_IMPLEMENTED reject for ev=0x09-0x0c back to INTERIM acks (correct fix per Trace #63's Pixel comparison) but pushed the debug-build trampoline blob to 4104 bytes, 84 over the 4020-byte LOAD #1 budget. Reverted in 806fb4b which also added a hard `AssertionError` in `patch_libextavrcp_jni.py::build_patches()` to catch any future overflow.
+
+This trace re-lands the substantive Step 2 revert (T8 INTERIM-acks ev=0x09-0x0c + arms state[20]) within budget by dropping two debug log sites that have served their diagnostic purpose:
+
+- **`T2reg ev=02`** (added 76bd5ed) — verified that the CT in question subscribes to TRACK_CHANGED. Confirmed. Removed.
+- **`T9tid c17=%02x`** (added Trace #59 era) — paired with `M5wire c39` to verify M5 TID-echo end-to-end through the JNI response builder. M5 verified live; the standalone `T9tid` site is no longer load-bearing for ongoing investigations. Removed.
+
+A new debug log site lands in T5's NowPlayingContent CHANGED emit:
+
+- **`T5ncc`** — no-arg format string (saves ~10 bytes vs the per-event `%02x` formats). Fires once per track edge when state[20] is armed. Absence after `T5emit` in a session means the CT never subscribed to ev=0x09 — diagnostic for the gate-arm chain.
+
+### Final blob sizes
+
+| Build | Bytes | Headroom |
+|---|---|---|
+| Release | 3800 | 220 |
+| Debug   | 4016 | 4 |
+
+Debug headroom is razor-thin (4 bytes); any future debug-log addition needs to drop or consolidate an existing site. The patcher's AssertionError safety net will fail loudly if a future change drives the blob over 4020.
+
+### Patcher state
+
+- `patch_libextavrcp_jni.py`: OUTPUT_MD5 `5d1e0fcf` → `da7225fd2ba79f99461b4fba641fcad1`. OUTPUT_DEBUG_MD5 `8c427734` → `326aa703106d645274fb8416d8cc438e`.
+- `patch_mtkbt.py`: unchanged (M1+M6 still in place; pass-through for `r2 ∈ {0x0F, 0x0D}`).
+
+### Verification plan
+
+KOENSAYR_DEBUG=1 build, post-flash:
+
+```bash
+grep -E 'Y1T.*(T8reg ev=09|T5ncc|T5emit|T4a=0001)' logcat.txt
+```
+
+Expected per track edge on a CT subscribed to ev=0x09:
+1. `T8reg ev=09` — CT subscribes (or re-subscribes after a previous CHANGED).
+2. (track changes) `T5ncc` — Y1 emits NowPlayingContent CHANGED.
+3. `T5emit aid=…` — Y1 emits TrackChanged CHANGED.
+4. `T4a=00010xxx` (≤ 1 s later) — CT's interrupt-driven GEA refresh.
+
+If `T8reg ev=09` is missing entirely, the M1+M6 dispatch isn't routing the INTERIM ack on the wire (or the CT is rejecting our INTERIM as malformed). If `T5ncc` is missing after `T8reg ev=09`, state[20] isn't actually getting armed — trace into `_emit_subscription_write`'s open/lseek/write/close path. If everything fires and CT still doesn't refresh, the issue is downstream (likely the PlaybackStatus CHANGED burst element Pixel emits that we don't — deferred until evidence shows it's needed).
+
+### Sonos restart-loop verification
+
+The c85ed7b revert (806fb4b) restored Sonos boot. This re-land keeps release-build bytes structurally identical to 806fb4b plus the `_emit_subscription_write` expansion (50 bytes), well inside the 220-byte release headroom. No new LOAD #2 overlap risk.
