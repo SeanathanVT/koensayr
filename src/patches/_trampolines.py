@@ -647,6 +647,18 @@ def _emit_extended_t2(a: Asm) -> None:
     a.cmp_imm8(0, 0x31)
     a.bne("ext2_check_get_attrs")             # not RegisterNotification → maybe T4
 
+    if DEBUG_NATIVE_LOG:
+        # One-shot probe to locate the inbound AVCTP TID in our trampoline's
+        # stack-frame view. T1 reads PDU at sp+382 (=0x17E, verified by
+        # GetCapabilities working), so the AVCTP header bytes should be in
+        # the 0x170..0x17d window. Bolt cycles TIDs across {1,4,5,7,9,b,d,f}
+        # — the dumped word should show one of those values in one of its
+        # bytes for every inbound RegNotif CMD. Dumps sp+0x170..0x173 as
+        # an LE u32; event_id is reloaded by the ldrb_w below so we don't
+        # need to preserve r0.
+        a.ldr_w(0, 13, 0x170)
+        _emit_native_log_u32(a, "log_fmt_t2dump", 0)
+
     a.ldrb_w(0, 13, T2_EVENT_ID_OFF_ENTRY)    # r0 = event_id
     a.cmp_imm8(0, 0x02)                       # TRACK_CHANGED?
     a.beq("ext2_track_changed")
@@ -873,9 +885,6 @@ def _emit_t5(a: Asm) -> None:
     _emit_restore_conn_tid_from_db(a, 0, 0x09, "t5_ncc")
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
-    if DEBUG_NATIVE_LOG:
-        # T5ncc — no-arg format string, r3 not read by printf, skip mov.
-        _emit_native_log_u32(a, "log_fmt_t5ncc", 3)
     a.blx_imm(PLT_reg_notievent_now_playing_content_rsp)
 
     a.label("t5_skip_now_playing")
@@ -2787,22 +2796,19 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         a.asciiz("Y1T")
         a.align(4)
         # log_fmt_t6pos / log_fmt_t6dur removed in tandem with the T6 dur/pos
-        # emits — see "T6 GetPlayStatus debug logs ... removed 2026-05-17"
-        # comment above for rationale. log_fmt_t9pos / log_fmt_t9pstat /
-        # log_fmt_t5emit / log_fmt_t4attr / log_fmt_t8reg dropped 2026-05-19
-        # to free budget for the shared restore_conn_tid subroutine that
-        # fixes the §3.3.5-echo TID at every rsp call site (see
-        # _emit_restore_conn_tid subroutine docstring). mtkbt-side
-        # `M5wire c39=` (D1 cave) covers wire-emit timing for every outbound
-        # frame including the per-event TID we ship to the wire.
-        # T5 NowPlayingContent CHANGED emit on track edge. Format takes no
-        # args (saves bytes vs a `%02x` format — the event_id is implicit
-        # in the call site). Surfaces whether T8's INTERIM-ack of ev=0x09
-        # actually armed state[20]; without state[20] armed, T5's
-        # NowPlayingContent CHANGED branch is gated out and the CT never
-        # receives the metadata-refresh interrupt.
-        a.label("log_fmt_t5ncc")
-        a.asciiz("T5ncc")
+        # emits. log_fmt_t9pos / log_fmt_t9pstat / log_fmt_t5emit /
+        # log_fmt_t4attr / log_fmt_t8reg / log_fmt_t5ncc dropped to free
+        # trampoline budget for the offset-probe logs below.
+        #
+        # t2dump: one-shot probe at extended_T2 entry that dumps a 4-byte
+        # word from the caller's stack frame (sp+0x170..0x173) on every
+        # inbound RegNotif CMD. Used to identify which byte holds the
+        # inbound AVCTP TID — Bolt's known TID set (1,4,5,7,9,b,d,f)
+        # should appear in one of the four dumped bytes. Once verified,
+        # the probe gets replaced by a targeted save-to-database emit at
+        # that offset.
+        a.label("log_fmt_t2dump")
+        a.asciiz("T2d=%08x")
         a.align(4)
 
     # PApp UTF-8 attribute / value text strings (charset 0x006A).
