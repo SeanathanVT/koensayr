@@ -487,7 +487,7 @@ def _emit_t4(a: Asm) -> None:
     _emit_restore_conn_tid_from_db(a, 0, 0x02, "t4_tc")
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_CHANGED)
-    a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
+    a.bl_w("incr_and_get_track_identifier")   # r3 = &id_buf (counter++)
     a.blx_imm(PLT_track_changed_rsp)
 
     # Update state in-memory: state[0..7] = file[0..7]
@@ -790,7 +790,7 @@ def _emit_extended_t2(a: Asm) -> None:
     # Browseable Player UID extension; strict 1.3 parsers reject those.
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_INTERIM)
-    a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
+    a.bl_w("incr_and_get_track_identifier")   # r3 = &id_buf (counter++)
     a.blx_imm(PLT_track_changed_rsp)
 
     # No separate "arm" write needed: save_event_seq_id (called at the top
@@ -973,10 +973,10 @@ def _emit_t5(a: Asm) -> None:
     _emit_restore_conn_tid_from_db(a, 0, 0x02, "t5_tc")
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_CHANGED)
-    a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
+    a.bl_w("incr_and_get_track_identifier")   # r3 = &id_buf (counter++)
     if DEBUG_NATIVE_LOG:
         # No-arg fmt; r3 ignored by printf. Confirms TRACK_CHANGED CHANGED
-        # emit fires per track edge after the loose-clear refactor.
+        # emit fires per track edge.
         _emit_native_log_u32(a, "log_fmt_t5tc", 3)
     a.blx_imm(PLT_track_changed_rsp)
 
@@ -1788,6 +1788,18 @@ def _emit_t_papp(a: Asm) -> None:
 # database→conn write immediately before the rsp builder blx.
 G_AVRCP_REQ_EVENT_DATABASE_VADDR = 0xd2b5
 
+# 8-byte buffer in .bss padding (between g_avrcp_req_event_database at 0xd2b5
+# +15 = 0xd2c4 and g_avrcp_auto_browse_connect at 0xd2d5) used as the
+# wire-side AVRCP TRACK_CHANGED Identifier payload. Bytes 0..6 stay zero;
+# byte 7 is a monotonic counter that increments on every emit. Mirrors
+# Pixel-4-as-TG-in-1.3-mode's wire shape (per Trace #46 btsnoop direct
+# tshark decode: Pixel emits 0x0000000000000000 → 0x00..01 → 0x00..02 etc.).
+# Bolt and similar CTs gate metadata refetch on Identifier-change detection;
+# a static 0x00*8 (the strictest §6.7.2 reading) wedges them on the first
+# track. The 4-byte-aligned slot at 0xd2c4 keeps the byte loads/stores
+# trivial.
+G_Y1_AVRCP_TRACK_IDENTIFIER_VADDR = 0xd2c4
+
 
 def _emit_check_event_subscribed(a: Asm, event_id: int, skip_label: str) -> None:
     """Emit `movs r1, #event_id; bl event_subscribed; beq skip_label`.
@@ -1917,31 +1929,35 @@ def _emit_clear_event_database_subroutine(a: Asm) -> None:
     """Emit the shared clear_event_database subroutine.
 
     Pre: (none)
-    Post: g_avrcp_req_event_database[0..14] = 0; r0 / r1 / r2 / r3 / lr clobbered.
+    Post: g_avrcp_req_event_database[0..14] = 0 AND
+          g_y1_avrcp_track_identifier[0..7] = 0; r0..r3 / lr clobbered.
 
     Called from T1_extended whenever the CT issues a fresh GetCapabilities
     request — by the AVRCP 1.3 §5.4.1 connection-setup flow, that's the
-    first CMD on every new CT→TG connection. Clearing the database here
-    means subscriptions from a previous CT session can't leak forward
-    into the new connection's session-scope gate (database[event_id] != 0).
+    first CMD on every new CT→TG connection. Clearing both the database
+    and the track-changed Identifier counter here means subscriptions and
+    monotonic-counter state from a previous CT session don't leak forward.
 
     .bss being zeroed on process restart handles the cross-process case;
     this subroutine handles the within-process CT disconnect/reconnect
     case (com.android.bluetooth stays alive across CT churn, so .bss
     persists).
 
-    14 B code + 2 B align + 4 B literal = 20 B total.
+    6 × str (12 B) + ldr.w (4 B) + add (2 B) + movs (2 B) + bx (2 B) = 26 B
+    + 2 B align + 4 B literal = 32 B total. Covers 24 bytes at
+    0xd2b5..0xd2cc: 15 B database + 8 B identifier_buf + 1 B slop.
     """
     a.label("clear_event_database")
     a.ldr_lit_w(2, "clear_event_database_lit")
     a.label("clear_event_database_add_pc")
     a.add_reg(2, 15)                          # add r2, pc → r2 = absolute db vaddr
     a.movs_imm8(0, 0)                         # r0 = 0
-    # Database is 15 bytes (0xd2b5..0xd2c3). Write four u32 zeros to clear
-    # 16 bytes — the trailing byte at 0xd2c4 is .bss padding before
-    # g_avrcp_auto_browse_connect at 0xd2d5, safe to overwrite (already zero).
+    # 6 word stores @ offsets 0, 4, 8, 12, 16, 20 from r2 (= 0xd2b5).
+    # Covers 24 bytes: 15 B database (0xd2b5..0xd2c3) + 8 B identifier_buf
+    # (0xd2c4..0xd2cb) + 1 B slop at 0xd2cc. None of the trailing bytes
+    # overlap g_avrcp_auto_browse_connect at 0xd2d5.
     # str (immediate) T1: 0110 0 imm5 Rn Rt — encoded inline.
-    for word_off in (0, 4, 8, 12):
+    for word_off in (0, 4, 8, 12, 16, 20):
         imm5 = word_off >> 2
         hw = 0x6000 | (imm5 << 6) | (2 << 3) | 0
         a.raw(bytes([hw & 0xFF, (hw >> 8) & 0xFF]))
@@ -1950,6 +1966,52 @@ def _emit_clear_event_database_subroutine(a: Asm) -> None:
     a.label("clear_event_database_lit")
     def _emit_lit(_pc: int) -> bytes:
         offset = G_AVRCP_REQ_EVENT_DATABASE_VADDR - (a.labels["clear_event_database_add_pc"] + 4)
+        return (offset & 0xFFFFFFFF).to_bytes(4, "little")
+    a._fixup(_emit_lit, 4)
+
+
+def _emit_incr_track_identifier_subroutine(a: Asm) -> None:
+    """Emit the shared incr_and_get_track_identifier subroutine.
+
+    Pre: (none)
+    Post: byte at g_y1_avrcp_track_identifier[7] incremented (8-bit wrap;
+          0xFF → 0x00 fine, Bolt still sees the value change);
+          r3 = &g_y1_avrcp_track_identifier (= 0xd2c4); r2 / lr clobbered.
+
+    Called from every TRACK_CHANGED rsp call site (T4 reactive emit,
+    extended_T2 INTERIM ack, T5 proactive CHANGED emit) immediately before
+    `blx PLT_track_changed_rsp`, replacing the old static `adr_w r3,
+    selected_track_id` reference. The rsp builder consumes r3 as the
+    Identifier pointer and packs 8 bytes onto the wire.
+
+    Wire bytes: `00 00 00 00 00 00 00 NN` where NN increments per emit
+    (counter at 0xd2cb). Matches Pixel-4-as-TG-in-1.3-mode's monotonic-
+    counter Identifier shape — see Trace #46. Bolt's metadata-refetch
+    code path appears to gate on Identifier-change-detection; a static
+    0x00*8 wedges it after the first emit per session.
+
+    Counter resets to 0 on every CT GetCapabilities CMD (via
+    clear_event_database's extended 24-byte clear range).
+
+    14 B code + 2 B align + 4 B literal = 20 B total.
+    """
+    a.label("incr_and_get_track_identifier")
+    a.ldr_lit_w(3, "incr_and_get_track_identifier_lit")
+    a.label("incr_and_get_track_identifier_add_pc")
+    a.add_reg(3, 15)                          # add r3, pc → r3 = absolute buf vaddr
+    # ldrb r2, [r3, #7] (T1 LDRB imm5: 0111 1 imm5 Rn Rt)
+    hw = 0x7800 | (7 << 6) | (3 << 3) | 2
+    a.raw(bytes([hw & 0xFF, (hw >> 8) & 0xFF]))
+    # adds r2, #1 (T2 ADD imm8)
+    a.raw(bytes([0x01, 0x32]))
+    # strb r2, [r3, #7] (T1 STRB imm5)
+    hw = 0x7000 | (7 << 6) | (3 << 3) | 2
+    a.raw(bytes([hw & 0xFF, (hw >> 8) & 0xFF]))
+    a.bx(14)                                  # bx lr
+    a.align(4)
+    a.label("incr_and_get_track_identifier_lit")
+    def _emit_lit(_pc: int) -> bytes:
+        offset = G_Y1_AVRCP_TRACK_IDENTIFIER_VADDR - (a.labels["incr_and_get_track_identifier_add_pc"] + 4)
         return (offset & 0xFFFFFFFF).to_bytes(4, "little")
     a._fixup(_emit_lit, 4)
 
@@ -2800,6 +2862,7 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     _emit_save_event_seq_id_subroutine(a)
     _emit_event_subscribed_subroutine(a)
     _emit_clear_event_database_subroutine(a)
+    _emit_incr_track_identifier_subroutine(a)
 
     # Path strings, 4-byte-aligned for clean ADR offsets.
     a.align(4)
@@ -2813,12 +2876,14 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     a.asciiz("/data/data/com.innioasis.y1/files/y1-papp-set")
     a.align(4)
 
-    # AVRCP 1.3 §6.7.2 TRACK_CHANGED Identifier: 8 zero bytes = "selected
-    # track" semantic. Referenced by all three track_changed_rsp emit sites
-    # (T4 reactive, extended_T2 INTERIM, T5 proactive CHANGED).
-    a.label("selected_track_id")
-    a.raw(bytes(8))
-    a.align(4)
+    # The TRACK_CHANGED Identifier static (selected_track_id, 8 zero bytes
+    # per AVRCP 1.3 §6.7.2 strict) is gone — replaced by a dynamic 8-byte
+    # buffer in .bss padding at vaddr 0xd2c4 whose trailing byte is a
+    # monotonic counter incremented by `incr_and_get_track_identifier`
+    # on every TRACK_CHANGED emit. Pixel-4-as-TG-in-1.3-mode does the same
+    # thing (Trace #46 btsnoop tshark decode); CTs that gate metadata
+    # refetch on Identifier-change-detection need the counter to advance
+    # or they wedge on the first emit per session.
 
     # PApp data tables (PDU 0x11..0x16). All AVRCP 1.3 §5.2 spec values.
     a.label("papp_attr_ids")
