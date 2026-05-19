@@ -911,9 +911,7 @@ def _emit_t5(a: Asm) -> None:
     #   1. previous-track-natural-end flag at file[793] (set by music app
     #      before metachanged broadcast)
     #   2. sub_track_reached_end bit at state[17] (armed by T8 INTERIM emit;
-    #      not cleared post-emit — state[17] is rarely armed by CTs in our
-    #      test matrix, so adding a §6.7.1-strict clear here would be ~58 B
-    #      of dead code. T2/T8 re-arm idempotently on every CT re-register.)
+    #      stays armed across CHANGEDs — universal §5.4.2 reading).
     a.ldrb_w(0, 13, T5_OFF_FILE_NATURAL_END)
     a.cmp_imm8(0, 0)
     a.beq("t5_skip_reached_end")
@@ -936,10 +934,11 @@ def _emit_t5(a: Asm) -> None:
     # Browseable Player UID extension; strict 1.3 parsers silently drop
     # CHANGED with non-zero Identifier and fall back to polling-only
     # metadata refresh. ICS Table 7 row 24 (Mandatory wire-level).
-    # sub_track_changed bit at state[16] (cleared after emit per §6.7.1).
-    # Pure subscription gate: 0 = not subscribed, nonzero = subscribed.
-    # Per-event TID is read from g_avrcp_req_event_database[2] by
-    # restore_conn_tid below.
+    # sub_track_changed bit at state[16]: pure subscription gate (0 = not
+    # subscribed, nonzero = subscribed; armed once by extended_T2 INTERIM,
+    # stays set across CHANGEDs per the universal §5.4.2 reading). Per-event
+    # TID is read from g_avrcp_req_event_database[2] by restore_conn_tid
+    # below.
     a.ldrb_w(0, 13, T5_OFF_STATE + 16)
     a.cmp_imm8(0, 0)
     a.beq("t5_skip_track_changed")
@@ -953,23 +952,29 @@ def _emit_t5(a: Asm) -> None:
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_CHANGED)
     a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
-    # T5emit aid= log dropped 2026-05-19 to free trampoline budget for the
-    # per-event-TID restore subroutine. mtkbt-side `M5wire c39=` (D1 cave)
-    # provides the wire-emit signal we actually care about post-fix.
+    if DEBUG_NATIVE_LOG:
+        # No-arg fmt; r3 ignored by printf. Confirms TRACK_CHANGED CHANGED
+        # emit fires per track edge after the loose-clear refactor.
+        _emit_native_log_u32(a, "log_fmt_t5tc", 3)
     a.blx_imm(PLT_track_changed_rsp)
 
-    # AVRCP §6.7.1 strict: clear sub_track_changed (state[16]) after CHANGED.
-    # CT must re-RegisterNotification(0x02) for the next track-edge CHANGED.
-    # r4 holds struct ptr — use fd_reg=6.
-    _emit_subscription_write(a, 0, 16, T5_OFF_FILE + 0,
-                             "t5_skip_track_changed", fd_reg=6)
+    # state[16] stays armed across CHANGED — universal §5.4.2 reading.
+    # The strict §6.7.1 single-shot semantic gated CHANGEDs on prompt
+    # CT re-registration after each emit, which several CTs in the test
+    # matrix didn't reliably do (they receive the first CHANGED, fetch
+    # metadata, but don't re-RegisterNotification(ev=02) before the next
+    # track edge — Y1's second-track CHANGED would then be gated out and
+    # the metadata pane stayed frozen on the first track). Keeping the
+    # gate set-once-by-INTERIM is consistent with extended_T2's INTERIM
+    # arm (byte_value=1, no auto-clear); per-event TID echo correctness
+    # is preserved via the database read in _emit_restore_conn_tid_from_db.
 
     a.label("t5_skip_track_changed")
 
     # ---- emit TRACK_REACHED_START (event 0x04) — gated on subscription ----
     # AVRCP 1.3 §5.4.2 Table 5.32. ICS Table 7 row 26 (Optional).
-    # sub_track_reached_start bit at state[18] (not cleared post-emit —
-    # same rationale as state[17] above; the gate is rarely armed by CTs).
+    # sub_track_reached_start bit at state[18] (armed by T8 INTERIM emit;
+    # stays armed across CHANGEDs — universal §5.4.2 reading).
     a.ldrb_w(0, 13, T5_OFF_STATE + 18)
     a.cmp_imm8(0, 0)
     a.beq("t5_skip_reached_start")
@@ -1737,40 +1742,19 @@ def _emit_t_papp(a: Asm) -> None:
     a.b_w("t4_to_epilogue")
 
 
-def _emit_subscription_write(a: Asm, byte_value, state_byte_offset: int,
+def _emit_subscription_write(a: Asm, byte_value: int, state_byte_offset: int,
                              scratch_sp_offset: int, fail_label: str,
                              fd_reg: int = 4) -> None:
-    """Write `byte_value` to y1-trampoline-state[state_byte_offset].
+    """Write `byte_value` (int 0..255) to y1-trampoline-state[state_byte_offset].
 
-    `byte_value` is either:
-      - an `int` (0..255): emitted as `movs r0, #imm8` before the store.
-        Used for clear-after-CHANGED (byte_value=0) sites.
-      - `None`: caller has already set r0 to the byte to write. Used by
-        per-event TID-save sites that compute `conn[+0x11] + 1` into r0
-        before calling this helper (the +1 encoding makes `state[N] = 0`
-        unambiguously mean "not subscribed" even when the saved TID
-        itself is 0).
-
-    Gate-check semantics (`cmp r0, 0; beq skip` at CHANGED sites) work
-    identically for either encoding — a nonzero state byte means the
-    event is subscribed; the byte value (1 for the legacy encoding,
-    TID+1 for the per-event encoding) just carries extra information
-    that some CHANGED-emit sites unpack before calling their rsp helper.
-
-    Used by T2 / T8 to ARM (byte_value=1 or TID+1) and by T5 / T9 to
-    CLEAR (byte_value=0) per-event subscription gates for AVRCP §6.7.1
-    once-per-registration semantics. `fd_reg` (default 4) is the
-    callee-saved register cached as the open()'d fd across the lseek /
-    write / close PLT blx calls (callee-saved per AAPCS so the value
-    survives).
-
-    Default fd_reg=4 keeps T2 / T8 callers untouched: they branch to a
-    terminal label immediately after this helper returns, so r4 going
-    from "struct ptr" to "fd" is harmless. T5 / T9 callers chain
-    multiple emits and rely on r4 = struct ptr throughout (used as
-    `r4 + 8 = conn` for every PLT_reg_notievent_*_rsp). Those callers
-    MUST pass fd_reg=6 to avoid clobbering r4; r6 is otherwise unused
-    in T5 / T9 bodies and is callee-saved per AAPCS.
+    Called only by extended_T2 / T8 INTERIM-ack sites to ARM the per-event
+    subscription gate (byte_value=1). The gate is set-once: T5 / T9 read
+    state[N] at CHANGED-emit time but do NOT clear, matching the universal
+    §5.4.2 reading of CHANGED notifications. CTs that gate metadata refresh
+    on receiving CHANGED don't need to re-RegisterNotification between
+    edges to keep the pane updating. `fd_reg` (default 4) is a callee-saved
+    register cached as the open()'d fd across the lseek / write / close
+    PLT blx calls.
 
     `scratch_sp_offset` is a 1-byte stack region the byte_value is
     written to first (so we can pass &sp[off] as the write source).
@@ -1779,8 +1763,7 @@ def _emit_subscription_write(a: Asm, byte_value, state_byte_offset: int,
     adjacent state we still need. `fail_label` is the branch target if
     open() fails; the rest of the block falls through after close().
     """
-    if byte_value is not None:
-        a.movs_imm8(0, byte_value)
+    a.movs_imm8(0, byte_value)
     a.strb_w(0, 13, scratch_sp_offset)        # 1-byte store, no adjacent clobber
 
     a.adr_w(0, "path_state")
@@ -2461,9 +2444,9 @@ def _emit_t9(a: Asm) -> None:
     a.strb_w(0, 13, T9_STATE_LAST_PS_OFF)
     a.movs_imm8(5, 1)                         # any_change = 1
 
-    # Subscription gate (§6.7.1 strict): emit CHANGED only if T8 INTERIM has
-    # armed sub_play_status (state[14] = 1). Gate is cleared after emit
-    # below; CT must re-RegisterNotification(0x01) for the next CHANGED.
+    # Subscription gate: emit CHANGED only if T8 INTERIM has armed
+    # sub_play_status (state[14] != 0). Gate stays armed across CHANGEDs
+    # — universal §5.4.2 reading; see T5 TRACK_CHANGED arm for rationale.
     a.ldrb_w(1, 13, T9_STATE_SUB_PLAY_OFF)
     a.cmp_imm8(1, 0)
     a.beq("t9_after_play_check")
@@ -2476,15 +2459,13 @@ def _emit_t9(a: Asm) -> None:
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
     a.ldrb_w(3, 13, T9_OFF_FILE_PLAYFLAG)     # r3 = play_status
-    # T9emit pstat= log dropped 2026-05-19 to free trampoline budget; the
-    # mtkbt-side D1 cave's `M5wire c39=` covers wire-emit timing.
+    if DEBUG_NATIVE_LOG:
+        _emit_native_log_u32(a, "log_fmt_t9ps", 3)
     a.blx_imm(PLT_reg_notievent_playback_rsp)
 
-    # AVRCP §6.7.1 strict: clear sub_play_status (state[14]) after CHANGED.
-    # CT must re-RegisterNotification(0x01) to receive the next emit.
-    # r4 holds struct ptr — use fd_reg=6.
-    _emit_subscription_write(a, 0, 14, T9_OFF_ARGS,
-                             "t9_after_play_check", fd_reg=6)
+    # state[14] stays armed across CHANGED — see "state[16] stays armed"
+    # comment in T5 TRACK_CHANGED for the rationale (universal §5.4.2
+    # reading; per-event TID echo correctness preserved via database).
 
     # ---- emit NowPlayingContentChanged CHANGED on play-edge ----
     # Paired with PlaybackStatus + TrackChanged as a 3-frame burst on
@@ -2520,11 +2501,8 @@ def _emit_t9(a: Asm) -> None:
     a.strb_w(0, 13, T9_STATE_LAST_BATT_OFF)
     a.movs_imm8(5, 1)                         # any_change = 1
 
-    # Subscription gate: emit only if sub_battery armed (state[19] = 1).
-    # Not cleared post-emit — battery transitions are infrequent (bucket-
-    # mapped from `Intent.ACTION_BATTERY_CHANGED`) and CTs in our matrix
-    # don't broadly subscribe to BATT_STATUS_CHANGED, so adding a strict-
-    # gate clear would add ~58 B for a code path that rarely fires.
+    # Subscription gate: emit only if sub_battery armed (state[19] != 0).
+    # Stays armed across CHANGEDs — universal §5.4.2 reading.
     a.ldrb_w(1, 13, T9_STATE_SUB_BATT_OFF)
     a.cmp_imm8(1, 0)
     a.beq("t9_after_batt_check")
@@ -2566,9 +2544,9 @@ def _emit_t9(a: Asm) -> None:
     a.strb_w(0, 13, T9_STATE_LAST_SHUFFLE_OFF)
     a.movs_imm8(5, 1)                         # any_change = 1
 
-    # Subscription gate (§6.7.1 strict): emit CHANGED only if T8 INTERIM has
-    # armed sub_papp (state[15] = 1). Cleared after emit; CT must
-    # re-RegisterNotification(0x08) to receive the next PApp CHANGED.
+    # Subscription gate: emit CHANGED only if T8 INTERIM has armed
+    # sub_papp (state[15] != 0). Stays armed across CHANGEDs — universal
+    # §5.4.2 reading; see T5 TRACK_CHANGED arm for rationale.
     a.ldrb_w(1, 13, T9_STATE_SUB_PAPP_OFF)
     a.cmp_imm8(1, 0)
     a.beq("t9_after_papp_check")
@@ -2586,13 +2564,11 @@ def _emit_t9(a: Asm) -> None:
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
     a.movs_imm8(3, 2)                         # n
+    if DEBUG_NATIVE_LOG:
+        _emit_native_log_u32(a, "log_fmt_t9papp", 3)
     a.blx_imm(PLT_reg_notievent_player_appsettings_rsp)
 
-    # AVRCP §6.7.1 strict: clear sub_papp (state[15]) after CHANGED.
-    # CT must re-RegisterNotification(0x08) for the next PApp CHANGED.
-    # r4 holds struct ptr — use fd_reg=6.
-    _emit_subscription_write(a, 0, 15, T9_OFF_ARGS,
-                             "t9_after_papp_check", fd_reg=6)
+    # state[15] stays armed across CHANGED — see T5 TRACK_CHANGED arm.
 
     a.label("t9_after_papp_check")
 
@@ -2650,10 +2626,10 @@ def _emit_t9(a: Asm) -> None:
     a.cmp_imm8(0, 1)                          # 1 = PLAYING (AVRCP §5.4.1 Tbl 5.26)
     a.bne("t9_done")
 
-    # Subscription gate (§6.7.1 strict): emit only if sub_pos armed
-    # (state[13] = 1). Cleared after emit; CT must re-register to receive
-    # the next CHANGED. Wire-side POS_CHANGED rate becomes
-    # min(PositionTicker 1 Hz, CT re-register rate).
+    # Subscription gate: emit only if sub_pos armed (state[13] != 0).
+    # Stays armed across CHANGEDs — universal §5.4.2 reading. Wire-side
+    # POS_CHANGED rate then tracks the music app's playstatechanged
+    # broadcast cadence (~1 Hz when playing).
     a.ldrb_w(0, 13, T9_STATE_SUB_POS_OFF)
     a.cmp_imm8(0, 0)
     a.beq("t9_done")
@@ -2714,12 +2690,9 @@ def _emit_t9(a: Asm) -> None:
     # cave) covers wire-emit timing for position frames.
     a.blx_imm(PLT_reg_notievent_pos_changed_rsp)
 
-    # AVRCP §6.7.1 strict: clear sub_pos (state[13]) after CHANGED.
-    # CT must re-RegisterNotification(0x05) to receive the next emit.
-    # CT-side cadence of re-registers effectively sets the wire-side
-    # POS_CHANGED rate (≈1 Hz for Bolt-on-Pixel). r4 holds struct ptr —
-    # use fd_reg=6.
-    _emit_subscription_write(a, 0, 13, T9_OFF_ARGS, "t9_done", fd_reg=6)
+    # state[13] stays armed across CHANGED — see T5 TRACK_CHANGED arm.
+    # Position CHANGED then fires at the music app's playstatechanged
+    # broadcast rate (~1 Hz when playing).
 
     a.label("t9_done")
     # ---- epilogue: return jboolean true ----
@@ -2824,12 +2797,25 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     # Tag + per-emit-site format strings. Each fmt is a single %08x arg
     # so log lines look like `Y1T  : T9pos=0000a3f4` — grep-friendly,
     # zero-pad-aligned, and avoids variadic 64-bit packing rules.
-    # DEBUG_NATIVE_LOG block intentionally empty: the trampoline budget is
-    # currently fully consumed by the restore_conn_tid + save_event_seq_id
-    # pair that implements the §3.3.5 strict-echo TID flow. mtkbt-side
-    # `M5wire c39=` (patch_mtkbt.py D1 cave) covers wire-emit timing for
-    # every outbound frame. Re-add log_tag + fmt strings + the matching
-    # _emit_native_log_u32 call sites here when adding new debug probes.
+    if DEBUG_NATIVE_LOG:
+        a.align(4)
+        a.label("log_tag")
+        a.asciiz("Y1T")
+        a.align(4)
+        # Per-event emit markers. No %08x value — the event_id is implicit
+        # in the call site. Used to verify each CHANGED actually fires after
+        # the §6.7.1 loose-clear refactor: if a given event's CHANGED never
+        # appears in a session that should produce one, the state[N] gate
+        # never armed (T8/extended_T2 INTERIM didn't run for that event).
+        a.label("log_fmt_t5tc")
+        a.asciiz("T5tc")
+        a.align(4)
+        a.label("log_fmt_t9ps")
+        a.asciiz("T9ps")
+        a.align(4)
+        a.label("log_fmt_t9papp")
+        a.asciiz("T9papp")
+        a.align(4)
 
     # PApp UTF-8 attribute / value text strings (charset 0x006A).
     a.label("papp_text_repeat")
