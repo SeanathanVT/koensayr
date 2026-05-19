@@ -5519,3 +5519,97 @@ ev=01 has 27 re-subscribes — already working. Same for ev=05 (16) and ev=08 (1
 ### Optional follow-up: simplify the M5+M7 cave
 
 Once per-event TID is in place, `fcn.0xf0bc:0xf1a8` writes the correct TID and M5+M7 just rewrite it to a stale value. M5+M7 could be removed entirely (revert `0x6d186` to stock ldrb+strb, drop the cave, drop the LOAD #1 filesz extension). Defer — non-load-bearing cleanup. Document the new understanding in `patch_mtkbt.py` comments when next touched.
+
+## Trace #70 (2026-05-19) — Bolt 1053 reveals M7 was breaking the per-event TID fix; M5 discriminator corrected to use packet[+0xd], M7 removed
+
+### Bolt 1053 outcome of commit 705f145 (per-event TID save/restore at JNI side)
+
+`dual-bolt-20260519-1053` with patched libextavrcp_jni.so (`3dfc20d6…`) and mtkbt (`68faa7cf…`): 0 restarts, 552 Y1T lines, but:
+
+- ev=09 subscribed once at `10:53:42.822` — **still** never re-subscribed.
+- `T5ncc` × 5 (most before Bolt even subscribed to ev=09 — state[20] persisted across boots with legacy `byte_value=1` encoding from a previous flash).
+- `M5wire c39` on the 5 `T5ncc` emits: `05` and `0a` — matching the latest inbound CMD TID at that moment, **not** the saved per-event TID.
+
+Per-frame `M5dbg`:
+```
+10:52:17.018  M5wire c39=09   (some inbound CMD at TID=9)
+10:52:17.031  M5wire c39=0a   (next inbound CMD at TID=0xa, chan+0xba9 updated)
+10:52:17.357  T5ncc           ← JNI: state[20] = X, conn[+0x11] = X-1
+10:52:17.358  M5wire c39=0a   ← but wire emits TID=0a, not X-1
+10:52:17.359  T5emit aid=d9e5d5e5
+10:52:17.359  M5wire c39=0a
+```
+
+### Root cause: M7's unconditional sync overrides fcn.0xf0bc's correct TID write
+
+Walking the post-fix outbound flow:
+
+1. T5 NCC trampoline reads `state[20]`, computes `r0 = state[20] - 1` (saved TID), writes to `conn[+0x11]`. ✓
+2. JNI's `reg_notievent_now_playing_content_rsp` reads `conn[+0x11]` = saved TID, writes `msg[5] = saved TID`. ✓
+3. `AVRCP_SendMessage` forwards `msg=544` to mtkbt.
+4. mtkbt's `fcn.0x11894:0x11928`: `packet[+0xa] = msg[5] = saved TID`. ✓
+5. `fcn.0xf0bc:0xf1a8`: `chan+0x39 = packet[+0xa] = saved TID`. ✓
+6. **M5+M7 cave runs at `0x6d186` → 0xf3680:**
+   - M5's `cmp r2, 1` checks `packet[+8]`. Empirically `p8 = 0xb8` (outbound) or `0xea` (inbound), **never `1`**. M5's `beq skip` is never taken → original `strb.w r0, [r4, 0x29]` always fires.
+   - That strb writes `chan+0x39 = packet[+0xd]`. For outbound, `packet[+0xd] = 0` (allocator-zeroed). chan+0x39 := 0 — wipes out the saved TID.
+   - M7's `ldrb.w r0, [r4, 0xb99]; strb.w r0, [r4, 0x29]` then unconditionally syncs `chan+0x39 = chan+0xba9` (latest inbound CMD's TID). ✗ — overwrites the saved TID with the wrong one.
+7. `fcn.0xae418:0xae448` wire builder reads `chan+0x39` = latest inbound TID. Wire emits wrong TID. Bolt rejects.
+
+**M7 was added in fe974f2 as a "fix" for what was actually a bug *in our own* M5 cave — M5's `cmp r2, 1` never matched, so M5's strb fired on every outbound and clobbered `chan+0x39` with 0. M7 papered over that by overwriting with `chan+0xba9` (which happens to match `packet[+0xa]` for FAST outbound responses where conn[+0x11] hasn't rotated). For DELAYED outbound responses (CHANGEDs fired async from broadcasts), `chan+0xba9` carries the latest-inbound-CMD TID, not the saved per-event TID. So M7 actively breaks the per-event fix.**
+
+### The actual fix: M5 discriminator corrected, M7 removed
+
+The cave at `0xf3680` is now 24 bytes (same size, no LOAD #1 filesz change) with the following layout:
+
+```
+0xf3680  68 7b           ldrb r0, [r5, 0xd]       ; load packet[+0xd]
+0xf3682  00 28           cmp r0, 0                 ; outbound = 0 (pd)
+0xf3684  00 bf           nop                        ; padding
+0xf3686  01 d0           beq 0xf368c                ; skip strb on outbound
+0xf3688  84 f8 29 00     strb.w r0, [r4, 0x29]     ; inbound: chan+0x39 = TID
+0xf368c  00 bf 00 bf     2 × nop                    ; was M7 ldrb.w (removed)
+0xf3690  00 bf 00 bf     2 × nop                    ; was M7 strb.w (removed)
+0xf3694  79 f7 7a bd     b.w 0x6d18c                ; return
+```
+
+Discriminator is now `packet[+0xd] == 0` instead of the broken `packet[+8] == 1`:
+- Outbound IPC packets have `packet[+0xd] = 0` (allocator-zeroed at `fcn.0x11894:0x11926`).
+- Inbound CMD stash struct has `r5[+0xd] = chan+0xba9 = inbound TID` (nonzero).
+- Empirically verified across TV / Sonos / Bolt sessions via D2 cave's `M5dbg pd=NN` logs.
+
+Edge case: inbound TID=0 falls into the outbound branch (skip strb). Result: `chan+0x39` not updated from the inbound CMD. But this only matters if an outbound RESPONSE then fires reading `chan+0x39` — and fcn.0xf0bc's outbound path always writes `chan+0x39 = packet[+0xa] = msg[5]` before the wire builder reads it. So the inbound-TID-0 edge case can't actually break wire echo.
+
+With M5 correctly skipping strb on outbound and M7 removed:
+- Outbound CHANGED: fcn.0xf0bc's `chan+0x39 = saved TID` (from JNI per-event fix) survives → wire emits correct TID. ✓
+- Outbound INTERIM: fcn.0xf0bc's `chan+0x39 = current inbound TID` (msg[5] = conn[+0x11], synchronous with the RegNotif) survives → wire emits correct TID. ✓
+- Outbound non-RegNotif (GEA, PASSTHROUGH ack, etc.): same path, conn[+0x11] = current cmd's TID synchronously → wire emits correct TID. ✓
+- Inbound CMDs: original strb still fires, chan+0x39 = inbound TID for subsequent (now-redundant) reads. ✓
+
+### Stale state file from previous sessions
+
+A side observation from Bolt 1053: `T5ncc` fired 5 times *before* Bolt even subscribed to ev=09 (the only `T8reg ev=09` is at 10:53:42, after most `T5ncc` emits). state[20] was nonzero from a previous flash session — the trampoline-state file at `/data/data/com.innioasis.y1/files/y1-trampoline-state` persists across reboots. This is mostly cosmetic now (the cave's strb-skip-on-outbound logic means a stale state[20] with value 1 just produces `conn[+0x11] = 0` for these "phantom" T5ncc emits, which then echoes correctly via fcn.0xf0bc → wire). Not load-bearing for the fix.
+
+### Patcher state
+
+`patch_mtkbt.py`:
+- OUTPUT_MD5 `9c4e4622` → `e466763d12cd516103de05ce4af174b9`
+- OUTPUT_DEBUG_MD5 `68faa7cf` → `0246e82640743f35211cddd84c9ad26f`
+- M5-CAVE entry's `after` bytes changed (4 byte differences: cmp + first NOP + 4 NOPs replacing the M7 ldrb/strb).
+- Debug build's `m5_cave_with_d2_redirect` construction in `build_patches()` updated to match.
+- M5 patch comments and `docs/PATCHES.md` cave-disassembly section updated.
+
+`patch_libextavrcp_jni.py`: unchanged from 705f145 (per-event TID save/restore at JNI side).
+
+### Verification on next Bolt capture
+
+Expected behavior on a fresh state file (delete `y1-trampoline-state` or first-flash):
+1. Bolt subscribes ev=09 — `T8reg ev=09`. JNI saves `state[20] = TID + 1`.
+2. Track edge fires `T5ncc`. JNI reads state[20], writes `conn[+0x11] = saved TID`.
+3. JNI calls rsp builder → mtkbt msg=544 → fcn.0xf0bc writes `chan+0x39 = saved TID`.
+4. Cave runs at 0x6d186 → 0xf3680: packet[+0xd] = 0 (outbound), `beq skip` taken, strb skipped. NOPs. b.w return.
+5. Wire builder reads `chan+0x39 = saved TID`. Emits correct echo TID.
+6. Bolt accepts CHANGED → re-subscribes ev=09 → repeats.
+
+Expected M5dbg pattern: `pd=00` on every outbound (confirms discriminator), `ba9=NN` should still show various values (chan+0xba9 still updated by mtkbt's stash on every inbound CMD — irrelevant now), `c39=NN` should match the saved per-event TID for CHANGED emits.
+
+If c39 still tracks latest inbound TID after this fix, there's a deeper issue we haven't found.

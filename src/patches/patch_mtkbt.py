@@ -35,10 +35,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _thumb2asm import Asm
 
 STOCK_MD5         = "3af1d4ad8f955038186696950430ffda"
-OUTPUT_MD5        = "9c4e462241169c3a181574db157c8df7"
+OUTPUT_MD5        = "e466763d12cd516103de05ce4af174b9"
 
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "68faa7cfbb5c833d4f55c44ccfa98813"
+OUTPUT_DEBUG_MD5  = "0246e82640743f35211cddd84c9ad26f"
 
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
@@ -440,53 +440,61 @@ BASE_PATCHES = [
     },
     {
         # Cave content at vaddr 0xf3680 (file 0xf3680, since LOAD #1 has
-        # file_off == vaddr). 24 bytes:
-        #   68 7b              ldrb r0, [r5, 0xd]       — original 1st insn
-        #   2a 7a              ldrb r2, [r5, 8]          — discriminator load
-        #   01 2a              cmp r2, 1                  — outbound = 1
-        #   01 d0              beq +2 (skip inbound strb, fall into M7 sync)
-        #   84 f8 29 00        strb.w r0, [r4, 0x29]      — original 2nd insn
-        #   94 f8 99 0b        ldrb.w r0, [r4, 0xb99]     — M7: load chan+0xba9 (inbound-RX TID stash)
-        #   84 f8 29 00        strb.w r0, [r4, 0x29]      — M7: sync chan+0x39 unconditionally
+        # file_off == vaddr). 24 bytes (last 8 are NOP-padding that holds
+        # the slot in case future work needs to re-grow the cave without
+        # touching LOAD #1 filesz/memsz):
+        #   68 7b              ldrb r0, [r5, 0xd]       — load packet[+0xd]
+        #   00 28              cmp r0, 0                 — outbound = 0 (pd)
+        #   00 bf              nop                        — padding
+        #   01 d0              beq +2 (skip strb on outbound)
+        #   84 f8 29 00        strb.w r0, [r4, 0x29]      — inbound: chan+0x39 = TID
+        #   00 bf 00 bf        2 × nop                    — was M7 ldrb.w (removed)
+        #   00 bf 00 bf        2 × nop                    — was M7 strb.w (removed)
         #   79 f7 7a bd        b.w 0x6d18c                — return into Path B
         #
-        # M7 closes the gap where M5's discriminator (packet[+8] == 1) fails
-        # for the msg=544 RegNotif INTERIM/CHANGED IPC path — that path
-        # routes through libextavrcp.so::AVRCP_SendMessage → BT_SendMessage
-        # with an allocator that doesn't set packet[+8] = 1, so M5's strb
-        # fires with packet[+0xd] = 0 and clobbers chan+0x39 to TID=0. CTs
-        # that cycle AV/C TIDs across 0-15 (Bolt, observed empirically:
-        # mtkbt btlog `transId:N` with N ∈ {3,6,7,8,9,12,13} inbound while
-        # M5wire c39=00 on every outbound) then fail the AVCTP §3.3.5
-        # echo check on every RegNotif response and retry-storm. CTs that
-        # use TID=0 exclusively (Sonos/TV/Kia) match the clobbered value
-        # by coincidence and aren't affected.
+        # Rationale (post-Trace #70). mtkbt's STOCK outbound chain already
+        # writes the correct AVRCP §3.3.5 echo TID at chan+0x39 via
+        # fcn.0xf0bc:0xf1a8 (`ldrb r3, [r0, 0xa]; strb.w r3, [r4, 0x31]`),
+        # where r0 = packet pointer, packet[+0xa] = msg[5] = JNI-supplied
+        # TID = libextavrcp's conn[+0x11] read. The only TID-echo bug in
+        # the stock binary was that Path B's `0x6d186 strb.w r0, [r4, 0x29]`
+        # then clobbers chan+0x39 with `packet[+0xd]` (= 0 for outbound,
+        # allocator-zeroed). This cave's only job is to skip that strb on
+        # outbound while preserving inbound semantics.
         #
-        # The new tail (offsets 0xf368c..0xf3693) loads the per-channel
-        # inbound-RX TID stash at chan+0xba9 (latched by fcn.0x11374:0x11436
-        # `strb.w sl, [r4, 0xba9]` on every inbound AV/C cmd) and forces
-        # chan+0x39 to mirror it. Runs unconditionally on both paths:
-        # - inbound (beq not taken): writes packet[+0xd] = TID, then re-
-        #   writes the same value from chan+0xba9. Idempotent.
-        # - outbound (beq taken): skips inbound strb, falls into M7 sync,
-        #   chan+0x39 = chan+0xba9 = latest inbound TID. Wire builder
-        #   fcn.0xae418 then emits the correct §3.3.5 echo TID regardless
-        #   of which IPC allocator originated the response packet.
+        # Discriminator: `cmp r0, 0` (uses the already-loaded packet[+0xd]).
+        # `packet[+0xd] == 0` ↔ outbound (allocator-zeroed); nonzero ↔
+        # inbound (per-channel stash struct's TID slot). Empirically
+        # verified across TV / Sonos / Bolt sessions via the D2 cave's
+        # `M5dbg pd=NN` logs (D2 stays for forward verification).
         #
-        # Why r4+0xb99 (and not +0xba9): in Path B r4 = chan+0x10, so the
-        # offset from r4 to chan+0xba9 is 0xba9 - 0x10 = 0xb99. Thumb-2
-        # ldrb.w T2 form (12-bit unsigned imm12) supports up to 0xfff.
-        "name":   "[M5-CAVE] TID echo trampoline blob @ 0xf3680 (24 bytes in LOAD #1 padding; includes M7 unconditional chan+0xba9 → chan+0x39 sync)",
+        # M7's chan+0xba9-sync removed: M7 was a Trace #66 attempt to
+        # bypass M5's broken `cmp r2, 1` discriminator (which never matched
+        # because mtkbt's IPC allocators leave packet[+8] = 0xb8/0xea, not
+        # 1). M7 worked for fast-CHANGED events (chan+0xba9 happens to
+        # match the saved msg[5] when CHANGED fires within ms of the
+        # RegNotif) but ACTIVELY BROKE delayed CHANGEDs (M7 overwrote the
+        # correctly-saved per-event TID at chan+0x39 with the latest
+        # inbound CMD's TID). The Bolt 1053 session confirmed the
+        # interaction: per-event TID save/restore at JNI side (commit
+        # 705f145) was emitting the right msg[5], but M7 then clobbered
+        # chan+0x39 right before the wire builder read it.
+        #
+        # With M7 removed and M5's discriminator using packet[+0xd] == 0
+        # instead of packet[+8] == 1, the cave correctly preserves
+        # fcn.0xf0bc's chan+0x39 write on outbound while still latching
+        # inbound TIDs into chan+0x39 on inbound CMD frames.
+        "name":   "[M5-CAVE] TID echo cave @ 0xf3680 (24 B; skip-strb-on-outbound discriminator + NOP padding; M7 removed)",
         "offset": 0xf3680,
         "before": bytes([0x00] * 24),
         "after":  bytes([
             0x68, 0x7b,                    # ldrb r0, [r5, 0xd]
-            0x2a, 0x7a,                    # ldrb r2, [r5, 8]
-            0x01, 0x2a,                    # cmp r2, 1
-            0x01, 0xd0,                    # beq +2
-            0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]
-            0x94, 0xf8, 0x99, 0x0b,        # ldrb.w r0, [r4, 0xb99]   (chan+0xba9)
-            0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]    (sync chan+0x39)
+            0x00, 0x28,                    # cmp r0, 0
+            0x00, 0xbf,                    # nop (padding)
+            0x01, 0xd0,                    # beq +2 (skip strb on outbound)
+            0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]    (inbound only)
+            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (was M7 ldrb.w chan+0xba9)
+            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (was M7 strb.w chan+0x39)
             0x79, 0xf7, 0x7a, 0xbd,        # b.w 0x6d18c
         ]),
     },
@@ -647,14 +655,19 @@ def build_patches(debug: bool) -> list[dict]:
         m5_cave_tail = Asm(0xf3694)
         m5_cave_tail.labels["cave2"] = DEBUG_CAVE2_VADDR
         m5_cave_tail.b_w("cave2")
+        # Same cave body as the release build's BASE_PATCHES entry —
+        # M5 with skip-strb-on-outbound discriminator (cmp r0, 0), M7
+        # removed (replaced with NOP padding) — but with the final b.w
+        # redirected to the D2 cave so D2 can log packet[+8] / pd / ba9
+        # before returning to the original 0x6d18c.
         m5_cave_with_d2_redirect = bytes([
             0x68, 0x7b,                    # ldrb r0, [r5, 0xd]
-            0x2a, 0x7a,                    # ldrb r2, [r5, 8]
-            0x01, 0x2a,                    # cmp r2, 1
-            0x01, 0xd0,                    # beq +2
+            0x00, 0x28,                    # cmp r0, 0
+            0x00, 0xbf,                    # nop (padding)
+            0x01, 0xd0,                    # beq +2 (skip strb on outbound)
             0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]
-            0x94, 0xf8, 0x99, 0x0b,        # ldrb.w r0, [r4, 0xb99]
-            0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]
+            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (was M7 ldrb.w)
+            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (was M7 strb.w)
         ]) + m5_cave_tail.resolve()        # b.w D2_cave (replaces b.w 0x6d18c)
 
         # Replace the BASE_PATCHES M5-CAVE entry's `after` in-place so the
@@ -664,8 +677,8 @@ def build_patches(debug: bool) -> list[dict]:
             if p["offset"] == 0xf3680 and len(p["after"]) == 24:
                 p["after"] = m5_cave_with_d2_redirect
                 p["name"] = p["name"].replace(
-                    "M7 unconditional chan+0xba9 → chan+0x39 sync",
-                    "M7 sync + D2 exit-log redirect"
+                    "M7 removed)",
+                    "M7 removed; D2 exit-log redirect for diagnostics)"
                 )
                 break
 

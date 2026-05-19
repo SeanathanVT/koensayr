@@ -150,12 +150,12 @@ M3 NOPs the SET (not the CHECK). After M3 the flag is never set, so `cbnz r3, 0x
 
 `fcn.0x6d0f0` is byte-for-byte structurally identical to M2's `fcn.0x6d048`: same `fcn.0x6ccdc` list-contains check at `0x6d110`, same INTERIM/CHANGED discriminator at `0x6d11e`, same drop target `movs r0, 0xd; pop {r3, r4, r5, pc}` at `0x6d19c`. Unlike Path A on busy A2DP-heavy CTs, Path B's list-contains check fails on most invocations, dropping the majority of `msg=544` emits before the wire frame is built. Subscription-class CTs that depend on RegNotif INTERIM responses (ev=01 / 05 / 08 / 0A) then retry-storm on the AVCTP V13 §3.3.5 3 s timer until they disengage AVRCP TG. M4 NOPs the analogous `beq 0x6d19c` at `0x6d116`, so `fcn.0x6d0f0` unconditionally builds the wire frame and tail-calls `b.w 0xae5e4` (`L2CAP_SendData`). `fcn.0x6d0f0` skips `fcn.0x6df20` entirely, so M3's chip-busy SET has no analogue on Path B.
 
-**M5 + M7 — TID echo trampoline: code-cave at `0xf3680`** (4 sites, 6 + 24 + 4 + 4 bytes):
+**M5 — TID-echo skip-on-outbound cave: code-cave at `0xf3680`** (4 sites, 6 + 24 + 4 + 4 bytes):
 
 | | offset | before | after |
 |---|---|---|---|
 | call site | `0x6d186` | `68 7b 84 f8 29 00` (`ldrb r0, [r5, 0xd]; strb.w r0, [r4, 0x29]`) | `86 f0 7b ba 00 bf` (`b.w 0xf3680; nop`) |
-| cave blob | `0xf3680` | 24 × `00` (LOAD #1 page padding) | `68 7b 2a 7a 01 2a 01 d0 84 f8 29 00 94 f8 99 0b 84 f8 29 00 79 f7 7a bd` (Thumb-2 M5 conditional store + M7 unconditional sync + return) |
+| cave blob | `0xf3680` | 24 × `00` (LOAD #1 page padding) | `68 7b 00 28 00 bf 01 d0 84 f8 29 00 00 bf 00 bf 00 bf 00 bf 79 f7 7a bd` (Thumb-2 M5 with `cmp r0,0` discriminator + NOP padding + return) |
 | LOAD #1 filesz | `0x84` | `6c 36 0f 00` (`0xf366c`) | `98 36 0f 00` (`0xf3698`) |
 | LOAD #1 memsz | `0x88` | `6c 36 0f 00` (`0xf366c`) | `98 36 0f 00` (`0xf3698`) |
 
@@ -163,22 +163,28 @@ Path B at `0x6d186` writes `chan[+0x29]` from `packet[+0xd]`. The same site is r
 
 CTs that cycle AV/C transIds across the 0-15 range (`AVCTP §6.1` transaction-label rotation, observed via `[AVRCP] transId:%d` btlog entries) see all their RegNotif INTERIM / CHANGED responses with TID=0, fail the `AVCTP §6.5` command-response TID echo and `§6.7.2` subscription TID match, and retry-storm on the V13 §3.3.5 3 s AVCTP retry timer until they disengage AVRCP TG. CTs that use transId=0 exclusively (no rotation) match accidentally and work pre-M5.
 
-The cave places a conditional-store trampoline in the LOAD #1 page-padding region (same ELF-extension trick used by `patch_libextavrcp_jni.py` for its trampoline blob — extend the segment's filesz / memsz to claim previously-unmapped zero-padding bytes as R+E). M5 discriminates outbound vs inbound at the Path B strb site via `packet[+8]`: the standard IPC allocator at `fcn.0x11894:0x11908` writes `packet[8] = 1` for outbound packets, while the inbound stash struct's `+8` is the low byte of a per-channel resolved address (`ip + (chnl << 11)`, runtime LSB constant `0xea`). M5 alone, however, fails for the `msg=544` RegNotif INTERIM/CHANGED IPC path — that path routes through `libextavrcp.so::AVRCP_SendMessage → BT_SendMessage(msg=0x220)` with an allocator that doesn't set `packet[+8] = 1`, so M5's strb fires with `packet[+0xd] = 0` and clobbers `chan+0x39` exactly as the unpatched code would. M7 adds an unconditional `chan+0xba9 → chan+0x39` sync after M5's conditional branch: regardless of which IPC allocator the response originated from, the wire builder reads the correct §3.3.5 TID echo from `chan+0xba9` (the per-channel inbound-RX stash slot latched by `fcn.0x11374:0x11436`).
+The cave places a conditional-store trampoline in the LOAD #1 page-padding region (same ELF-extension trick used by `patch_libextavrcp_jni.py` for its trampoline blob — extend the segment's filesz / memsz to claim previously-unmapped zero-padding bytes as R+E). The cave skips the outbound strb (preserving `fcn.0xf0bc:0xf1a8`'s prior write of `chan+0x39 = packet[+0xa] = msg[5]`) and lets the inbound strb fire (writing `chan+0x39 = packet[+0xd]` = inbound TID).
+
+Discriminator: `cmp r0, 0` using the already-loaded `packet[+0xd]`. Outbound IPC packets have `packet[+0xd] = 0` (allocator-zeroed at `fcn.0x11894:0x11926` — `movs r6, 0; strb r6, [r4, 0xd]`). Inbound stash struct's `+0xd` is the inbound TID (nonzero in the common case). Empirically validated across TV / Sonos / Bolt sessions via the D2 cave's `M5dbg pd=NN` logs — `pd=0` correlates 1:1 with outbound IPC packets.
+
+Per-event TID echo correctness depends on the JNI side restoring `conn[+0x11] = saved RegNotif TID` before each delayed CHANGED emit (see `patch_libextavrcp_jni.py` `state[16]` / `state[20]` TID+1 encoding below). With that restore in place, `fcn.0xf0bc:0xf1a8` writes the correct TID to chan+0x39, and this cave preserves it across the outbound strb at `0x6d186`.
 
 Cave disassembly (24 bytes at `0xf3680`):
 
 ```
-0xf3680  68 7b           ldrb r0, [r5, 0xd]        ; M5: original 1st insn (load packet[+0xd])
-0xf3682  2a 7a           ldrb r2, [r5, 8]           ; M5: discriminator load
-0xf3684  01 2a           cmp r2, 1                   ; M5: outbound = 1
-0xf3686  01 d0           beq 0xf368c                 ; M5: skip strb on outbound
-0xf3688  84 f8 29 00     strb.w r0, [r4, 0x29]      ; M5: original 2nd insn (inbound only)
-0xf368c  94 f8 99 0b     ldrb.w r0, [r4, 0xb99]     ; M7: load chan+0xba9 (inbound-RX TID stash)
-0xf3690  84 f8 29 00     strb.w r0, [r4, 0x29]      ; M7: sync chan+0x39 unconditionally
-0xf3694  79 f7 7a bd     b.w 0x6d18c                ; return into Path B
+0xf3680  68 7b           ldrb r0, [r5, 0xd]        ; load packet[+0xd]
+0xf3682  00 28           cmp r0, 0                  ; outbound = 0 (pd)
+0xf3684  00 bf           nop                         ; padding
+0xf3686  01 d0           beq 0xf368c                 ; skip strb on outbound
+0xf3688  84 f8 29 00     strb.w r0, [r4, 0x29]      ; inbound: chan+0x39 = TID
+0xf368c  00 bf 00 bf     2 × nop                     ; (was M7 ldrb.w; removed)
+0xf3690  00 bf 00 bf     2 × nop                     ; (was M7 strb.w; removed)
+0xf3694  79 f7 7a bd     b.w 0x6d18c                 ; return into Path B
 ```
 
-For inbound (`beq` not taken), M5 writes `packet[+0xd] = TID` to `chan+0x39`, then M7 re-writes the same value from `chan+0xba9` — idempotent. For outbound (`beq` taken), M5 preserves whatever was at `chan+0x39`, then M7 forces it to `chan+0xba9` (latest inbound TID). The wire builder at `fcn.0xae418:0xae448` then reads the correct TID via `ldrb r6, [r4, 0x15]` and emits `byte0 = (TID << 4) | …` per AVCTP V13 §6.1.1.
+Edge case: inbound CMDs with TID=0 fall into the outbound branch (skip strb). chan+0x39 isn't updated from the inbound. This doesn't affect wire echo because every outbound response goes through fcn.0xf0bc which rewrites chan+0x39 from packet[+0xa] = msg[5]. The inbound strb is therefore redundant in the working flow; it's kept for compatibility with any code path that reads chan+0x39 between an inbound CMD and the next outbound response.
+
+Historical: an earlier iteration (commit fe974f2) added an `M7` unconditional `chan+0xba9 → chan+0x39` sync after M5's conditional branch, attempting to bypass M5's then-broken `cmp r2, 1` discriminator (empirically `packet[+8]` is `0xb8` or `0xea`, never `1`). M7 appeared to fix CTs cycling AVCTP transaction IDs but actually overrode the correctly-saved per-event TID for delayed CHANGED emits — `chan+0xba9` carries the *latest* inbound CMD's TID, not the per-event saved TID. Removed once the JNI-side per-event TID save/restore was in place (commit 705f145) — see `docs/INVESTIGATION.md` Trace #70. The 8-byte M7 sequence is now NOP padding; cave size unchanged at 24 B to avoid touching LOAD #1 filesz.
 
 LOAD #1 filesz / memsz expand from `0xf366c` to `0xf3698` (a 44-byte extension — the cave at `0xf3680` is 24 bytes; the 20 bytes of preceding zero-padding `0xf366c..0xf3680` are absorbed harmlessly). No section headers are modified; the kernel ELF loader maps segments by program headers exclusively.
 
@@ -681,7 +687,7 @@ Tail with `adb logcat -s Y1Patch:*` to observe the metadata pipeline live; pipe 
 | `T9emit pstat=%u` | `t9_play_status_changed` before `reg_notievent_playback_rsp` | `play_status` byte (0=STOPPED, 1=PLAYING, 2=PAUSED) about to be sent in PLAYBACK_STATUS_CHANGED CHANGED. |
 | `T4a=%08x` | `t4_req_loop` before each `get_element_attributes_rsp` PLT call | packed `(attr_id<<16) | strlen` per attribute in the request-driven GEA response loop. `tools/avrcp-wire-trace.py` parses these to reconstruct the total wire-frame size and predicts whether mtkbt's `fcn.0xed50` will fragment the response (wire size > 502 B). |
 | `M5wire c39=%02x` | `patch_mtkbt.py` D1 cave at `0xf36a0`, hooked from `fcn.0xae418:0xae448` | byte at `chan+0x39` immediately before mtkbt's AVCTP wire-frame builder encodes it as the outbound TL nibble. Fires once per outbound AVCTP frame (every RegNotif response). |
-| `M5dbg p8=%02x` / `M5dbg pd=%02x` / `M5dbg ba9=%02x` | `patch_mtkbt.py` D2 cave at `0xf3700`, hooked from M5+M7 cave tail at `0xf3694` | three values captured at M5+M7 cave exit: `packet[+8]` (M5's outbound-discriminator byte — 1 = outbound IPC, anything else = M5 fires the inbound-strb), `packet[+0xd]` (the original strb source — inbound TID for inbound-path packets, allocator-zeroed 0 otherwise), and `chan+0xba9` (M7's source — set by `fcn.0x11374:0x11436` on `msg=520 cmd_frame_ind_rsp`). Pair with `M5wire c39` to ground-truth which value is 0 on a CT that retry-storms — `c39=0` plus `ba9=0` means the inbound stash was never latched; `c39=0` plus `ba9=NN` (non-zero) means M7's write didn't reach the wire-builder read. |
+| `M5dbg p8=%02x` / `M5dbg pd=%02x` / `M5dbg ba9=%02x` | `patch_mtkbt.py` D2 cave at `0xf3700`, hooked from M5 cave tail at `0xf3694` | three values captured at M5 cave exit (forward-verification of the discriminator + comparison to the deprecated M7 source): `packet[+8]` (the previously-attempted M7 discriminator — empirically `0xb8` outbound, `0xea` inbound, never `1`), `packet[+0xd]` (the current discriminator — `0` outbound, inbound TID otherwise), and `chan+0xba9` (formerly M7's source — `fcn.0x11374:0x11436` writes the latest inbound CMD's TID here; preserved as a log to detect any regression where the per-event TID isn't being correctly restored at the JNI side). Pair with `M5wire c39` to verify the wire emits the saved per-event TID (not `chan+0xba9`) for delayed CHANGEDs. |
 
 Tail with `adb logcat -s Y1T:*` and pipe through `tools/avrcp-wire-trace.py` for the GEA wire-size analysis. Pair with `tools/btlog-parse.py --avrcp` on the simultaneously-captured `btlog.bin` for mtkbt internal log surfaces (`avctpCB`, `[AVCTP]`, `avrcp:` lines).
 
