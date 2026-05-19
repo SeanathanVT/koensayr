@@ -5158,87 +5158,33 @@ Post-flash capture from Bolt expected to show `T5emit aid=…` → `T4a=00010xxx
 
 
 
-## Trace #63 (2026-05-19) — Pixel-4-as-TG vs Y1-as-TG on the same head unit: NowPlayingContentChanged is the real refresh trigger; Step 2 reverted
+## Trace #64 (2026-05-19) — c85ed7b reverted: Step 2 revert OK in release, but added debug-log site pushed debug blob past LOAD #1 budget → Sonos SIGSEGV loop
 
-### User-provided reference capture
+### What happened
 
-User flashed a Pixel 4 (BP4A.251205.006) btsnoop capture (`/work/logs/pixel4-bugreport-20260518-1959/FS/data/misc/bluetooth/logs/btsnoop_hci.log`) of Pixel acting as the AVRCP TG against the same head unit Y1 has been lagging on. User-reported result: <1 s metadata pane lag on every track skip / play-pause / repeat toggle. The capture covers full pairing → SDP → AVCTP setup → RegisterNotification burst → multiple track-edge bursts → PASSTHROUGH PLAY → metadata flow.
+Commit `c85ed7b` reverted Step 2 (good — INTERIM-acks ev=0x09..0x0c, arms `state[20]` for the NowPlayingContent CHANGED emit). The substantive change is correct and aligns Y1 with Pixel-as-TG behaviour.
 
-User feedback ("Don't worry about 'strict', worry about fixing it") shifted the scope: match Pixel's wire behaviour wherever it diverges from §6.7.1 strict reading. The reference is what works on the wire, not the spec text.
+The same commit also added a `T5ncc ev=09` debug log at the new T5 NowPlayingContent emit site (inline `_emit_native_log_u32` + a `log_fmt_t5ncc` asciiz format string in the trampoline data section). These additions, combined with the `_emit_subscription_write(a, 1, 20, ...)` inline expansion (~50 bytes), grew the debug-build trampoline blob from 4008 bytes (commit `91c7b36`) to **4104 bytes**.
 
-### CT subscription delta — Y1 vs Pixel as TG
+The LOAD #1 padding budget on this binary is hard-capped at `0xbc08 - 0xac54 = 4020 bytes` — LOAD #2's file offset starts at 0xbc08. Writing past that overwrites LOAD #2's first bytes, which are part of `.data`/`.got`. The dynamic linker maps those bytes into the GOT; corrupting them causes the next PLT call (or GOT-relative access) to SIGSEGV.
 
-Bolt's `Notify - RegisterNotification` event_ids in two captures of the same CT:
+`dual-sonos-20260518-2024` showed `com.mediatek.bluetooth` SIGSEGV-looping every ~350 ms: `BluetoothAvrcpService Constructor enable → +JNI_OnLoad → -JNI_OnLoad: 65540 → +classInitNative → (crash)`. dmesg confirms `sig 11 to [iatek.bluetooth]` per restart. The release build was safe (3800 bytes, 220 bytes headroom) but the user habitually flashes with `KOENSAYR_DEBUG=1`.
 
-| CT subscribes to | against Pixel 4 (working TG) | against Y1 (laggy TG) |
-|---|---|---|
-| ev=0x01 PlaybackStatus | 7× | 12× |
-| ev=0x02 TrackChanged | 11× | 13× |
-| ev=0x05 PlaybackPosition | 46× | 1× |
-| ev=0x08 PApp | 1× | 0× |
-| ev=0x09 NowPlayingContent | **11×** | **0×** |
-| ev=0x0a AvailablePlayers | 1× | 0× |
-| ev=0x0b AddressedPlayer | 1× | 0× |
-| ev=0x0c UIDs | 1× | 0× |
+### Why the patcher didn't catch it
 
-Bolt subscribes to **NowPlayingContent 11 times against Pixel** and **zero times against Y1**. Root cause: Step 2 (commit `a5f9d3c`) had T8 emit AV/C ctype `0x08` NOT_IMPLEMENTED for ev=0x09; per AV/C §6.7.1 Bolt blacklisted the event after the first NOT_IMPLEMENTED and never re-subscribed.
+`patch_libextavrcp_jni.py`'s pre-patch site verification (`verify("before")`) is *bypassed on the happy path* — it only runs when `--skip-md5` is set or `EXPECTED_OUTPUT_MD5` is None. With OUTPUT_DEBUG_MD5 pinned to the corrupted build's MD5 (`8e314521…`), the patcher produces the corrupted output → MD5 matches the pin → patcher reports success.
 
-### Pixel's track-edge burst pattern (frames 729-734, 78.491-78.519 s)
+### Fix
 
-```
-78.491  Pixel → Bolt   CHANGED RegisterNotification - NowPlayingContentChanged
-78.491  Pixel → Bolt   CHANGED RegisterNotification - PlaybackStatusChanged - Paused
-78.497  Pixel → Bolt   CHANGED RegisterNotification - TrackChanged - 0x0000000000000001
-78.519  Bolt  → Pixel  Status - GetElementAttributes
-78.521  Pixel → Bolt   Stable - GetElementAttributes - Title: "ANTHEM PART 3"
-```
+1. Revert `c85ed7b` (commit `[revert hash]`). Restores 91c7b36 state — §6.7.2 fix in place, Step 2 still active for now.
+2. Add a hard `AssertionError` in `patch_libextavrcp_jni.py::build_patches()` that fires when `len(blob) > LOAD2_FILE_OFFSET - LOAD1_OLD_SIZE = 4020 bytes`. Future debug-log additions that overflow the budget will now fail loudly at patcher-run time, before any binary is written.
 
-22 ms from CHANGED burst to Bolt's GEA. Three CHANGED notifications fire as a burst on every track edge:
-1. NowPlayingContentChanged (empty payload)
-2. PlaybackStatusChanged (current play status)
-3. TrackChanged (Identifier — `0x00*8` on first edge, monotonically incrementing `0x00*7,N` thereafter)
+### Path forward
 
-The earlier burst at frames 713-714 (78.013-78.014 s) emits only NowPlayingContent + TrackChanged with Identifier `0x00*8` (no track loaded yet); Bolt re-queries GEA 22 ms later (frame 717) and gets "Not Provided". Both bursts trigger immediate GEA refresh on Bolt — confirming Bolt treats NowPlayingContent CHANGED as the refresh interrupt.
+The Step 2 revert + `state[20]` arm + `T5 NowPlayingContent CHANGED` emit are still the right substantive fix for Bolt's lag (see Trace #63 cross-CT comparison). The smaller re-land needs to fit within the 4020-byte budget at debug. Current debug blob is at 4008 bytes — only 12 bytes of headroom. Any new debug log site (~30-38 bytes) must be paired with shrinking elsewhere:
 
-### Y1's missing pieces
+- Drop one of the older logs that's no longer load-bearing (e.g. `T9tid c17` — M5 TID-echo has been verified end-to-end, the log was diagnostic-only for that landing).
+- Or consolidate format strings: replace per-site asciiz with a unified `"Y1T %s ev=%02x"` and pass per-site short tag strings.
+- Or shift the LOAD #1 padding boundary by re-laying out the ELF (high-risk, deferred).
 
-Y1 currently emits on track edge: only TrackChanged CHANGED (via T5). What it's missing vs Pixel:
-
-1. **NowPlayingContent CHANGED**: T5 has the emit branch coded (line 879-886) but gated on `state[20]` (sub_now_playing_content), which Step 2 prevented from arming.
-2. **PlaybackStatus CHANGED on every track edge**: T9 emits this only on actual `play_status` byte edge (gated on `last_play_status` change). Pixel emits it on every track edge regardless of state continuity. (Deferred — Step 2 revert alone addresses the worst gap; revisit if Bolt still lags.)
-3. **TrackChanged Identifier increment**: Pixel does `0x00*8` → `0x00*7,01` → `0x00*7,02`. Y1 emits `0x00*8` always (per §6.7.2 strict). Bolt re-queries GEA on both Pixel emit shapes — so the increment isn't load-bearing for Bolt. Deferred.
-
-### Patch
-
-`_trampolines.py` `_emit_t8`:
-
-- Reverted Step 2 (commit `a5f9d3c`). All four arms `t8_check_9` / `t8_check_a` / `t8_check_b` / `t8_check_c` now call their `reg_notievent_*_rsp` PLT helpers with `r2 = REASON_INTERIM (0x0F)` instead of `REASON_NOT_IMPLEMENTED (0x08)`.
-- Re-added `_emit_subscription_write(a, 1, 20, T8_OFF_TIMESPEC_SEC, "t8_done")` after the 0x09 arm to arm `state[20]` for T5's NowPlayingContent CHANGED emit on every subsequent track edge.
-
-M1 + M6 (mtkbt-side) unchanged — they remain byte-identical pass-through for production traffic (`r2 ∈ {0x0F, 0x0D}`). Removing them would be a separate revert, deferred (their post-Step-2 role is dormant but harmless).
-
-`_trampolines.py` debug log additions:
-
-- `T5ncc ev=09` log at T5's `t5_changed` block, immediately before `reg_notievent_now_playing_content_rsp` PLT call. Fires once per track edge per subscribed CT. Absence after `T5emit` means the CT never subscribed to ev=0x09.
-- `log_fmt_t5ncc` format string in data section.
-
-### Patcher state
-
-- `patch_libextavrcp_jni.py`: OUTPUT_MD5 `5d1e0fcf` → `da7225fd2ba79f99461b4fba641fcad1`. OUTPUT_DEBUG_MD5 `8c427734` → `8e314521ac887610242283c36f3bdf48`.
-- `patch_mtkbt.py`: unchanged (M1 + M6 retained, dormant but harmless).
-
-### Verification plan
-
-Post-flash KOENSAYR_DEBUG=1 build on Bolt:
-
-```bash
-grep -E 'Y1T.*(T8reg ev=09|T5ncc|T5emit|T4a=0001)' logcat.txt
-```
-
-Expected timeline on a track edge:
-1. `T8reg ev=09` — Bolt re-subscribes to NowPlayingContent after previous CHANGED.
-2. (track changes) `T5ncc ev=09` — Y1 emits NowPlayingContent CHANGED.
-3. `T5emit aid=…` — Y1 emits TrackChanged CHANGED.
-4. `T4a=00010xxx` (≤ 1 s later) — Bolt's interrupt-driven GEA refresh.
-
-If `T5ncc` fires but Bolt doesn't query within 1 s, then the issue extends beyond NowPlaying (next candidate: emit synthetic PlaybackStatus CHANGED on track edge to match Pixel's three-frame burst).
+The Step 2 revert is re-landable without any *new* debug log if we accept that the chain verification has to happen via existing `T8reg ev=09` logs alone.

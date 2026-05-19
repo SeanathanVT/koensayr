@@ -41,12 +41,12 @@ NATIVE_TRACK_CHANGED_VADDR = 0x3bc0
 NATIVE_PLAY_STATUS_CHANGED_VADDR = 0x3c88
 
 STOCK_MD5         = "fd2ce74db9389980b55bccf3d8f15660"
-OUTPUT_MD5        = "da7225fd2ba79f99461b4fba641fcad1"
+OUTPUT_MD5        = "5d1e0fcf1b4049fcc4c96dc0e8077acf"
 
 # --debug: splices __android_log_print calls into T5/T6/T8/T9 emit sites
 # (tag "Y1T"). Release builds remain byte-identical without the env var.
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "8e314521ac887610242283c36f3bdf48"
+OUTPUT_DEBUG_MD5  = "8c427734bcb7887bc4a38fbd006726cd"
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
 # ---------------------------------------------------------------- T1
@@ -119,6 +119,18 @@ LOAD1_FILESZ_OFFSET = LOAD1_PHDR_OFFSET + 16
 LOAD1_MEMSZ_OFFSET  = LOAD1_PHDR_OFFSET + 20
 LOAD1_OLD_SIZE = 0xac54
 
+# Hard ceiling for the trampoline blob. The stock ELF lays LOAD #2's
+# file offset at 0xbc08 (its first byte is `.data` / `.got` and the
+# dynamic linker reads it via mmap). Anything past 0xbc08 in the file
+# silently clobbers LOAD #2's first bytes — GOT corruption produces a
+# SIGSEGV during/after the next PLT call (typically classInitNative).
+# The patcher's MD5 pin catches stable changes but a fresh debug build
+# with new log sites would *match its own pinned MD5* even while
+# silently corrupting LOAD #2; the assertion below makes that case
+# fail loudly.
+LOAD2_FILE_OFFSET = 0xbc08
+TRAMPOLINE_BUDGET = LOAD2_FILE_OFFSET - LOAD1_OLD_SIZE   # 0xbc08 - 0xac54 = 4020
+
 # ---------------------------------------------------------------- patch list builder
 
 
@@ -164,6 +176,16 @@ def build_patches() -> tuple[list[dict], int]:
     t5_vaddr = addrs["T5"]
     t9_vaddr = addrs["T9"]
     new_load1_size = T4_VADDR + len(blob)
+
+    if len(blob) > TRAMPOLINE_BUDGET:
+        raise AssertionError(
+            f"trampoline blob ({len(blob)} bytes) exceeds the LOAD #1 padding "
+            f"budget ({TRAMPOLINE_BUDGET} bytes). Anything past file offset "
+            f"0x{LOAD2_FILE_OFFSET:x} overwrites LOAD #2's .data/.got and the "
+            f"binary will SIGSEGV during classInitNative on load. Shrink the "
+            f"trampoline (drop debug log sites or consolidate format strings) "
+            f"before re-running. debug={DEBUG_LOGGING}"
+        )
 
     patches = [
         {
