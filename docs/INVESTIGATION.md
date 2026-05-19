@@ -5299,3 +5299,50 @@ Sonos / TV / Kia byte-identical wire behaviour (their TIDs were already 0, so M7
 ### Why Trace #59 missed this
 
 `T9tid c17` was the only TID-source log site; it surfaced `conn[+17]` (which IS the inbound TID, correctly latched JNI-side) but the matching `M5wire c39` always read 0 on Sonos because Sonos's inbound TID was 0. The "match" was structural coincidence. Memory `architecture_y1_m5_regnotif_gap.md` documents the verification path forward — cycling-TID CTs (Bolt, Kia under different conditions, future captures) are required for any future TID-related claim.
+
+## Trace #67 (2026-05-19) — M7 sync visible but ineffective; D2 multi-value log added to disambiguate
+
+### What we know after fe974f2 + 252cd8a
+
+The M5+M7 cave at `0xf3680` is correctly assembled (verified byte-for-byte in the patched binary) and the wire-builder reads from `chan+0x39` (per the `M5wire c39=%02x` log site, which always fires once per outbound AVCTP frame at `fcn.0xae418:0xae448`). Yet the post-M7 Bolt session (the brief 0724 capture that actually showed metadata for 3 songs before wedging) still indicates `c39=0` on the RegNotif response paths — same as the pre-M7 captures.
+
+This means *either* M7's source slot `chan+0xba9` is 0 at the moment the cave runs, *or* M7's write to `chan+0x39` is being overwritten between cave exit and wire-builder read.
+
+### Static analysis from this session
+
+- `fcn.0x518ac` is mtkbt's per-msg-id dispatcher (called by `fcn.0x67768`). Case `msg=0x208` (= 520, `cmd_frame_ind_rsp`) is the *only* case that calls `fcn.0x11374` → `chan+0xba9 = arg1 = msg[5]`. Other msg IDs (e.g. `msg=0x220` = 544 RegNotif response, `msg=0x21c` = 540 GEA response) go to different handlers that don't latch `chan+0xba9`.
+- `fcn.0xae418` (wire builder) has *two* TID source paths: `chan+0x39` (`[r4, 0x15]`) and `chan+0x38` (`[r4, 0x14]`). The conditional at `0xae43e` (`cbnz r3, 0xae448`) and `0xae442` (`cbz r0, 0xae448`) selects between them based on `[packet, 8]` and `[packet, 0xe]`. Most frames take the `chan+0x39` path (which `M5wire` logs); the `chan+0x38` path is the alternate. Our empirical data confirms `chan+0x39` is the path taken for the RegNotif response frames that Bolt rejects.
+- `fcn.0x6d1a8` is a structural twin of Path B `fcn.0x6d0f0`, with its own strb sites writing `chan+0x28` or `chan+0x29` from `packet[0]` based on `packet[1]`. Only one caller (`fcn.0xf290:0xf348`); probably not on the msg=544 path but a candidate for future investigation if D2 indicates Path B isn't even running.
+
+### Hypothesis the D2 cave is designed to test
+
+The most likely cause is that `msg=520 cmd_frame_ind_rsp` is *not* being emitted by JNI on every inbound CMD — our R1 redirect at `0x6538` diverts inbound dispatch into the T1/T2-stub trampolines, which might short-circuit the normal cmd_frame_ind_rsp path. If so, `chan+0xba9` stays at its initial value (0) for all inbound CMDs, and M7's unconditional copy preserves the 0.
+
+### D2 cave (this trace)
+
+`patch_mtkbt.py` debug build now adds a second cave at `0xf3700` (107 bytes), hooked from the M5+M7 cave's tail b.w at `0xf3694`. D2 fires after M5+M7's stores, with r4 and r5 still holding their cave-entry values (chan+0x10 and packet pointer respectively per AAPCS callee-save). It emits three logs per outbound AVCTP frame:
+
+- **`M5dbg p8=%02x`** — `packet[+8]` (M5's outbound-discriminator byte). Allocator path writes 1 here for outbound IPC; M5's `cmp r2, 1` skips the inbound-strb when this is 1.
+- **`M5dbg pd=%02x`** — `packet[+0xd]` (M5's strb source). Inbound CMD path: this is the inbound TID per Path B's stash-struct semantics. Outbound: allocator-zeroed unless a handler wrote it.
+- **`M5dbg ba9=%02x`** — `chan+0xba9` (M7's source). Set by `fcn.0x11374:0x11436` on `msg=520 cmd_frame_ind_rsp`; M7 syncs `chan+0x39` from here unconditionally.
+
+`M5wire c39=%02x` (from D1, unchanged) continues to log the final wire-side TID.
+
+### Diagnostic table for the next Bolt capture
+
+| `M5wire c39` | `M5dbg p8` | `M5dbg pd` | `M5dbg ba9` | Interpretation |
+|---|---|---|---|---|
+| `00` | `01` | `00` | `00` | M5 thinks outbound (skips strb), M7 source is 0 → either `msg=520` never fired or `fcn.0x11374` isn't reaching the stash slot we expect |
+| `00` | `00` (or non-1) | `00` | `00` | M5 thinks inbound, strb writes 0, M7 source also 0 → same conclusion, plus packet[+0xd] isn't carrying the TID |
+| `00` | `01` | `00` | `NN` (non-0) | M7 source has TID but `chan+0x39` is 0 → M7's write didn't land OR something between M7 and wire-builder clobbered it |
+| `NN` | `01` | `00` | `NN` | Working — M7 sync took effect (this is what we want) |
+| `NN` | `01` | `NN` | `*` | Working without M7 — packet[+0xd] already had TID via some path we haven't seen |
+
+### Patcher state
+
+- `patch_mtkbt.py`: OUTPUT_MD5 `9c4e4622…` (unchanged from fe974f2; release-side bytes are identical). OUTPUT_DEBUG_MD5 `03da20024a8bc750f0c60ab4f828de2f` → `68faa7cfbb5c833d4f55c44ccfa98813`. Adds `LOAD2_FILE_OFFSET` + `LOAD1_BUDGET` constants and a hard `AssertionError` when LOAD #1 end would exceed the LOAD #2 file offset (same safety net `patch_libextavrcp_jni.py` already has). mtkbt headroom: 1748 B budget; current usage 256 B with D1+D2.
+- `patch_libextavrcp_jni.py`: unchanged.
+
+### Verification plan
+
+KOENSAYR_DEBUG=1 build, flash, capture a fresh Bolt session covering connection + several track skips. Grep `Y1T:*` for `M5dbg p8=`, `M5dbg pd=`, `M5dbg ba9=`, `M5wire c39=` and map against the table above. The pattern that fires per-frame tells us exactly where the M7 hypothesis breaks.

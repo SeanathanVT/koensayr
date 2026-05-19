@@ -38,7 +38,7 @@ STOCK_MD5         = "3af1d4ad8f955038186696950430ffda"
 OUTPUT_MD5        = "9c4e462241169c3a181574db157c8df7"
 
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "03da20024a8bc750f0c60ab4f828de2f"
+OUTPUT_DEBUG_MD5  = "68faa7cfbb5c833d4f55c44ccfa98813"
 
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
@@ -51,11 +51,21 @@ PLT_android_log_print = 0xaef8
 
 # LOAD #1 sizing. Stock filesz = 0xf366c (16 bytes before M5's cave end). M5
 # extends to 0xf3698 (M5 cave is 24 bytes after the M7 unconditional-sync
-# extension). The DEBUG cave adds a TID-source wire-frame log past that and
-# the segment must be extended further to cover it.
+# extension). The DEBUG caves add wire-frame log instrumentation past that
+# and the segment must be extended further to cover them.
 LOAD1_STOCK_END      = 0xf366c
 LOAD1_RELEASE_END    = 0xf3698
-DEBUG_CAVE_VADDR     = 0xf36a0
+DEBUG_CAVE_VADDR     = 0xf36a0    # D1: chan+0x39 read-time log (M5wire c39=NN)
+DEBUG_CAVE2_VADDR    = 0xf3700    # D2: M5+M7 exit-time multi-value log
+
+# Hard ceiling for any LOAD #1 padding writes. The stock ELF lays LOAD #2's
+# file offset at 0xf3d40; anything past that overwrites .data / .got and
+# the binary will SIGSEGV at the next PLT call. Caves + the patcher's
+# MD5 pin combined silently mask overflow if a new debug cave grows the
+# blob without updating the pinned hash properly — same trap that bit
+# patch_libextavrcp_jni.py at commit c85ed7b. Assert eagerly.
+LOAD2_FILE_OFFSET    = 0xf3d40
+LOAD1_BUDGET         = LOAD2_FILE_OFFSET - LOAD1_STOCK_END   # 0x6d4 = 1748 B
 
 # 12-byte descriptor table entry: attrID:LE16, len:LE16, ptr:LE32, zeros:LE32
 def entry(attr_id: int, length: int, ptr: int) -> bytes:
@@ -521,6 +531,81 @@ def build_debug_cave_blob(cave_vaddr: int) -> bytes:
     return a.resolve()
 
 
+def build_debug_cave2_blob(cave_vaddr: int) -> bytes:
+    """Assemble the D2 M5+M7 exit-time multi-value log cave.
+
+    Hooked from the b.w 0x6d18c at the end of the M5+M7 cave at 0xf3694.
+    Replaces that b.w with `b.w cave_vaddr`. The cave logs three values
+    that disambiguate why a given wire frame ends up with `c39=NN`:
+
+      - `packet[+8]`  — M5's outbound-discriminator byte. M5's cave at
+                       0xf3680 takes the skip-strb path when this is 1.
+                       For msg=544 RegNotif responses, empirical c39=0
+                       suggests this byte is not 1 (allocator doesn't
+                       mark the packet as outbound for that msg path).
+      - `packet[+0xd]` — the original strb source. Inbound CMD path:
+                       this is the inbound TID (per Path B's stash
+                       struct semantics). Outbound: this should be 0
+                       (allocator-zeroed) unless someone wrote it.
+      - `chan+0xba9` — M7's source. Set by `fcn.0x11374:0x11436` on
+                       msg=520 cmd_frame_ind_rsp; M7 syncs `chan+0x39`
+                       from here unconditionally. If `c39=0` despite
+                       M7 running, this slot was 0 at sync time.
+
+    Three separate log calls (one per value, simpler than packing into
+    a 3-arg printf — __android_log_print's variadic argument layout
+    requires stack pushes for args beyond r3). r5 (packet ptr) and r4
+    (chan+0x10) are callee-saved per AAPCS and preserved across each
+    `blx` to __android_log_print.
+
+    Stack discipline: push {r0-r4, lr} = 6 words = 24 B → keeps sp
+    8-aligned at each blx call (AAPCS requirement). r4 is included in
+    the push only for alignment — its value is the original chan+0x10
+    that the rest of fcn.0x6d0f0 expects (b.w 0x6d18c → add.w r0, r4,
+    0x14 → fcn.0xae5e4).
+    """
+    a = Asm(cave_vaddr)
+    a.raw(bytes([0x1f, 0xb5]))                     # push {r0-r4, lr}
+
+    # ---- log 1: packet[+8] (M5 discriminator) ----
+    a.raw(bytes([0x2b, 0x7a]))                     # ldrb r3, [r5, 8]
+    a.movs_imm8(0, 4)                               # r0 = ANDROID_LOG_INFO
+    a.adr_w(1, "log_tag")
+    a.adr_w(2, "log_fmt_p8")
+    a.blx_imm(PLT_android_log_print)
+
+    # ---- log 2: packet[+0xd] (M5's strb source) ----
+    a.raw(bytes([0x6b, 0x7b]))                     # ldrb r3, [r5, 0xd]
+    a.movs_imm8(0, 4)
+    a.adr_w(1, "log_tag")
+    a.adr_w(2, "log_fmt_pd")
+    a.blx_imm(PLT_android_log_print)
+
+    # ---- log 3: chan+0xba9 (M7's source — should hold inbound TID) ----
+    # Path B's r4 = chan+0x10, so chan+0xba9 is at [r4, 0xb99]. Thumb-2
+    # ldrb.w T2 form supports 12-bit unsigned imm (0..0xfff) — 0xb99 fits.
+    a.ldrb_w(3, 4, 0xb99)                           # r3 = chan+0xba9
+    a.movs_imm8(0, 4)
+    a.adr_w(1, "log_tag")
+    a.adr_w(2, "log_fmt_ba9")
+    a.blx_imm(PLT_android_log_print)
+
+    a.raw(bytes([0xbd, 0xe8, 0x1f, 0x40]))         # pop.w {r0-r4, lr}
+    a.labels["ret"] = 0x6d18c                       # original M5+M7 return target
+    a.b_w("ret")
+
+    a.align(2)
+    a.label("log_tag")
+    a.asciiz("Y1T")
+    a.label("log_fmt_p8")
+    a.asciiz("M5dbg p8=%02x")
+    a.label("log_fmt_pd")
+    a.asciiz("M5dbg pd=%02x")
+    a.label("log_fmt_ba9")
+    a.asciiz("M5dbg ba9=%02x")
+    return a.resolve()
+
+
 def build_patches(debug: bool) -> list[dict]:
     patches = list(BASE_PATCHES)
     load1_end = LOAD1_RELEASE_END
@@ -549,6 +634,57 @@ def build_patches(debug: bool) -> list[dict]:
                 "after":  blob,
             },
         ])
+
+        # D2: M5+M7 exit-time log. Re-emit the M5+M7 cave with its tail
+        # b.w pointed at the D2 cave instead of directly at 0x6d18c. D2
+        # logs packet[+8] / packet[+0xd] / chan+0xba9, then b.w's back to
+        # 0x6d18c. Rewriting the M5-CAVE site (rather than overlapping it
+        # with a separate hook patch) keeps post-patch verification clean.
+        blob2 = build_debug_cave2_blob(DEBUG_CAVE2_VADDR)
+        debug2_end = DEBUG_CAVE2_VADDR + len(blob2)
+        load1_end = max(load1_end, (debug2_end + 3) & ~3)
+
+        m5_cave_tail = Asm(0xf3694)
+        m5_cave_tail.labels["cave2"] = DEBUG_CAVE2_VADDR
+        m5_cave_tail.b_w("cave2")
+        m5_cave_with_d2_redirect = bytes([
+            0x68, 0x7b,                    # ldrb r0, [r5, 0xd]
+            0x2a, 0x7a,                    # ldrb r2, [r5, 8]
+            0x01, 0x2a,                    # cmp r2, 1
+            0x01, 0xd0,                    # beq +2
+            0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]
+            0x94, 0xf8, 0x99, 0x0b,        # ldrb.w r0, [r4, 0xb99]
+            0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]
+        ]) + m5_cave_tail.resolve()        # b.w D2_cave (replaces b.w 0x6d18c)
+
+        # Replace the BASE_PATCHES M5-CAVE entry's `after` in-place so the
+        # cave bytes match what we'll actually write. We've already added
+        # it via `list(BASE_PATCHES)` at function entry; find and update.
+        for p in patches:
+            if p["offset"] == 0xf3680 and len(p["after"]) == 24:
+                p["after"] = m5_cave_with_d2_redirect
+                p["name"] = p["name"].replace(
+                    "M7 unconditional chan+0xba9 → chan+0x39 sync",
+                    "M7 sync + D2 exit-log redirect"
+                )
+                break
+
+        patches.append({
+            "name":   f"[D2-CAVE] M5+M7 multi-value log blob @ 0x{DEBUG_CAVE2_VADDR:x} ({len(blob2)} B in LOAD #1 padding)",
+            "offset": DEBUG_CAVE2_VADDR,
+            "before": bytes([0x00] * len(blob2)),
+            "after":  blob2,
+        })
+
+    if load1_end > LOAD2_FILE_OFFSET:
+        raise AssertionError(
+            f"LOAD #1 end (0x{load1_end:x}) exceeds LOAD #2 file offset "
+            f"(0x{LOAD2_FILE_OFFSET:x}) — would clobber mtkbt's .data / .got "
+            f"and SIGSEGV at the next PLT call. Budget = {LOAD1_BUDGET} B; "
+            f"current usage = {load1_end - LOAD1_STOCK_END} B. Shrink the "
+            f"debug caves (drop or consolidate log sites) before re-running. "
+            f"debug={debug}"
+        )
 
     patches.extend([
         {
