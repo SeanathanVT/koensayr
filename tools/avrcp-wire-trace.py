@@ -15,10 +15,15 @@ lines surface in `adb logcat -s Y1T:*`:
     Y1T : T4a=00050002        attr_id=0x05 (TotalNum), strlen=2
     Y1T : T4a=00060000        attr_id=0x06 (Genre), strlen=0
     Y1T : T4a=00070006        attr_id=0x07 (PlayTime), strlen=6
-    Y1T : T8reg ev=01         RegisterNotification(PlayStatus)
-    Y1T : T5emit aid=00000001 TrackChanged Identifier high32=1
-    Y1T : T9emit pstat=1      PlaybackStatusChanged CHANGED PlayStatus=1
-    Y1T : T9emit pos=10077    PlaybackPosChanged CHANGED pos_ms=10077
+    Y1T : T8reg ev=01         RegisterNotification(PlayStatus, event_id 0x01)
+    Y1T : T5emit aid=63b667e1 TrackChanged CHANGED on track edge (Identifier on wire = 0x00*8 per §6.7.2; aid is the internal audio_id for grep correlation with the music app's Y1Patch fL.id lines)
+    Y1T : T5ncc               NowPlayingContent CHANGED on track edge (no-arg format; fires once per edge per CT subscribed to ev=0x09)
+    Y1T : T9emit pstat=1      PlaybackStatusChanged CHANGED, PlayStatus=1
+    Y1T : T9emit pos=10077    PlaybackPosChanged CHANGED, pos_ms=10077
+    Y1T : M5wire c39=02       mtkbt-side: chan+0x39 byte at wire emit (AVCTP TID nibble source)
+    Y1T : M5dbg p8=01         mtkbt-side: M5 outbound-discriminator byte at cave exit
+    Y1T : M5dbg pd=02         mtkbt-side: packet[+0xd] (M5's strb source — inbound TID on inbound path, 0 on outbound)
+    Y1T : M5dbg ba9=02        mtkbt-side: chan+0xba9 (M7's source — inbound-RX TID stash)
 
 This script:
   - Groups consecutive T4a=... lines into a single GEA response.
@@ -26,7 +31,10 @@ This script:
   - Flags responses that exceed the 502-byte L2CAP MTU threshold
     (where mtkbt's fcn.0xed50 sets AVCTP packet_type=1 START and
     triggers fragmentation).
-  - Surfaces T8reg / T5emit / T9emit lines verbatim for cross-correlation.
+  - Surfaces all other Y1T lines (T8reg / T5emit / T5ncc / T9emit /
+    M5wire / M5dbg) verbatim for cross-correlation. Use `grep` against
+    M5wire / M5dbg directly for the TID-echo diagnostic table (see
+    INVESTIGATION.md Trace #67).
 
 Usage:
     adb logcat -s Y1T:* > bolt.log
