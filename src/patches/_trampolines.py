@@ -883,6 +883,11 @@ def _emit_t5(a: Asm) -> None:
     a.add_imm_t3(0, 4, 8)                     # r0 = conn
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
+    if DEBUG_NATIVE_LOG:
+        # Logged unconditionally inside the gate — fires once per track
+        # edge for every CT subscribed to ev=0x09.
+        a.movs_imm8(6, 0x09)
+        _emit_native_log_u32(a, "log_fmt_t5ncc", 6)
     a.blx_imm(PLT_reg_notievent_now_playing_content_rsp)
 
     a.label("t5_skip_now_playing")
@@ -2063,38 +2068,39 @@ def _emit_t8(a: Asm) -> None:
     _emit_subscription_write(a, 1, 15, T8_OFF_TIMESPEC_SEC, "t8_done")
     a.b_w("t8_done")
 
-    # Events 0x09..0x0c — AVRCP 1.4+ event IDs outside the §5.4.2 Tbl 5.28
-    # set. Each arm calls the matching `reg_notievent_*_rsp` helper with
-    # `r2 = REASON_NOT_IMPLEMENTED (0x08)` instead of REASON_INTERIM. The
-    # helper writes ipc[8] = 0x08; mtkbt's M1 + M6 dispatch at fcn.0x121d8
-    # routes that ctype through the CHANGED branch (which post-M6 is a
-    # pass-through), and the wire AV/C frame goes out with ctype 0x08
-    # NOT_IMPLEMENTED. Per AV/C §6.7.1 the CT is then required to drop
-    # those event_ids from its retry set, so subscription-state side
-    # effects (state[20] arm for ev=09) are intentionally NOT performed —
-    # the CT won't re-register, the CHANGED branches gated on state[20]
-    # (T5:0x09 / T9:0x09) never need to fire.
+    # Events 0x09..0x0c — AVRCP 1.4+ event IDs, advertised in T1 because
+    # the working Pixel-4-as-TG reference also advertises + INTERIM-acks
+    # them on a 1.3-profile SDP record. ACK with INTERIM (empty / zero
+    # payload depending on event). The 0x09 NowPlayingContentChanged
+    # subscription is load-bearing: it's the primary metadata-refresh
+    # trigger for at least one CT in our test matrix (which polls only
+    # on its own ~21 s safety timer if NowPlaying CHANGED isn't flowing,
+    # vs <22 ms refresh latency when it is). T5's NowPlaying CHANGED arm
+    # at `t5_changed` fires on every track edge, gated on state[20]
+    # armed below.
     #
-    # Wire-route considerations: msg=544 still selected (helper's
-    # AVRCP_SendMessage), Path B (`packetFrame[9] = 0` because ctype > 6
-    # = response direction). Same Path B as INTERIM/CHANGED responses,
-    # which is the production-validated path post-M4. Static-verified
-    # end-to-end in `docs/INVESTIGATION.md` Trace #60.
+    # For 0x0a / 0x0b / 0x0c we ACK but emit no CHANGED — Y1 has no
+    # multi-player / UID-database semantics, so the subscriptions stay
+    # idle (matching Pixel-TG's observed behaviour: INTERIM-ack at
+    # connection time, no CHANGED in steady state).
     a.label("t8_check_9")
     a.cmp_imm8(0, 0x09)
     a.bne("t8_check_a")
-    # 0x09 NOW_PLAYING_CONTENT_CHANGED reject.
-    a.movs_imm8(2, REASON_NOT_IMPLEMENTED)
+    # 0x09 NOW_PLAYING_CONTENT_CHANGED INTERIM ACK.
+    a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
     a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_now_playing_content_rsp)
+    # Arm sub_now_playing_content (state[20]) — T5 emits CHANGED for
+    # ev=0x09 on every track edge gated on this byte.
+    _emit_subscription_write(a, 1, 20, T8_OFF_TIMESPEC_SEC, "t8_done")
     a.b_w("t8_done")
 
     a.label("t8_check_a")
     a.cmp_imm8(0, 0x0A)
     a.bne("t8_check_b")
-    # 0x0A AVAILABLE_PLAYERS_CHANGED reject.
-    a.movs_imm8(2, REASON_NOT_IMPLEMENTED)
+    # 0x0A AVAILABLE_PLAYERS_CHANGED INTERIM ACK (empty payload).
+    a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
     a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_availplayers_rsp)
@@ -2103,14 +2109,11 @@ def _emit_t8(a: Asm) -> None:
     a.label("t8_check_b")
     a.cmp_imm8(0, 0x0B)
     a.bne("t8_check_c")
-    # 0x0B ADDRESSED_PLAYER_CHANGED reject. PlayerID u16 in r3,
-    # UidCounter u16 at sp[0]. Both = 0 (Y1 has one player, no UID
-    # database — the helper still writes these fields into the IPC
-    # frame, but the wire frame is a NOT_IMPLEMENTED reject so the
-    # payload bytes are spec-irrelevant; we set them to 0 for hygiene).
+    # 0x0B ADDRESSED_PLAYER_CHANGED INTERIM ACK. PlayerID u16 in r3 = 0,
+    # UidCounter u16 at sp[0] = 0 (Y1 has one player, no UID database).
     a.movs_imm8(3, 0)
     a.str_sp_imm(3, 0)                          # sp[0] = uid_counter (0)
-    a.movs_imm8(2, REASON_NOT_IMPLEMENTED)
+    a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
     a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_addredplayer_rsp)
@@ -2119,9 +2122,9 @@ def _emit_t8(a: Asm) -> None:
     a.label("t8_check_c")
     a.cmp_imm8(0, 0x0C)
     a.bne("t8_unknown_event")
-    # 0x0C UIDS_CHANGED reject. UidCounter u16 in r3 = 0.
+    # 0x0C UIDS_CHANGED INTERIM ACK. UidCounter u16 in r3 = 0.
     a.movs_imm8(3, 0)
-    a.movs_imm8(2, REASON_NOT_IMPLEMENTED)
+    a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
     a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_uids_changed_rsp)
@@ -2679,6 +2682,14 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         a.align(4)
         a.label("log_fmt_t2reg")
         a.asciiz("T2reg ev=%02x")
+        a.align(4)
+        # T5 NowPlayingContent CHANGED emit — fires once per track edge per
+        # subscribed CT. Surfaces whether state[20] (sub_now_playing_content)
+        # was armed by a previous T8 ev=0x09 INTERIM ack. Absence of this
+        # log after a T5emit means the CT never subscribed to ev=0x09 (or
+        # we rejected the subscription).
+        a.label("log_fmt_t5ncc")
+        a.asciiz("T5ncc ev=%02x")
         a.align(4)
         # T4 per-attribute emit. Packed value: high 16 = attr_id, low 16 = strlen.
         # tools/avrcp-wire-trace.py reconstructs total wire-frame size per GEA
