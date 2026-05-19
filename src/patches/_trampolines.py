@@ -647,19 +647,18 @@ def _emit_extended_t2(a: Asm) -> None:
     a.cmp_imm8(0, 0x31)
     a.bne("ext2_check_get_attrs")             # not RegisterNotification → maybe T4
 
-    if DEBUG_NATIVE_LOG:
-        # One-shot probe to locate the inbound AVCTP TID in our trampoline's
-        # stack-frame view. T1 reads PDU at sp+382 (=0x17E, verified by
-        # GetCapabilities working), so the AVCTP header bytes should be in
-        # the 0x170..0x17d window. Bolt cycles TIDs across {1,4,5,7,9,b,d,f}
-        # — the dumped word should show one of those values in one of its
-        # bytes for every inbound RegNotif CMD. Dumps sp+0x170..0x173 as
-        # an LE u32; event_id is reloaded by the ldrb_w below so we don't
-        # need to preserve r0.
-        a.ldr_w(0, 13, 0x170)
-        _emit_native_log_u32(a, "log_fmt_t2dump", 0)
-
-    a.ldrb_w(0, 13, T2_EVENT_ID_OFF_ENTRY)    # r0 = event_id
+    # Save the inbound AVCTP TID into g_avrcp_req_event_database[event_id].
+    # Stock JNI normally does this via saveRegEventSeqId at 0x6d26 in its
+    # CMD dispatcher, but our R1 redirect hijacks the path upstream of that
+    # call. Without this save, the database stays zero and the matching
+    # restore_conn_tid in T5/T8/T9 reads 0 → wire frame ships c39=0 → CT
+    # drops on §3.3.5 TID-echo mismatch. The TID lives at sp+0x171 (pre-
+    # SUB-SP, verified empirically — see commit 2765ebd's T2d= probe).
+    # Done once here, covering every RegNotif event_id: extended_T2's
+    # TRACK_CHANGED arm + T8's 11 other arms all reach this point.
+    a.ldrb_w(0, 13, T2_EVENT_ID_OFF_ENTRY)    # r0 = event_id (preserved by save)
+    a.ldrb_w(1, 13, 0x171)                    # r1 = inbound seq_id
+    a.bl_w("save_event_seq_id")               # database[event_id] = seq_id
     a.cmp_imm8(0, 0x02)                       # TRACK_CHANGED?
     a.beq("ext2_track_changed")
 
@@ -1893,6 +1892,37 @@ def _emit_restore_conn_tid_subroutine(a: Asm) -> None:
     a._fixup(_emit_lit, 4)
 
 
+def _emit_save_event_seq_id_subroutine(a: Asm) -> None:
+    """Emit the shared save_event_seq_id subroutine.
+
+    Pre: r0 = event_id, r1 = seq_id.
+    Post: g_avrcp_req_event_database[event_id] = seq_id; r0 preserved.
+    Clobbers r2, r3, lr.
+
+    Mirrors stock JNI's saveRegEventSeqId at 0x5ee4 — same database, same
+    indexing — but called from our trampoline path since R1 hijacks the
+    dispatcher upstream of stock's call site at 0x6d26. Without this
+    save, restore_conn_tid reads 0 from the database for every event.
+
+    12 B code + alignment + 4 B literal = 16 B total.
+    """
+    a.label("save_event_seq_id")
+    a.ldr_lit_w(2, "save_event_seq_id_lit")
+    a.label("save_event_seq_id_add_pc")
+    a.add_reg(2, 15)                          # add r2, pc → r2 = absolute db vaddr
+    # strb r1, [r2, r0]: STRB (register) T1, 0101 010 Rm Rn Rt → 0x5400
+    # Rm=r0, Rn=r2, Rt=r1 → hw = 0x5400 | (0 << 6) | (2 << 3) | 1
+    hw = 0x5400 | (0 << 6) | (2 << 3) | 1
+    a.raw(bytes([hw & 0xFF, (hw >> 8) & 0xFF]))
+    a.bx(14)                                  # bx lr
+    a.align(4)
+    a.label("save_event_seq_id_lit")
+    def _emit_lit(_pc: int) -> bytes:
+        offset = G_AVRCP_REQ_EVENT_DATABASE_VADDR - (a.labels["save_event_seq_id_add_pc"] + 4)
+        return (offset & 0xFFFFFFFF).to_bytes(4, "little")
+    a._fixup(_emit_lit, 4)
+
+
 def _emit_native_log_u32(a: Asm, fmt_label: str, value_reg: int) -> None:
     """Emit __android_log_print(INFO, "Y1T", fmt, value_reg) before a wire-side
     response blx. Used by build(debug=True) to record exactly what bytes the
@@ -2739,11 +2769,15 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     _emit_t8(a)                               # PDU 0x31 RegisterNotification dispatch
     _emit_t9(a)                               # proactive PLAYBACK_STATUS_CHANGED + battery + position
 
-    # Shared subroutine for per-event TID restore at every rsp call site.
-    # Called via bl_w("restore_conn_tid") from each emit gate before its
-    # rsp builder blx. See _emit_restore_conn_tid_from_db for caller
-    # contract.
+    # Shared subroutines for per-event TID save / restore.
+    # save_event_seq_id (called from extended_T2 entry post-PDU-check):
+    #   database[event_id] = inbound seq_id from sp+0x171. Mirrors stock
+    #   JNI's saveRegEventSeqId at 0x5ee4 which we bypass via R1.
+    # restore_conn_tid (called from every *_rsp call site):
+    #   conn[+0x11] = database[event_id]. Mirrors stock JNI's pattern at
+    #   e.g. 0x3c06 in notificationTrackChangedNative.
     _emit_restore_conn_tid_subroutine(a)
+    _emit_save_event_seq_id_subroutine(a)
 
     # Path strings, 4-byte-aligned for clean ADR offsets.
     a.align(4)
@@ -2790,26 +2824,12 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     # Tag + per-emit-site format strings. Each fmt is a single %08x arg
     # so log lines look like `Y1T  : T9pos=0000a3f4` — grep-friendly,
     # zero-pad-aligned, and avoids variadic 64-bit packing rules.
-    if DEBUG_NATIVE_LOG:
-        a.align(4)
-        a.label("log_tag")
-        a.asciiz("Y1T")
-        a.align(4)
-        # log_fmt_t6pos / log_fmt_t6dur removed in tandem with the T6 dur/pos
-        # emits. log_fmt_t9pos / log_fmt_t9pstat / log_fmt_t5emit /
-        # log_fmt_t4attr / log_fmt_t8reg / log_fmt_t5ncc dropped to free
-        # trampoline budget for the offset-probe logs below.
-        #
-        # t2dump: one-shot probe at extended_T2 entry that dumps a 4-byte
-        # word from the caller's stack frame (sp+0x170..0x173) on every
-        # inbound RegNotif CMD. Used to identify which byte holds the
-        # inbound AVCTP TID — Bolt's known TID set (1,4,5,7,9,b,d,f)
-        # should appear in one of the four dumped bytes. Once verified,
-        # the probe gets replaced by a targeted save-to-database emit at
-        # that offset.
-        a.label("log_fmt_t2dump")
-        a.asciiz("T2d=%08x")
-        a.align(4)
+    # DEBUG_NATIVE_LOG block intentionally empty: the trampoline budget is
+    # currently fully consumed by the restore_conn_tid + save_event_seq_id
+    # pair that implements the §3.3.5 strict-echo TID flow. mtkbt-side
+    # `M5wire c39=` (patch_mtkbt.py D1 cave) covers wire-emit timing for
+    # every outbound frame. Re-add log_tag + fmt strings + the matching
+    # _emit_native_log_u32 call sites here when adding new debug probes.
 
     # PApp UTF-8 attribute / value text strings (charset 0x006A).
     a.label("papp_text_repeat")
