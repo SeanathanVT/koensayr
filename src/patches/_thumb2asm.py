@@ -203,6 +203,26 @@ class Asm:
         self._hw(0xF8D0 | rn)
         self._hw((rt << 12) | imm)
 
+    def ldr_lit_w(self, rt: int, label: str) -> None:
+        """LDR (literal) T2: load Rt from align(PC, 4) + imm12 (or minus imm12).
+        PC = inst_addr + 4. Used for fetching a 4-byte word literal from a
+        named label elsewhere in the blob (e.g., a constant offset pool).
+        """
+        _check(0 <= rt <= 14, "ldr_lit_w rt")
+
+        def emit(pc: int) -> bytes:
+            target = self.labels[label]
+            offset = target - ((pc + 4) & ~3)
+            U = 1 if offset >= 0 else 0
+            imm = abs(offset)
+            _check(imm <= 0xFFF, f"ldr_lit_w out of range to {label}: {offset}")
+            # Encoding: 11111000 U101 1111 Rt imm12
+            hw1 = 0xF85F | (U << 7)
+            hw2 = (rt << 12) | imm
+            return bytes([hw1 & 0xFF, hw1 >> 8, hw2 & 0xFF, hw2 >> 8])
+
+        self._fixup(emit, 4)
+
     def add_reg(self, rdn: int, rm: int) -> None:
         # ADD (register) T2: 0100 0100 DN Rm[3..0] Rdn[2..0]; DN = bit 3 of Rdn.
         # Rdn = Rdn + Rm; no flag change; any reg in {0..15}.

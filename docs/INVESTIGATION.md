@@ -5613,3 +5613,113 @@ Expected behavior on a fresh state file (delete `y1-trampoline-state` or first-f
 Expected M5dbg pattern: `pd=00` on every outbound (confirms discriminator), `ba9=NN` should still show various values (chan+0xba9 still updated by mtkbt's stash on every inbound CMD — irrelevant now), `c39=NN` should match the saved per-event TID for CHANGED emits.
 
 If c39 still tracks latest inbound TID after this fix, there's a deeper issue we haven't found.
+
+## Trace #71 (2026-05-19) — Bolt 1222: c39=0 in 90/100 outbound frames; conn[+0x11] is empirically not populated by stock JNI's inbound CMD path; per-event TID lives at g_avrcp_req_event_database[event_id] (vaddr 0xd2b5)
+
+### What the logs showed
+
+Bolt 1222 session after the M7-removal + M5-discriminator fix (Trace #70, commit 3b0c628). Trampoline-state file had `state[16]=1` from a previous session (legacy "subscribed yes/no" encoding interpreted by the new TID+1 code as "subscribed with TID=0"). M5wire c39 distribution on outbound frames:
+
+- 90/100 outbound frames: `c39=00`
+- 11/100 frames non-zero — every non-zero is in inbound path (`p8=ea`)
+
+Crucially, ev=09's RegNotif INTERIM ack at 12:21:27.619 had `c39=00`. INTERIM is emitted SYNCHRONOUSLY from within stock JNI's inbound CMD dispatch, so `conn[+0x11]` should hold the inbound TID at that moment per the per-event-TID hypothesis. It didn't.
+
+### What this rules out
+
+The hypothesis "state[N] = conn[+0x11] + 1 at INTERIM-arm time captures the originating RegNotif TID, restorable at CHANGED emit time" (commit 705f145) is empirically false. `conn[+0x11]` is 0 at extended_T2 / T8 entry, so what we were saving was 0+1=1, and at CHANGED time we restored `1-1=0` to conn[+0x11] — shipping the wrong TID on the wire.
+
+### What's actually going on (the JNI RE)
+
+Reverse-engineered stock `libextavrcp_jni.so` (`/work/v3.0.7/system.img.extracted/lib/libextavrcp_jni.so`, MD5 `fd2ce74db9389980b55bccf3d8f15660`):
+
+1. Inbound CMD dispatcher (in the function that handles `MSG_ID_BT_AVRCP_CMD_FRAME_IND`, around file offset `0x6cf0..0x6d58`):
+   - Extracts inbound event_id into `[sp, 0x172]` and seq_id (the AVCTP transId) into `[sp, 0x171]`.
+   - Calls `_Z17saveRegEventSeqIdhh(event_id, seq_id)` at `0x5ee5` via the `bl` at `0x6d26`.
+   - `saveRegEventSeqId` writes `g_avrcp_req_event_database[event_id] = seq_id` (sym 0x5ee4, body):
+     ```
+     0x5ee4  cmp r0, 0xe             ; event_id bounds check
+     0x5ee8  bls 0x5ef8
+     0x5ef8  ldr r2, [literal]       ; PC-relative load of database offset
+     0x5efa  add r2, pc              ; r2 = absolute &g_avrcp_req_event_database
+     0x5efc  strb r1, [r2, r0]       ; database[event_id] = seq_id
+     0x5efe  bx lr
+     ```
+2. `g_avrcp_req_event_database` symbol table entry: vaddr `0x0000d2b5`, size 15 bytes, section [16] `.bss`. Maintained automatically by stock JNI on every inbound RegisterNotification.
+3. `getSavedRegEventSeqId` (sym `0x71f1`) exists but has no xrefs in stock JNI — dead code; the database is read directly via PC-relative addressing at each per-rsp restore site.
+4. Per-rsp restore sites in stock JNI (the canonical pattern):
+   - `notificationTrackChangedNative` @ `0x3bc0`:
+     ```
+     0x3c06  add ip, pc             ; ip = &g_avrcp_req_event_database
+     0x3c0c  ldrb.w r2, [ip, #2]   ; r2 = database[2] (TRACK_CHANGED)
+     0x3c1e  strb.w r2, [r8, 0x19] ; conn[+0x11] = r2  (r8 = avrcp_state; conn = r8+8)
+     ```
+     Then calls `track_changed_rsp`.
+   - `notificationPlayStatusChangedNative` @ `0x3c88`:
+     ```
+     0x3cec  add lr, pc             ; lr = &database
+     0x3cee  ldrb.w ip, [lr, #1]   ; ip = database[1] (PLAYBACK_STATUS)
+     0x3cf2  strb.w ip, [r7, 0x19] ; conn[+0x11] = ip
+     0x3cf6  blx playback_rsp
+     ```
+   - Same pattern in every other `notification*ChangedNative` (10 total in stock JNI).
+5. The `*_rsp` builders in `libextavrcp.so` (file offset `0x23f0` for `reg_notievent_playback_rsp`, `0x2458` for `track_changed_rsp`) read `conn[+0x11]` (`ldrb r3, [r4, #0x11]`) and pack it into `msg[5]` of the outbound IPC frame. From there, mtkbt's `fcn.0xf0bc:0xf1a8` writes `chan+0x39 = packet[+0xa] = msg[5]`, and the wire builder `fcn.0xae418` reads it as the TID nibble.
+
+The TID flow is: inbound CMD → `saveRegEventSeqId(event_id, seq_id)` → `database[event_id] = seq_id` → (later, at any response time) `add ip, pc ; ldrb r2, [ip, #event_id] ; strb r2, [conn, 0x11]` → rsp builder → mtkbt → wire. `conn[+0x11]` is a *transient scratch slot* that stock JNI populates fresh on every rsp call, NOT a persistent inbound-TID stash.
+
+### Why our trampolines didn't pick up the database value
+
+Our T5 / T9 trampolines REPLACE the stock natives at `0x3bc0` / `0x3c88` (the first 4 bytes are overwritten with `b.w T5` / `b.w T9`), short-circuiting the entire stock body including the `database → conn[+0x11]` write. Our extended_T2 / T8 short-circuit the CMD dispatcher and call the rsp builders directly without setting `conn[+0x11]`. So none of our rsp call sites had the database read happening.
+
+### Fix
+
+Every rsp call site in our trampolines now invokes a shared `restore_conn_tid(r0=conn_ptr, r1=event_id)` subroutine inside the trampoline blob. The subroutine does the canonical 14-byte PC-relative dance:
+
+```
+restore_conn_tid:
+  ldr.w r2, [pc, #lit_offset]   ; load PC-relative offset to database
+  add r2, pc                     ; r2 = absolute &g_avrcp_req_event_database
+  ldrb r3, [r2, r1]              ; r3 = database[event_id]
+  strb r3, [r0, #0x11]           ; conn[+0x11] = r3
+  bx lr
+.align 4
+.lit: .word (DB_VADDR - (add_pc_inst + 4))
+```
+
+Subroutine = 16 bytes (12 code + 4 literal). Each call site = 6 bytes (`movs r1, #event_id ; bl restore_conn_tid`). 13 call sites (T4 reactive TC + extended_T2 ev=02 + T5 NCC/Pos/RE_END/TC/RE_START + T8's 11 INTERIM arms + T9's 4 CHANGED emits) × 6 bytes + 16 subroutine = 94 bytes added. Offset by removing the stale `subs r0, #1; strb r0, [r4, 0x19]` TID-restore code in T5/T9 (~10 bytes saved) and the stale `ldrb r0, [r5, 0x19]; adds r0, #1` TID-save in extended_T2/T8 ev=09 (~12 bytes saved). Net add to blob: ~70 bytes.
+
+To fit the debug build under the 4020-byte LOAD #1 padding budget, dropped `T4a=` / `T5emit aid=` / `T9emit pstat=` / `T8reg ev=` log emits and their format strings (~150 bytes total). Kept `T5ncc` (no-arg format) — the load-bearing diagnostic for whether NCC CHANGED actually fires per Bolt's metadata-refresh path. mtkbt-side `M5wire c39=` (D1 cave) covers wire-emit timing for every outbound frame, replacing what the JNI-side per-emit logs were measuring.
+
+Post-fix:
+- Release blob: 3964 / 4020 bytes (56 free)
+- Debug blob: 3992 / 4020 bytes (28 free)
+- OUTPUT_MD5: `a05d8e3208f155e9e8c8c1c0a925eadf`
+- OUTPUT_DEBUG_MD5: `3ddad5af4ce016c79e0ed294582ee8c8`
+
+Sanity-checked via r2 disassembly of the patched blob: `restore_conn_tid @ 0xbae2`, literal at `0xbaf0 = 0x000017cb`; `add r2, pc` at `0xbae6` → `0x17cb + (0xbae6 + 4) = 0xd2b5` ✓ matches `g_avrcp_req_event_database` vaddr. extended_T2's `bl.w restore_conn_tid` at file offset `0xaf6a` decodes to target `0xbae2` ✓.
+
+### State bytes [13..20] now pure subscription gates
+
+With the database providing per-event TIDs, the `state[N]` bytes that previously encoded `TID + 1` (state[16] for ev=02, state[20] for ev=09) revert to pure 0/1 subscription flags, matching the schema documented for state[13..19] (sub_pos / sub_play / sub_papp / sub_track_changed / sub_track_reached_end / sub_track_reached_start / sub_battery). Bytes that were 1..16 from a previous flash session under the TID+1 encoding are interpreted as "subscribed" — harmless on the first re-subscription, which writes a fresh 1.
+
+### Patcher state (post-fix)
+
+- `_trampolines.py`: shared `restore_conn_tid` subroutine + per-call-site `bl restore_conn_tid` stubs at every `*_rsp` blx site. `_emit_restore_conn_tid_from_db(a, conn_reg, event_id, tag)` is the helper API.
+- `_thumb2asm.py`: new `Asm.ldr_lit_w(rt, label)` for PC-relative literal loads (Thumb-2 T2 encoding `0xF85F` family).
+- `patch_libextavrcp_jni.py`: OUTPUT_MD5 / OUTPUT_DEBUG_MD5 pins updated.
+- `patch_mtkbt.py`: unchanged from 3b0c628 (M5 cave with `cmp r0, 0` discriminator on `packet[+0xd]`).
+
+### Expected post-fix behavior
+
+The trampoline now emits, at every rsp call site:
+1. `r0 = conn_ptr (= avrcp_state + 8)`
+2. `movs r1, #event_id`
+3. `bl restore_conn_tid` → reads `database[event_id]`, writes `conn[+0x11]`
+4. Set up `r1, r2, r3` for the rsp builder
+5. `blx *_rsp`
+
+`*_rsp` packs `conn[+0x11]` into `msg[5]`. mtkbt's `fcn.0xf0bc:0xf1a8` writes `chan+0x39 = packet[+0xa] = msg[5]`. M5 cave at `0x6d186` skips its strb on outbound (`packet[+0xd] = 0`), preserving the `chan+0x39` write. Wire builder reads `chan+0x39` for the TID nibble.
+
+For Bolt 1222's failing case: ev=09 RegNotif arrives with TID=N → `saveRegEventSeqId(9, N)` → `database[9] = N`. T8 INTERIM ack runs → `restore_conn_tid(conn, 9)` writes `conn[+0x11] = N`. Outbound INTERIM ships with TID=N. CT acknowledges. Track edge fires `T5ncc` (gated on state[20]) → `restore_conn_tid(conn, 9)` reads `database[9] = N` again, writes `conn[+0x11] = N`. Outbound CHANGED ships with TID=N. Bolt accepts. Pane updates without lag.
+
+If Bolt logs still show `c39=0` for `T5ncc`-adjacent frames after this fix, either (a) `database[9]` is not being populated (unlikely — stock JNI is invariably calling `saveRegEventSeqId` from the dispatcher), or (b) Bolt is not actually re-subscribing to ev=09 in this session (would show as no `T8reg ev=09` — but T8reg log was dropped, so verify via M5wire frame counts before/after track edge), or (c) the cave isn't preserving the c39 write (D2 `M5dbg p8/pd/ba9=` logs would surface it).

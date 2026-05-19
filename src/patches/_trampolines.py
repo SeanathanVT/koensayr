@@ -442,6 +442,7 @@ def _emit_t4(a: Asm) -> None:
     # audio_id for trampoline-side edge detection — only the wire payload
     # is constrained to spec.
     a.add_imm_t3(0, 5, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x02, "t4_tc")
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_CHANGED)
     a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
@@ -564,20 +565,10 @@ def _emit_t4(a: Asm) -> None:
     a.movs_imm8(1, 0)                         # r1 = 0
     a.mov_lo_lo(2, 6)                         # r2 = i
     a.mov_lo_lo(3, 7)                         # r3 = N
-    if DEBUG_NATIVE_LOG:
-        # Pack (attr_id<<16) | (strlen & 0xFFFF) for single-arg log call.
-        # AVRCP §26 Tbl 26.1 attr_id ≤ 7; UTF-8 string slot ≤ 256 → both fit.
-        # Compute in r4 + r11 (both AAPCS callee-saved across upcoming PLT
-        # blx; not in the r0-r3 set that _emit_native_log_u32 push/pops).
-        # r4 was last used as table-index pointer above and is free to clobber:
-        # the loop top re-inits it via addw(4, 13, T4_ATTRIDS_OFF).
-        a.mov_lo_lo(4, 9)                     # r4 = attr_id (T2 mov reg, r9→r4)
-        a.lsls_imm5(4, 4, 16)                 # r4 = attr_id << 16 (low regs)
-        a.ldr_w(11, 13, T4_OFF_ARGS + 8)      # r11 = strlen at sp+T4_OFF_ARGS+8
-        a.add_reg(4, 11)                      # r4 = (attr_id << 16) | strlen
-        _emit_native_log_u32(a, "log_fmt_t4attr", 4)
-        # Caller's r0=conn / r1=0 / r2=i / r3=N restored by _emit_native_log_u32
-        # via its internal push/pop. r4 / r11 clobbered (not used post-loop).
+    # T4a= per-attribute log dropped 2026-05-19 to free trampoline budget
+    # for the per-event-TID restore subroutine. GEA wire-size predictions
+    # remain available via mtkbt-side btlog parsing (`tools/btlog-parse.py
+    # --avrcp`); the trampoline-side per-attr log was diagnostic-only.
     a.blx_imm(PLT_get_element_attributes_rsp)
 
     # i++; if i < N: loop.
@@ -732,29 +723,30 @@ def _emit_extended_t2(a: Asm) -> None:
     a.label("ext2_after_state_write")
 
     # ---- reply track_changed_rsp INTERIM ----
+    # Before the rsp call: write database[2] → conn[+0x11] so the rsp
+    # builder's `ldrb r3, [r4, 0x11]` picks up the inbound RegNotif TID
+    # for §3.3.5 strict echo. r5 = struct ptr; conn = r5+8.
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn (also restore site target)
+    _emit_restore_conn_tid_from_db(a, 0, 0x02, "ext2_tc")
     # r1=0 takes the spec-correct path. Disassembly of the response builder
     # at libextavrcp.so:0x2458 shows `cbnz r5, reject_path` on r1; r1==0 is
     # the spec-correct path that emits reasonCode + event_id + identifier;
     # r1!=0 writes a reject-shape frame that omits the event payload.
-    # transId is auto-extracted from conn[17] regardless.
     # r3 → 8 zero bytes per AVRCP 1.3 §6.7.2: 1.3 TGs shall emit
     # Identifier=0x00...00 ("selected track"). Non-zero values are a 1.4+
     # Browseable Player UID extension; strict 1.3 parsers reject those.
-    a.add_imm_t3(0, 5, 8)                     # r0 = conn
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_INTERIM)
     a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
     a.blx_imm(PLT_track_changed_rsp)
 
-    # Arm sub_track_changed (event 0x02) and save the inbound RegNotif TID
-    # for AVRCP §3.3.5 strict echo on the eventual T5 CHANGED. state[16]
-    # encoding: 0 = not subscribed, 1..16 = subscribed with TID = byte-1.
-    # The +1 makes "not subscribed" unambiguously distinguishable from
-    # "subscribed with TID=0". r5 = struct ptr here; conn = r5+8; TID is
-    # at conn[+0x11] = [r5, 0x19].
-    a.ldrb_w(0, 5, 0x19)                      # r0 = conn[+0x11] = inbound TID
-    a.raw(bytes([0x01, 0x30]))                # adds r0, #1 (Thumb T1, 2 B)
-    _emit_subscription_write(a, None, 16, T2_OFF_SUB_SCRATCH, "ext2_epilogue")
+    # Arm sub_track_changed (event 0x02) gate so T5's CHANGED branch fires
+    # on the eventual track edge. The byte value is just a 0/1 flag — the
+    # per-event TID restore for §3.3.5 strict echo is handled at each
+    # CHANGED rsp call site by _emit_restore_conn_tid_from_db, reading
+    # the latest inbound seq_id from g_avrcp_req_event_database[event_id]
+    # (which stock JNI maintains on every RegisterNotification CMD).
+    _emit_subscription_write(a, 1, 16, T2_OFF_SUB_SCRATCH, "ext2_epilogue")
 
     a.label("ext2_epilogue")
     # Restore stack and branch to epilogue.
@@ -872,16 +864,13 @@ def _emit_t5(a: Asm) -> None:
     a.cmp_imm8(0, 0)
     a.beq("t5_skip_now_playing")
 
-    # Restore the per-event RegNotif TID into conn[+0x11] so mtkbt's
+    # Restore the per-event RegNotif TID (ev=09) into conn[+0x11] so mtkbt's
     # stock wire path (libextavrcp::*_rsp reads conn[+0x11] → msg[5] →
     # packet[+0xa] → fcn.0xf0bc:0xf1a8 → chan+0x39 → wire builder) emits
-    # the §3.3.5-correct echo TID even though the current inbound CMD's
-    # TID has rotated since the ev=0x09 RegNotif. state[20] encodes
-    # TID+1; subtract 1 before writing to conn[+0x11].
-    a.raw(bytes([0x01, 0x38]))                # subs r0, #1 (Thumb T1, 2 B)
-    a.raw(bytes([0x60, 0x76]))                # strb r0, [r4, 0x19] (= conn[+0x11])
-
+    # the §3.3.5-correct echo TID. Source is g_avrcp_req_event_database[9],
+    # maintained by stock JNI's saveRegEventSeqId on every inbound RegNotif.
     a.add_imm_t3(0, 4, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x09, "t5_ncc")
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
     if DEBUG_NATIVE_LOG:
@@ -899,9 +888,10 @@ def _emit_t5(a: Asm) -> None:
     a.cmp_imm8(0, 0)
     a.beq("t5_skip_pos_changed")
 
+    a.add_imm_t3(0, 4, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x05, "t5_pos")
     a.ldr_sp_imm(3, T5_OFF_FILE + 780)        # r3 = file[780..783] (BE)
     a.rev_lo_lo(3, 3)                         # → host order
-    a.add_imm_t3(0, 4, 8)                     # r0 = conn
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
     a.blx_imm(PLT_reg_notievent_pos_changed_rsp)
@@ -925,6 +915,7 @@ def _emit_t5(a: Asm) -> None:
 
     # reg_notievent_reached_end_rsp(conn, 0, REASON_CHANGED)
     a.add_imm_t3(0, 4, 8)                     # r0 = r4 + 8 (conn)
+    _emit_restore_conn_tid_from_db(a, 0, 0x03, "t5_re_end")
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_CHANGED)
     a.blx_imm(PLT_reg_notievent_reached_end_rsp)
@@ -938,32 +929,25 @@ def _emit_t5(a: Asm) -> None:
     # CHANGED with non-zero Identifier and fall back to polling-only
     # metadata refresh. ICS Table 7 row 24 (Mandatory wire-level).
     # sub_track_changed bit at state[16] (cleared after emit per §6.7.1).
-    # Encoding: 0 = not subscribed, 1..16 = subscribed with TID = byte-1.
+    # Pure subscription gate: 0 = not subscribed, nonzero = subscribed.
+    # Per-event TID is read from g_avrcp_req_event_database[2] by
+    # restore_conn_tid below.
     a.ldrb_w(0, 13, T5_OFF_STATE + 16)
     a.cmp_imm8(0, 0)
     a.beq("t5_skip_track_changed")
 
-    # Restore the per-event RegNotif TID into conn[+0x11] for §3.3.5 echo
-    # (track-edge CHANGEDs can fire 30s+ after the originating RegNotif on
-    # CTs with sparse re-subscription — conn[+0x11] has rotated since).
-    a.raw(bytes([0x01, 0x38]))                # subs r0, #1 (Thumb T1, 2 B)
-    a.raw(bytes([0x60, 0x76]))                # strb r0, [r4, 0x19] (= conn[+0x11])
-
-    a.add_imm_t3(0, 4, 8)                     # r0 = r4 + 8 (conn)
+    # Restore the per-event RegNotif TID (ev=02) into conn[+0x11] for §3.3.5
+    # echo (track-edge CHANGEDs can fire 30s+ after the originating RegNotif
+    # on CTs with sparse re-subscription). Source is
+    # g_avrcp_req_event_database[2].
+    a.add_imm_t3(0, 4, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x02, "t5_tc")
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_CHANGED)
     a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
-    if DEBUG_NATIVE_LOG:
-        # Log low 32 bits of internal audio_id (file[4..7] BE → host) for
-        # grep correlation with the music app's fL.id debug lines, even
-        # though the wire-side Identifier is SELECTED 0x00*8. r6 is unused
-        # elsewhere in T5 body, callee-saved across the log blx.
-        # _emit_native_log_u32 push/pops r0..r3 internally so the emit args
-        # set up just above (r0=conn, r1=0, r2=REASON_CHANGED, r3=&zero)
-        # all survive the call.
-        a.ldr_sp_imm(6, T5_OFF_FILE_TID + 4)
-        a.rev_lo_lo(6, 6)
-        _emit_native_log_u32(a, "log_fmt_t5emit", 6)
+    # T5emit aid= log dropped 2026-05-19 to free trampoline budget for the
+    # per-event-TID restore subroutine. mtkbt-side `M5wire c39=` (D1 cave)
+    # provides the wire-emit signal we actually care about post-fix.
     a.blx_imm(PLT_track_changed_rsp)
 
     # AVRCP §6.7.1 strict: clear sub_track_changed (state[16]) after CHANGED.
@@ -983,6 +967,7 @@ def _emit_t5(a: Asm) -> None:
     a.beq("t5_skip_reached_start")
 
     a.add_imm_t3(0, 4, 8)                     # r0 = r4 + 8 (conn)
+    _emit_restore_conn_tid_from_db(a, 0, 0x04, "t5_re_start")
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_CHANGED)
     a.blx_imm(PLT_reg_notievent_reached_start_rsp)
@@ -1814,6 +1799,91 @@ def _emit_subscription_write(a: Asm, byte_value, state_byte_offset: int,
     a.blx_imm(PLT_close)
 
 
+# g_avrcp_req_event_database is a 15-byte global at vaddr 0xd2b5 (in
+# libextavrcp_jni.so's .bss). Stock JNI's inbound CMD dispatcher calls
+# saveRegEventSeqId(event_id, seq_id) on every inbound RegisterNotification,
+# which writes seq_id into g_avrcp_req_event_database[event_id]. Just before
+# calling any reg_notievent_*_rsp builder, stock JNI also writes
+# database[event_id] into conn[+0x11], which the rsp builders read as the
+# AVCTP transId for §3.3.5 strict-echo response packing (see e.g. stock JNI
+# at 0x3c06: `add ip, pc ; ldrb r2, [ip, #2] ; strb r2, [r8, 0x19]` for
+# notificationTrackChangedNative).
+#
+# Our T-trampolines REPLACE the stock prologues of those notification natives
+# (and dispatch RegisterNotification CMDs via extended_T2 / T8 before stock's
+# inbound handler does its database→conn write), so the conn[+0x11] slot is
+# never populated. Empirically (Bolt 1222 logs): every outbound wire frame
+# emitted by the rsp builders ships with chan+0x39 = 0, breaking the strict
+# §3.3.5 echo and causing CT-side drops.
+#
+# Fix: at every rsp call site in our trampolines, replicate the stock
+# database→conn write immediately before the rsp builder blx.
+G_AVRCP_REQ_EVENT_DATABASE_VADDR = 0xd2b5
+
+
+def _emit_restore_conn_tid_from_db(a: Asm, conn_reg: int, event_id: int,
+                                   tag: str) -> None:
+    """Emit a call to the shared `restore_conn_tid` subroutine that writes
+    g_avrcp_req_event_database[event_id] → [r0, #0x11].
+
+    Caller contract:
+      - r0 must hold the conn pointer (the subroutine writes through it).
+      - event_id must fit in an 8-bit immediate (0..255; all AVRCP event_ids
+        are 0x01..0x0d so this is fine).
+      - The bl clobbers r1, r2, r3, lr per the subroutine body (and the
+        Thumb-1 push/pop dance below). The caller's rsp-builder arg vector
+        (r0..r3) must be set up AFTER this call returns. r0 is preserved.
+
+    `conn_reg` and `tag` are accepted for backward-compat with earlier
+    inline-helper callers but ignored — every site funnels into the same
+    subroutine.
+
+    Per-site cost: 6 bytes (movs r1, #imm8 + bl_w).
+    """
+    _check = lambda c, m: None if c else (_ for _ in ()).throw(AssertionError(m))
+    _check(0 <= event_id <= 0xFF, f"event_id imm8 overflow: {event_id}")
+    del conn_reg, tag                          # unused — subroutine reads r0 directly
+    a.movs_imm8(1, event_id)
+    a.bl_w("restore_conn_tid")
+
+
+def _emit_restore_conn_tid_subroutine(a: Asm) -> None:
+    """Emit the shared restore_conn_tid subroutine.
+
+    Pre: r0 = conn pointer, r1 = event_id.
+    Post: [r0, #0x11] = g_avrcp_req_event_database[event_id]; r0 preserved.
+    Clobbers r1, r2, r3, lr.
+
+    Pattern mirrors stock JNI's database read (e.g., 0x3c06 in
+    notificationTrackChangedNative):
+        add ip, pc           ; ip = &g_avrcp_req_event_database
+        ldrb r2, [ip, evid]  ; r2 = database[event_id]
+        strb r2, [conn, 0x11]
+    We use r2/r3 instead of ip/r2 since the trampoline blob's Thumb-1
+    forms have wider register support.
+
+    14 B code + alignment + 4 B literal = 16 B total.
+    """
+    a.label("restore_conn_tid")
+    a.ldr_lit_w(2, "restore_conn_tid_lit")
+    a.label("restore_conn_tid_add_pc")
+    a.add_reg(2, 15)                          # add r2, pc → r2 = absolute db vaddr
+    # ldrb r3, [r2, r1]: LDRB (register) T1, 0101 110 Rm Rn Rt → 0x5C00
+    # imm fields: Rm=r1, Rn=r2, Rt=r3 → hw = 0x5C00 | (1 << 6) | (2 << 3) | 3
+    hw = 0x5C00 | (1 << 6) | (2 << 3) | 3
+    a.raw(bytes([hw & 0xFF, (hw >> 8) & 0xFF]))
+    # strb r3, [r0, #0x11]: STRB imm T1, 0111 0 imm5 Rn Rt
+    hw = 0x7000 | (0x11 << 6) | (0 << 3) | 3
+    a.raw(bytes([hw & 0xFF, (hw >> 8) & 0xFF]))
+    a.bx(14)                                  # bx lr
+    a.align(4)
+    a.label("restore_conn_tid_lit")
+    def _emit_lit(_pc: int) -> bytes:
+        offset = G_AVRCP_REQ_EVENT_DATABASE_VADDR - (a.labels["restore_conn_tid_add_pc"] + 4)
+        return (offset & 0xFFFFFFFF).to_bytes(4, "little")
+    a._fixup(_emit_lit, 4)
+
+
 def _emit_native_log_u32(a: Asm, fmt_label: str, value_reg: int) -> None:
     """Emit __android_log_print(INFO, "Y1T", fmt, value_reg) before a wire-side
     response blx. Used by build(debug=True) to record exactly what bytes the
@@ -1927,17 +1997,19 @@ def _emit_t8(a: Asm) -> None:
 
     # ---- dispatch on event_id (caller's sp+386, post-SUB-SP at T8_EVENT_ID_OFF) ----
     a.ldrb_w(0, 13, T8_EVENT_ID_OFF)          # r0 = event_id
-    if DEBUG_NATIVE_LOG:
-        _emit_native_log_u32(a, "log_fmt_t8reg", 0)
+    # T8reg ev= log dropped 2026-05-19 to free trampoline budget; M5wire
+    # c39= identifies which inbound event the post-fix TID restore writes
+    # for, and Bolt's RegNotif event set is already-known (ev=01..09).
     a.cmp_imm8(0, 0x01)
     a.bne("t8_check_3")
 
     # 0x01 PLAYBACK_STATUS_CHANGED
     # reg_notievent_playback_rsp(conn, 0, REASON_INTERIM, play_status)
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn (also restore-site target)
+    _emit_restore_conn_tid_from_db(a, 0, 0x01, "t8_e01")
     a.ldrb_w(3, 13, T8_OFF_FILE_PLAYFLAG)     # r3 = play_status (1=PLAYING / 2=PAUSED / 0=STOPPED)
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)                         # success
-    a.add_imm_t3(0, 5, 8)                     # r0 = conn
     a.blx_imm(PLT_reg_notievent_playback_rsp)
 
     # Arm sub_play_status bit (event 0x01) per AVRCP §6.7.1.
@@ -1949,9 +2021,10 @@ def _emit_t8(a: Asm) -> None:
     a.bne("t8_check_4")
     # 0x03 TRACK_REACHED_END
     # reg_notievent_reached_end_rsp(conn, 0, REASON_INTERIM)
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x03, "t8_e03")
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
-    a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_reached_end_rsp)
 
     # Arm sub_track_reached_end (event 0x03) per AVRCP §6.7.1.
@@ -1962,9 +2035,10 @@ def _emit_t8(a: Asm) -> None:
     a.cmp_imm8(0, 0x04)
     a.bne("t8_check_5")
     # 0x04 TRACK_REACHED_START
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x04, "t8_e04")
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
-    a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_reached_start_rsp)
 
     # Arm sub_track_reached_start (event 0x04) per AVRCP §6.7.1.
@@ -2021,9 +2095,16 @@ def _emit_t8(a: Asm) -> None:
 
     a.label("t8_pos_emit")
     # reg_notievent_pos_changed_rsp(conn, 0, REASON_INTERIM, position_ms_u32)
+    # r3 already holds the position from the live-extrapolation block above;
+    # restore must use a register the helper preserves, so do conn first then
+    # set up r2/r1 (helper clobbers r2/r3 — r3 will be re-loaded? NO, r3 is
+    # already set up). Use a callee-saved stash: push/pop r3 across the helper.
+    a.raw(bytes([0x08, 0xB4]))                # push {r3}
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x05, "t8_e05")
+    a.raw(bytes([0x08, 0xBC]))                # pop {r3}
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
-    a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_pos_changed_rsp)
 
     # Arm sub_pos_changed bit (event 0x05) per AVRCP §6.7.1 per-subscription
@@ -2042,10 +2123,11 @@ def _emit_t8(a: Asm) -> None:
     # 3=EXTERNAL, 4=FULL_CHARGE) bucket-mapped from
     # Android `Intent.ACTION_BATTERY_CHANGED`. Stack is memset to 0 before the
     # read, so a short file gives BATT_STATUS_NORMAL — benign default.
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x06, "t8_e06")
     a.ldrb_w(3, 13, T8_OFF_FILE_BATTERY)
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
-    a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_battery_status_rsp)
 
     # Arm sub_battery (event 0x06) per AVRCP §6.7.1.
@@ -2057,10 +2139,11 @@ def _emit_t8(a: Asm) -> None:
     a.bne("t8_check_8")
     # 0x07 SYSTEM_STATUS_CHANGED
     # reg_notievent_system_status_changed_rsp(conn, 0, REASON_INTERIM, system_status_u8)
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x07, "t8_e07")
     a.movs_imm8(3, SYSTEM_STATUS_POWERED)
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
-    a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_system_status_rsp)
     a.b_w("t8_done")
 
@@ -2081,6 +2164,7 @@ def _emit_t8(a: Asm) -> None:
     a.addw(0, 13, T8_OFF_FILE_REPEAT)           # r0 = &file[795] (= [r, s])
     a.str_sp_imm(0, 4)                          # sp[4] = current values
     a.add_imm_t3(0, 5, 8)                       # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x08, "t8_e08")
     a.movs_imm8(1, 0)                           # success
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(3, 2)                           # n=2
@@ -2108,27 +2192,26 @@ def _emit_t8(a: Asm) -> None:
     a.cmp_imm8(0, 0x09)
     a.bne("t8_check_a")
     # 0x09 NOW_PLAYING_CONTENT_CHANGED INTERIM ACK.
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x09, "t8_e09")
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
-    a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_now_playing_content_rsp)
-    # Arm sub_now_playing_content (state[20]) and save the inbound RegNotif
-    # TID for §3.3.5 strict echo on the eventual T5/T9 CHANGED. Encoding:
-    # 0 = not subscribed, 1..16 = subscribed with TID = byte-1. r5 = struct
-    # (preserved across the rsp blx by AAPCS callee-save); conn = r5+8;
-    # TID at conn[+0x11] = [r5, 0x19].
-    a.ldrb_w(0, 5, 0x19)                      # r0 = conn[+0x11] = inbound TID
-    a.raw(bytes([0x01, 0x30]))                # adds r0, #1 (Thumb T1, 2 B)
-    _emit_subscription_write(a, None, 20, T8_OFF_TIMESPEC_SEC, "t8_done")
+    # Arm sub_now_playing_content gate (state[20]). The per-event TID
+    # restore for §3.3.5 strict echo on the eventual T5/T9 CHANGED is
+    # handled by _emit_restore_conn_tid_from_db at those rsp call sites,
+    # reading the latest inbound seq_id from g_avrcp_req_event_database[9].
+    _emit_subscription_write(a, 1, 20, T8_OFF_TIMESPEC_SEC, "t8_done")
     a.b_w("t8_done")
 
     a.label("t8_check_a")
     a.cmp_imm8(0, 0x0A)
     a.bne("t8_check_b")
     # 0x0A AVAILABLE_PLAYERS_CHANGED INTERIM ACK (empty payload).
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x0A, "t8_e0a")
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
-    a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_availplayers_rsp)
     a.b_w("t8_done")
 
@@ -2139,9 +2222,11 @@ def _emit_t8(a: Asm) -> None:
     # UidCounter u16 at sp[0] = 0 (Y1 has one player, no UID database).
     a.movs_imm8(3, 0)
     a.str_sp_imm(3, 0)                          # sp[0] = uid_counter (0)
+    a.add_imm_t3(0, 5, 8)                       # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x0B, "t8_e0b")
+    a.movs_imm8(3, 0)                           # re-set after restore clobber
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
-    a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_addredplayer_rsp)
     a.b_w("t8_done")
 
@@ -2149,10 +2234,11 @@ def _emit_t8(a: Asm) -> None:
     a.cmp_imm8(0, 0x0C)
     a.bne("t8_unknown_event")
     # 0x0C UIDS_CHANGED INTERIM ACK. UidCounter u16 in r3 = 0.
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x0C, "t8_e0c")
     a.movs_imm8(3, 0)
     a.movs_imm8(2, REASON_INTERIM)
     a.movs_imm8(1, 0)
-    a.add_imm_t3(0, 5, 8)
     a.blx_imm(PLT_reg_notievent_uids_changed_rsp)
     a.b_w("t8_done")
 
@@ -2347,11 +2433,12 @@ def _emit_t9(a: Asm) -> None:
     # r0 = conn (= struct + 8); r1 = 0 success; r2 = REASON_CHANGED;
     # r3 = play_status (from file_buf[792]).
     a.add_imm_t3(0, 4, 8)                     # r0 = r4 + 8 (conn)
+    _emit_restore_conn_tid_from_db(a, 0, 0x01, "t9_ps")
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
     a.ldrb_w(3, 13, T9_OFF_FILE_PLAYFLAG)     # r3 = play_status
-    if DEBUG_NATIVE_LOG:
-        _emit_native_log_u32(a, "log_fmt_t9pstat", 3)
+    # T9emit pstat= log dropped 2026-05-19 to free trampoline budget; the
+    # mtkbt-side D1 cave's `M5wire c39=` covers wire-emit timing.
     a.blx_imm(PLT_reg_notievent_playback_rsp)
 
     # AVRCP §6.7.1 strict: clear sub_play_status (state[14]) after CHANGED.
@@ -2362,19 +2449,16 @@ def _emit_t9(a: Asm) -> None:
 
     # ---- emit NowPlayingContentChanged CHANGED on play-edge ----
     # Paired with PlaybackStatus + TrackChanged as a 3-frame burst on
-    # play/pause edge. Gate is set-once at T8 INTERIM, never cleared.
-    # state[20] encodes TID+1 (0 = not subscribed, 1..16 = TID).
+    # play/pause edge. Gate (state[20]) is set-once at T8 INTERIM, never
+    # cleared; per-event TID restore for §3.3.5 echo is handled by the
+    # shared restore_conn_tid subroutine reading
+    # g_avrcp_req_event_database[9].
     a.ldrb_w(1, 13, T9_STATE_SUB_NOWPLAY_OFF)
     a.cmp_imm8(1, 0)
     a.beq("t9_after_play_check")
 
-    # Restore per-event RegNotif TID into conn[+0x11] for §3.3.5 echo on
-    # the eventual wire frame. r1 holds state[20] = TID+1; subtract 1
-    # and store to [r4, 0x19].
-    a.raw(bytes([0x49, 0x1e]))                # subs r1, r1, #1 (Thumb T1, 2 B)
-    a.raw(bytes([0x61, 0x76]))                # strb r1, [r4, 0x19] (= conn[+0x11])
-
     a.add_imm_t3(0, 4, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x09, "t9_ncc")
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
     a.blx_imm(PLT_reg_notievent_now_playing_content_rsp)
@@ -2408,6 +2492,7 @@ def _emit_t9(a: Asm) -> None:
 
     # ---- emit CHANGED via reg_notievent_battery_status_changed_rsp ----
     a.add_imm_t3(0, 4, 8)                     # r0 = r4 + 8 (conn)
+    _emit_restore_conn_tid_from_db(a, 0, 0x06, "t9_batt")
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
     a.ldrb_w(3, 13, T9_OFF_FILE_BATTERY)      # r3 = battery_status
@@ -2458,6 +2543,7 @@ def _emit_t9(a: Asm) -> None:
     a.addw(0, 13, T9_OFF_FILE_REPEAT)         # r0 = &file[795] (= [r, s])
     a.str_sp_imm(0, T9_OFF_ARGS + 4)          # sp[4] = current values
     a.add_imm_t3(0, 4, 8)                     # r0 = conn (struct + 8)
+    _emit_restore_conn_tid_from_db(a, 0, 0x08, "t9_papp")
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
     a.movs_imm8(3, 2)                         # n
@@ -2576,13 +2662,17 @@ def _emit_t9(a: Asm) -> None:
     a.adds_lo_lo(3, 3, 2)                     # r3 = live_pos
 
     # ---- emit reg_notievent_pos_changed_rsp(conn, 0, REASON_CHANGED, live_pos) ----
+    # r3 holds live_pos from the math chain above; restore_conn_tid would
+    # clobber r3, so push/pop around the bl.
+    a.raw(bytes([0x08, 0xB4]))                # push {r3}
     a.add_imm_t3(0, 4, 8)                     # r0 = conn (= struct + 8)
+    _emit_restore_conn_tid_from_db(a, 0, 0x05, "t9_pos")
+    a.raw(bytes([0x08, 0xBC]))                # pop {r3}
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
-    # r3 already = live_pos. Trampoline-side `T9emit pos=` log dropped
-    # 2026-05-19 to free budget for the per-event-TID restore code; the
-    # mtkbt-side `M5wire c39=` (D1 cave) covers wire-emit timing for
-    # position frames via the same logging window.
+    # Trampoline-side `T9emit pos=` log dropped 2026-05-19 to free budget
+    # for the per-event-TID restore code; the mtkbt-side `M5wire c39=` (D1
+    # cave) covers wire-emit timing for position frames.
     a.blx_imm(PLT_reg_notievent_pos_changed_rsp)
 
     # AVRCP §6.7.1 strict: clear sub_pos (state[13]) after CHANGED.
@@ -2640,6 +2730,12 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     _emit_t8(a)                               # PDU 0x31 RegisterNotification dispatch
     _emit_t9(a)                               # proactive PLAYBACK_STATUS_CHANGED + battery + position
 
+    # Shared subroutine for per-event TID restore at every rsp call site.
+    # Called via bl_w("restore_conn_tid") from each emit gate before its
+    # rsp builder blx. See _emit_restore_conn_tid_from_db for caller
+    # contract.
+    _emit_restore_conn_tid_subroutine(a)
+
     # Path strings, 4-byte-aligned for clean ADR offsets.
     a.align(4)
     a.label("path_track_info")
@@ -2690,30 +2786,15 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         a.label("log_tag")
         a.asciiz("Y1T")
         a.align(4)
-        a.label("log_fmt_t5emit")
-        a.asciiz("T5emit aid=%08x")
-        a.align(4)
         # log_fmt_t6pos / log_fmt_t6dur removed in tandem with the T6 dur/pos
         # emits — see "T6 GetPlayStatus debug logs ... removed 2026-05-17"
-        # comment above for rationale.
-        # log_fmt_t9pos dropped 2026-05-19; T9emit pos= no longer emitted.
-        # mtkbt-side D1 cave's M5wire c39= covers wire-emit timing for
-        # position frames.
-        a.label("log_fmt_t9pstat")
-        a.asciiz("T9emit pstat=%u")
-        a.align(4)
-        a.label("log_fmt_t8reg")
-        a.asciiz("T8reg ev=%02x")
-        a.align(4)
-        # T4 per-attribute emit. Packed value: high 16 = attr_id, low 16 = strlen.
-        # tools/avrcp-wire-trace.py reconstructs total wire-frame size per GEA
-        # response by summing the per-attr emits per response:
-        #   wire_size = 16 (AVCTP+AV/C outer) + 1 (num_attribs) + N * (8 + strlen_i)
-        # If wire_size > 502 bytes, mtkbt's fcn.0xed50 will set packet_type=1
-        # (Start) and fragmentation triggers — exactly the case we want to detect.
-        a.label("log_fmt_t4attr")
-        a.asciiz("T4a=%08x")
-        a.align(4)
+        # comment above for rationale. log_fmt_t9pos / log_fmt_t9pstat /
+        # log_fmt_t5emit / log_fmt_t4attr / log_fmt_t8reg dropped 2026-05-19
+        # to free budget for the shared restore_conn_tid subroutine that
+        # fixes the §3.3.5-echo TID at every rsp call site (see
+        # _emit_restore_conn_tid subroutine docstring). mtkbt-side
+        # `M5wire c39=` (D1 cave) covers wire-emit timing for every outbound
+        # frame including the per-event TID we ship to the wire.
         # T5 NowPlayingContent CHANGED emit on track edge. Format takes no
         # args (saves bytes vs a `%02x` format — the event_id is implicit
         # in the call site). Surfaces whether T8's INTERIM-ack of ev=0x09
