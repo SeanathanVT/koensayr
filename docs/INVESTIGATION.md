@@ -5346,3 +5346,68 @@ The most likely cause is that `msg=520 cmd_frame_ind_rsp` is *not* being emitted
 ### Verification plan
 
 KOENSAYR_DEBUG=1 build, flash, capture a fresh Bolt session covering connection + several track skips. Grep `Y1T:*` for `M5dbg p8=`, `M5dbg pd=`, `M5dbg ba9=`, `M5wire c39=` and map against the table above. The pattern that fires per-frame tells us exactly where the M7 hypothesis breaks.
+
+## Trace #68 (2026-05-19) — D2 cave first capture: M7 verified working; M5's discriminator is empirically dead code
+
+### What the D2 cave revealed on TV / Sonos
+
+Post-293b382 debug build (mtkbt `68faa7cfbb5c833d4f55c44ccfa98813`), fresh sessions on the two TID=0 / oscillating-TID CTs:
+
+**TV `dual-tv-20260519-0949`** (4008 Y1T lines, 0 restarts):
+
+| log tag | distribution |
+|---|---|
+| `M5wire c39=` | `09` × 402 |
+| `M5dbg ba9=` | `09` × 402 |
+| `M5dbg p8=` | `0xb8` × 402 |
+| `M5dbg pd=` | `0x00` × 402 |
+| `T8reg ev=` | `01` × 4, `08` × 1, `09` × 8, `0b` × 1, `0c` × 1 |
+
+**Sonos `dual-sonos-20260519-0951`** (852 Y1T lines, 0 restarts):
+
+| log tag | distribution |
+|---|---|
+| `M5wire c39=` | `09` × 45, `00` × 80 |
+| `M5dbg ba9=` | `09` × 45, `00` × 80 |
+| `M5dbg p8=` | `0xb8` × 103, `0xea` × 22 |
+| `M5dbg pd=` | `0x00` × 125 |
+| `T8reg ev=` | `01` × 7, `08` × 1, `09` × 14, `0b` × 1, `0c` × 1 |
+
+**Per-frame correlation** (interleaved `M5dbg` + `M5wire` lines fire within the same microsecond, same PID, in this order: `p8` → `pd` → `ba9` → `c39`): `c39 == ba9` in **100% of observed wire frames** across both CTs. M7's unconditional `chan+0x39 = chan+0xba9` is doing exactly what it claimed to do.
+
+### M5's discriminator is empirically dead
+
+The M5 patch (commit `c5e93be`-era) relied on `cmp r2, 1; beq skip_strb` to distinguish outbound IPC (allocator path, `packet[+8]=1`) from inbound (stash struct, `packet[+8]=0xea`). The D2 log of `packet[+8]` shows the value is **never 1** — it's `0xb8` (most frames, both CTs) or `0xea` (Sonos minority). So:
+
+- M5's `beq skip_strb` is never taken.
+- The original strb at `0xf3688` fires every frame.
+- That strb writes `packet[+0xd]` (= `0x00` in 100% of observed frames) to `chan+0x39`.
+- M7's two-instruction tail at `0xf368c..0xf3693` (`ldrb.w r0, [r4, 0xb99]; strb.w r0, [r4, 0x29]`) immediately overwrites with `chan+0xba9`.
+
+**M5's discriminator-based logic was never actually doing anything in production.** Pre-M7, the CTs that "worked" did so by coincident match: M5's broken strb wrote `0` to chan+0x39, and those CTs happened to use TID=0. Bolt cycles TIDs across 0-15 → coincident match fails → 3 s retry storm.
+
+This contradicts the architecture comment in `patch_mtkbt.py` (M5 patch description) and in `docs/PATCHES.md` (the M5 cave disassembly section) that claim M5 discriminates correctly. Both should be updated when next touched.
+
+### chan+0xba9 is not a stable stash — it tracks the latest inbound TID
+
+Sonos's wire-side TID transitions exactly once mid-session (09:49:41 UTC, `ba9: 9 → 0`, ~33 s after `connect_ind`). This corresponds to a legitimate change in the CT's inbound CMD TID, not a bug. The wire echo follows correctly — both `ba9` and `c39` change together at that frame. Subsequent frames stay at `ba9=00` (and `c39=00`).
+
+This means `chan+0xba9` is updated on every inbound CMD (via `fcn.0x11374:0x11436` on msg=520 cmd_frame_ind_rsp). Between inbound CMDs, the value sticks. M7 reads it whenever it runs (on every outbound frame), so the wire TID = most-recently-seen inbound TID.
+
+For RegNotif INTERIM/CHANGED responses (the path Bolt was retry-storming on), this is exactly what AVCTP §3.3.5 strict echo requires — the response TID must match the original cmd's TID. With M7, outbound TID = `chan+0xba9` = the inbound RegNotif's TID. Should work for Bolt too.
+
+### Prediction for the in-flight Bolt capture
+
+We expect:
+
+1. `M5wire c39=NN` matching `M5dbg ba9=NN` on every frame (M7 working).
+2. `NN` covering the range of Bolt's actual inbound TIDs (per the Pixel-as-TG reference btsnoop: 2 for ev=01, 3 for ev=02, 5 for ev=05, 6 for ev=09, 8 for ev=0a, 9 for ev=0b, 0xa for ev=0c).
+3. No 3 s retry storms on ev=01 / ev=05 / ev=0a (which were the post-Trace-#66 symptom).
+4. `T5ncc` firing on every track edge.
+5. GEA queries `T4a=00010NNN` within < 1 s of CHANGED bursts (interrupt-driven refresh).
+
+If the "3 songs then wedge" symptom persists, it's no longer TID-related and we need to look at a different layer (Bolt-side state machine, metadata content edge case, AVCTP fragmentation under sustained traffic, or our state[X] subscription gate clearing logic).
+
+### Patcher state
+
+Unchanged from 293b382: mtkbt OUTPUT_MD5 `9c4e462241169c3a181574db157c8df7` / OUTPUT_DEBUG_MD5 `68faa7cfbb5c833d4f55c44ccfa98813`. patch_libextavrcp_jni.so unchanged from 252cd8a.
