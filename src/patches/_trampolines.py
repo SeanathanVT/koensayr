@@ -1973,16 +1973,20 @@ def _emit_clear_event_database_subroutine(a: Asm) -> None:
 def _emit_incr_track_identifier_subroutine(a: Asm) -> None:
     """Emit the shared incr_and_get_track_identifier subroutine.
 
-    Pre: (none)
+    Pre: (none — but caller's r2 must be preserved across the call because
+         it carries the reasonCode arg to the downstream rsp builder).
     Post: byte at g_y1_avrcp_track_identifier[7] incremented (8-bit wrap;
-          0xFF → 0x00 fine, Bolt still sees the value change);
-          r3 = &g_y1_avrcp_track_identifier (= 0xd2c4); r2 / lr clobbered.
+          0xFF → 0x00 fine, CT change-detection still sees the transition);
+          r3 = &g_y1_avrcp_track_identifier (= 0xd2c4); r2 / r0 / r1 / lr
+          preserved (r2 via push/pop, r0/r1 untouched).
 
     Called from every TRACK_CHANGED rsp call site (T4 reactive emit,
     extended_T2 INTERIM ack, T5 proactive CHANGED emit) immediately before
     `blx PLT_track_changed_rsp`, replacing the old static `adr_w r3,
     selected_track_id` reference. The rsp builder consumes r3 as the
-    Identifier pointer and packs 8 bytes onto the wire.
+    Identifier pointer (packs 8 bytes onto the wire), r2 as reasonCode,
+    r1 as success-flag, r0 as conn ptr — so r2 MUST survive this call,
+    hence the push/pop.
 
     Wire bytes: `00 00 00 00 00 00 00 NN` where NN increments per emit
     (counter at 0xd2cb). Matches Pixel-4-as-TG-in-1.3-mode's monotonic-
@@ -1993,9 +1997,11 @@ def _emit_incr_track_identifier_subroutine(a: Asm) -> None:
     Counter resets to 0 on every CT GetCapabilities CMD (via
     clear_event_database's extended 24-byte clear range).
 
-    14 B code + 2 B align + 4 B literal = 20 B total.
+    18 B code + 2 B align + 4 B literal = 24 B total.
     """
     a.label("incr_and_get_track_identifier")
+    # push {r2} (T1 PUSH: 1011 010 R imm8; R=0 for plain push, imm8=bitmap r0..r7)
+    a.raw(bytes([0x04, 0xB4]))                # push {r2} (bitmap 0x04 = r2 only)
     a.ldr_lit_w(3, "incr_and_get_track_identifier_lit")
     a.label("incr_and_get_track_identifier_add_pc")
     a.add_reg(3, 15)                          # add r3, pc → r3 = absolute buf vaddr
@@ -2007,6 +2013,8 @@ def _emit_incr_track_identifier_subroutine(a: Asm) -> None:
     # strb r2, [r3, #7] (T1 STRB imm5)
     hw = 0x7000 | (7 << 6) | (3 << 3) | 2
     a.raw(bytes([hw & 0xFF, (hw >> 8) & 0xFF]))
+    # pop {r2} (T1 POP: 1011 110 R imm8; R=0, imm8=bitmap r0..r7)
+    a.raw(bytes([0x04, 0xBC]))                # pop {r2}
     a.bx(14)                                  # bx lr
     a.align(4)
     a.label("incr_and_get_track_identifier_lit")
