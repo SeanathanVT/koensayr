@@ -207,13 +207,13 @@ T2 stub at `0x72d0` (8 bytes) overwrites `classInitNative` with `movs r0, #0; bx
 
 1. Read `y1-track-info[0..7]` (track_id) into a stack buffer.
 2. Write `[track_id || transId || pad]` to `y1-trampoline-state` so T4 can detect track-id edges later.
-3. Reply INTERIM via `reg_notievent_track_changed_rsp` (PLT `0x3384`) with `r1=0` (success), `r2=REASON_INTERIM` (`0x0f`), `r3=&audio_id` (per-track BE u64 from `y1-track-info[0..7]`).
+3. Reply INTERIM via `reg_notievent_track_changed_rsp` (PLT `0x3384`) with `r1=0` (success), `r2=REASON_INTERIM` (`0x0f`), `r3=&selected_track_id` (8 zero bytes per AVRCP 1.3 §6.7.2).
 
 Other PDU / event combos fall through to T4 (PDU 0x20 → main, 0x17 → T_charset, 0x18 → T_battery, 0x30 → T6, 0x40 / 0x41 → T_continuation, 0x31+event≠0x02 → T8) before hitting the original "unknow indication" path.
 
-`r1=0` matters: response builders dispatch on r1 — `r1==0` writes the spec-correct event payload (reasonCode + event_id + 8-byte track_id memcpy per AVRCP 1.3 §5.4.2 Table 5.30); `r1!=0` writes a reject-shape frame. We pass `r1=0` everywhere.
+`r1=0` matters: response builders dispatch on r1 — `r1==0` writes the spec-correct event payload (reasonCode + event_id + 8-byte Identifier memcpy per AVRCP 1.3 §5.4.2 Table 5.30); `r1!=0` writes a reject-shape frame. We pass `r1=0` everywhere.
 
-**Track_id payload** = the per-track audio_id (BE u64) read from `y1-track-info[0..7]`. Strict 1.4+ CTs cache `GetElementAttributes` keyed by the TRACK_CHANGED Identifier; an unchanging value (e.g. `0x0000000000000000` SELECTED) means the CT dedups every re-query after the first one and the metadata pane stays stale on track skip. A per-track id forces cache invalidation + re-query on every track edge. `y1-trampoline-state[0..7]` holds the previous audio_id so T4 / T5 detect real-id edges before emitting CHANGED.
+**Identifier payload** = 8 zero bytes (`selected_track_id` const in the trampoline data section) per AVRCP 1.3 §6.7.2: "For TG conforming to AVRCP 1.3, the Identifier shall always be set to 0x00...00." Non-zero values are a 1.4+ Browseable Player UID extension; strict 1.3 parsers silently drop CHANGED carrying non-zero Identifier and fall back to polling-only metadata refresh (observed as ~22 s lag instead of <1 s on the strict-1.3 CTs in our matrix). `y1-trampoline-state[0..7]` still holds the previous audio_id so T4 / T5 can detect real-id edges before emitting CHANGED — only the wire payload is constrained to spec.
 
 ### T4 — GetElementAttributes (PDU 0x20)
 
@@ -253,7 +253,7 @@ T5 obtains the AVRCP per-conn struct via JNI helper at `0x36c0` (the same helper
 1. `reg_notievent_now_playing_content_rsp` (PLT `0x330c`, event 0x09) with `r1=0`, `r2=REASON_CHANGED` (`0x0d`). Gated on `state[20]` (sub_now_playing_content); T8 rejects ev=09 with NOT_IMPLEMENTED so the gate is never armed and this branch never executes — kept for code structure only.
 2. `reg_notievent_pos_changed_rsp` (PLT `0x3360`, event 0x05 — Tbl 5.33) with `r1=0`, `r2=REASON_CHANGED`, `r3=REV(file[780..783])` (current position in host order — `duration_ms` on natural end, `0` on NEXT / PREV). Gated on `state[13]` (sub_pos, armed by T8 0x05 INTERIM).
 3. `reg_notievent_reached_end_rsp` (PLT `0x3378`, event 0x03 — Tbl 5.31) **only when** `y1-track-info[793]` (the `previous_track_natural_end` flag set by `PlaybackStateBridge.onCompletion`) `== 1` AND `state[17]` (sub_track_reached_end, armed by T8 0x03 INTERIM). Strict spec semantic: TRACK_REACHED_END fires on natural end, not on a skip.
-4. `reg_notievent_track_changed_rsp` (PLT `0x3384`, event 0x02 — Tbl 5.30) with `r1=0`, `r2=REASON_CHANGED`, `r3=&audio_id` (per-track BE u64 from `y1-track-info[0..7]`). Gated on `state[16]` (sub_track_changed, armed by extended_T2's INTERIM emit).
+4. `reg_notievent_track_changed_rsp` (PLT `0x3384`, event 0x02 — Tbl 5.30) with `r1=0`, `r2=REASON_CHANGED`, `r3=&selected_track_id` (8 zero bytes per §6.7.2). Gated on `state[16]` (sub_track_changed, armed by extended_T2's INTERIM emit).
 5. `reg_notievent_reached_start_rsp` (PLT `0x336c`, event 0x04 — Tbl 5.32) with `r1=0`, `r2=REASON_CHANGED`. Gated on `state[18]` (sub_track_reached_start, armed by T8 0x04 INTERIM).
 
 Then writes the new track_id back to state and returns `jboolean(1)`.
@@ -671,7 +671,7 @@ Tail with `adb logcat -s Y1Patch:*` to observe the metadata pipeline live; pipe 
 |---|---|---|
 | `T8reg ev=%02x` | `_emit_t8` entry | inbound `RegisterNotification` `event_id` for the dispatch in T8 (events 0x01 / 0x03..0x0C). Counts CT subscription requests per event. |
 | `T2reg ev=%02x` | `_emit_extended_t2` `ext2_track_changed` entry | inbound `RegisterNotification` `event_id` for the TRACK_CHANGED-handling arm in extended_T2 (event 0x02 only — distinct from T8). Surfaces whether a CT is actually subscribing to TRACK_CHANGED, which determines whether the downstream T5 CHANGED-emit gate (`state[16]`) gets armed. |
-| `T5emit aid=%08x` | `t5_track_changed` before `track_changed_rsp` | high 32 bits of the `y1-track-info[0..7]` audio_id about to be sent in `TRACK_CHANGED` CHANGED. |
+| `T5emit aid=%08x` | `t5_track_changed` before `track_changed_rsp` | low 32 bits of the internal `y1-track-info[0..7]` audio_id (the wire Identifier itself is `0x00*8` per §6.7.2; this log is for grep correlation with the music app's `fL.id` Y1Patch lines). |
 | `T9emit pstat=%u` | `t9_play_status_changed` before `reg_notievent_playback_rsp` | `play_status` byte (0=STOPPED, 1=PLAYING, 2=PAUSED) about to be sent in PLAYBACK_STATUS_CHANGED CHANGED. |
 | `T9tid c17=%02x` | `t9_play_status_changed` immediately after `T9emit pstat` | byte at `conn[+17]` — the JNI response builder's TID source. Paired with `M5wire c39` to verify M5 TID-echo end-to-end (Trace #59 followup). |
 | `T9emit pos=%u` | `t9_pos_changed` before `reg_notievent_pos_changed_rsp` | live-extrapolated position in milliseconds about to be sent in PLAYBACK_POS_CHANGED CHANGED. |

@@ -752,11 +752,11 @@ Stock md5s and patcher-output md5s are baked into the patcher headers; check the
 
 The JNI trampoline blob is built dynamically by `src/patches/_trampolines.py` using a tiny Thumb-2 assembler in `src/patches/_thumb2asm.py`. Both files are imported by `patch_libextavrcp_jni.py` at run time. Self-tests in `_thumb2asm.py` verify several encodings against known-good byte sequences (b.w, blx, addw, movw, ldrb.w, add immediate T3).
 
-**Wire-level `track_id` choice.**
+**Wire-level `Identifier` choice.**
 
-The wire-level `Identifier` field in TRACK_CHANGED notifications carries the per-track audio_id (BE u64, read from `y1-track-info[0..7]`). Strict 1.4+ CTs cache `GetElementAttributes` responses keyed by the TRACK_CHANGED Identifier; an unchanging value (e.g. the `0x0000000000000000` SELECTED sentinel) means the cache stays warm after the first response and the CT dedups every subsequent re-query, leading to a stale metadata pane on track skip. Per-track audio_id forces cache invalidation + re-query on every track edge. `y1-trampoline-state[0..7]` holds the previous audio_id so T4 / T5 can edge-detect on real-id transitions before emitting CHANGED. Under the proactive emit pattern (T5 / T9 fire on file-edge, not on poll) the per-track-id approach produces ~1 CHANGED per actual track edge, well below historical subscribe-storm thresholds.
+The wire-level `Identifier` field in TRACK_CHANGED INTERIM / CHANGED notifications is 8 zero bytes per AVRCP 1.3 §6.7.2: "For TG conforming to AVRCP 1.3, the Identifier shall always be set to 0x00...00." Non-zero values (a per-track UID, for example) are an AVRCP 1.4+ Browseable Player extension; strict 1.3 parsers silently drop CHANGED carrying a non-zero Identifier and revert to polling-only metadata refresh, producing a ~22 s lag between TRACK_CHANGED CHANGED on the wire and the CT's next GetElementAttributes (vs <1 s for permissive parsers on the same build). Backed by a single static const (`selected_track_id`) in the trampoline data section, referenced from all three emit sites: T4 reactive CHANGED, extended_T2 INTERIM, T5 proactive CHANGED.
 
-Per-track CHANGED edge information is delivered by T4 / T5 detecting divergence between `y1-track-info[0..7]` and `y1-trampoline-state[0..7]`. The state file at `y1-trampoline-state[0..7]` holds the synthetic audioId derived in `TrackInfoWriter.syntheticAudioId` (= `(path.hashCode() & 0xFFFFFFFFL) | 0x100000000L`).
+Per-track CHANGED edge information is delivered by T4 / T5 detecting divergence between `y1-track-info[0..7]` and `y1-trampoline-state[0..7]`. Both buffers still hold the per-track audio_id — only the wire payload is constrained to spec. The state file's audio_id is the synthetic value derived in `TrackInfoWriter.syntheticAudioId` (= `(path.hashCode() & 0xFFFFFFFFL) | 0x100000000L`).
 
 See [`INVESTIGATION.md`](INVESTIGATION.md) "Hardware test history per CT" for the empirical observations that drove this design choice.
 

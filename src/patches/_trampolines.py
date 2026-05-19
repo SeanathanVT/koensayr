@@ -432,16 +432,19 @@ def _emit_t4(a: Asm) -> None:
     a.beq("t4_no_change")
 
     a.label("t4_track_changed")
-    # track_changed_rsp(conn, 0, REASON_CHANGED, &audio_id_BE)
+    # track_changed_rsp(conn, 0, REASON_CHANGED, &selected_track_id)
     # r1=0 takes the response builder's spec-correct path; r1!=0 hits the
-    # reject-shape path that omits the event payload (see extended_T2's
-    # matching comment). track_id = y1-track-info[0..7] (audio_id BE u64).
-    # Strict 1.4+ CTs cache GetElementAttributes keyed by Identifier; a
-    # per-track id forces refresh on every track edge.
+    # reject-shape path that omits the event payload. r3 → 8 zero bytes per
+    # AVRCP 1.3 §6.7.2: "For TG conforming to AVRCP 1.3, the Identifier
+    # shall always be set to 0x00...00." (Non-zero is a 1.4+ Browseable
+    # Player UID; strict 1.3 parsers silently drop CHANGED with non-zero
+    # Identifier and fall back to polling.) state[0..7] still tracks
+    # audio_id for trampoline-side edge detection — only the wire payload
+    # is constrained to spec.
     a.add_imm_t3(0, 5, 8)                     # r0 = conn
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_CHANGED)
-    a.add_sp_imm(3, T4_OFF_FILE_TID)          # r3 = &file[0..7] = audio_id BE u64
+    a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
     a.blx_imm(PLT_track_changed_rsp)
 
     # Update state in-memory: state[0..7] = file[0..7]
@@ -743,18 +746,16 @@ def _emit_extended_t2(a: Asm) -> None:
     # ---- reply track_changed_rsp INTERIM ----
     # r1=0 takes the spec-correct path. Disassembly of the response builder
     # at libextavrcp.so:0x2458 shows `cbnz r5, reject_path` on r1; r1==0 is
-    # the spec-correct path that emits reasonCode + event_id + track_id;
+    # the spec-correct path that emits reasonCode + event_id + identifier;
     # r1!=0 writes a reject-shape frame that omits the event payload.
     # transId is auto-extracted from conn[17] regardless.
-    # track_id = audio_id from y1-track-info[0..7] (BE u64; helper memcpy's
-    # raw 8 bytes to wire, which is also BE per AVRCP §5.4.2 Tbl 5.30).
-    # Strict 1.4+ CTs cache GetElementAttributes keyed by the TRACK_CHANGED
-    # Identifier; a per-track id forces cache invalidation + re-query on
-    # every track edge.
+    # r3 → 8 zero bytes per AVRCP 1.3 §6.7.2: 1.3 TGs shall emit
+    # Identifier=0x00...00 ("selected track"). Non-zero values are a 1.4+
+    # Browseable Player UID extension; strict 1.3 parsers reject those.
     a.add_imm_t3(0, 5, 8)                     # r0 = conn
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_INTERIM)
-    a.add_sp_imm(3, T2_OFF_TID)               # r3 = &sp[0] = audio_id (BE u64)
+    a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
     a.blx_imm(PLT_track_changed_rsp)
 
     # Arm sub_track_changed (event 0x02) per AVRCP §6.7.1. T5 emits CHANGED
@@ -927,11 +928,11 @@ def _emit_t5(a: Asm) -> None:
     a.label("t5_skip_reached_end")
 
     # ---- emit TRACK_CHANGED (event 0x02) — gated on subscription ----
-    # AVRCP 1.3 §5.4.2 Table 5.30. ICS Table 7 row 24 (Mandatory wire-level).
-    # r1=0 takes the response builder's spec-correct payload path; track_id
-    # = y1-track-info[0..7] (audio_id BE u64). Strict 1.4+ CTs cache
-    # GetElementAttributes keyed by Identifier; a per-track id forces
-    # refresh on every track edge.
+    # AVRCP 1.3 §5.4.2 Table 5.30 + §6.7.2: 1.3 TGs shall emit
+    # Identifier=0x00...00 ("selected track"). Non-zero values are a 1.4+
+    # Browseable Player UID extension; strict 1.3 parsers silently drop
+    # CHANGED with non-zero Identifier and fall back to polling-only
+    # metadata refresh. ICS Table 7 row 24 (Mandatory wire-level).
     # sub_track_changed bit at state[16] (cleared after emit per §6.7.1).
     a.ldrb_w(0, 13, T5_OFF_STATE + 16)
     a.cmp_imm8(0, 0)
@@ -940,14 +941,14 @@ def _emit_t5(a: Asm) -> None:
     a.add_imm_t3(0, 4, 8)                     # r0 = r4 + 8 (conn)
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_CHANGED)
-    a.add_sp_imm(3, T5_OFF_FILE_TID)          # r3 = &file[0..7] = audio_id BE u64
+    a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§6.7.2 strict 1.3)
     if DEBUG_NATIVE_LOG:
-        # Log the low 32 bits of the internal audio_id (file[4..7] BE → host)
-        # for grep-able correlation with the music app's fL.id debug lines,
-        # even though the wire-side Identifier is SELECTED 0x00*8. r6 is
-        # unused elsewhere in T5 body, callee-saved across the log blx.
+        # Log low 32 bits of internal audio_id (file[4..7] BE → host) for
+        # grep correlation with the music app's fL.id debug lines, even
+        # though the wire-side Identifier is SELECTED 0x00*8. r6 is unused
+        # elsewhere in T5 body, callee-saved across the log blx.
         # _emit_native_log_u32 push/pops r0..r3 internally so the emit args
-        # set up just above (r0=conn, r1=0, r2=REASON_CHANGED, r3=&selected)
+        # set up just above (r0=conn, r1=0, r2=REASON_CHANGED, r3=&zero)
         # all survive the call.
         a.ldr_sp_imm(6, T5_OFF_FILE_TID + 4)
         a.rev_lo_lo(6, 6)
@@ -2621,6 +2622,13 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     a.align(4)
     a.label("path_papp_set")
     a.asciiz("/data/data/com.innioasis.y1/files/y1-papp-set")
+    a.align(4)
+
+    # AVRCP 1.3 §6.7.2 TRACK_CHANGED Identifier: 8 zero bytes = "selected
+    # track" semantic. Referenced by all three track_changed_rsp emit sites
+    # (T4 reactive, extended_T2 INTERIM, T5 proactive CHANGED).
+    a.label("selected_track_id")
+    a.raw(bytes(8))
     a.align(4)
 
     # PApp data tables (PDU 0x11..0x16). All AVRCP 1.3 §5.2 spec values.

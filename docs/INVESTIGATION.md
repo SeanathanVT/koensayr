@@ -5107,5 +5107,53 @@ The `_emit_subscription_write(a, 1, 20, ...)` previously in `t8_check_9` (armed 
 - `patch_libextavrcp_jni.py`: OUTPUT_MD5 `d803f42c` → `637e2f18d7947511c0ab0d4a78ea7003`. OUTPUT_DEBUG_MD5 `4995ca17` → `bbec7d68b70ca7973d1e2a14b8dd5fd2`.
 - New `REASON_NOT_IMPLEMENTED = 0x08` constant in `_trampolines.py` alongside `REASON_INTERIM` / `REASON_CHANGED`.
 
+## Trace #62 (2026-05-19) — TRACK_CHANGED Identifier: audio_id BE u64 → 0x00*8 per AVRCP 1.3 §6.7.2 (Bolt's polling-only lag closed)
+
+### Cross-CT latency table — T5emit → next T4a
+
+After Step 1+2 + the T2reg debug log (commit `76bd5ed`), per-CT response time from `T5emit` (TRACK_CHANGED CHANGED on the wire) to the CT's next `T4a=00010xxx` (first attribute of the GEA response for the new track) across all four CTs in `dual-*-20260518-{1811,1814,1907,1940}`:
+
+| CT | T5emit → next T4a | Status |
+|---|---|---|
+| TV   | 110 ms | interrupt-driven ✅ |
+| Kia  | 1020 ms | interrupt-driven ✅ |
+| Sonos | 17–29 ms | interrupt-driven ✅ |
+| Bolt | **22,046 ms** | **polling-driven ❌** |
+
+Bolt's gap was structural — every prior Bolt session in `/work/logs/dual-bolt-*` showed the same 20–30 s lag between `T5emit` and the next GEA query, consistent with Bolt's RegisterNotification re-subscribe cadence of ~3 s and GEA refresh cadence of ~21 s (Bolt's "safety polling" timer, independent of CHANGED notifications on the wire).
+
+The `T2reg ev=02` log added in commit `76bd5ed` confirmed Bolt **does** receive each CHANGED — Bolt re-subscribes within 1 s of `T5emit`. So the AVCTP transaction completes successfully; what fails is Bolt's metadata-refresh trigger. That points to packet-payload semantics, not transport.
+
+### Root cause: §6.7.2 Identifier divergence (long-pending fix from Trace #41-ish hypothesis)
+
+The wire-level `Identifier` field in `TRACK_CHANGED` carries 8 bytes. AVRCP 1.3 §6.7.2 mandates:
+
+> "For TG conforming to AVRCP 1.3, the Identifier shall always be set to 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00."
+
+The trampoline was emitting the per-track audio_id (BE u64 from `y1-track-info[0..7]`) at all three emit sites — a Trace #32-era optimization premised on "Strict 1.4+ CTs cache `GetElementAttributes` keyed by Identifier; a per-track id forces refresh." That premise is a 1.4+ Browseable Player extension, not a 1.3 contract. Per-frame evidence across the four CTs falsifies it: TV / Kia / Sonos all re-query GEA within 1 s of CHANGED regardless of Identifier value (their parsers ignore it). Bolt, being strict-1.3, silently drops CHANGED carrying non-zero Identifier and falls back to polling.
+
+This hypothesis was documented in the older "Strongest remaining hypothesis: TRACK_CHANGED Identifier divergence" section earlier in this file (Trace #41-ish era) and marked as the "Best first move (low-cost, low-risk)" follow-up, but never executed — superseded at the time by M5 / M6 / Step 2 work. With those landed, this fix becomes the natural next move.
+
+### Patch
+
+`_trampolines.py`:
+
+- New 8-byte data const `selected_track_id` in the data section after `path_papp_set`. Referenced by all three `track_changed_rsp` emit sites.
+- T4 reactive CHANGED (line 444): `add_sp_imm(3, T4_OFF_FILE_TID)` → `adr_w(3, "selected_track_id")`.
+- extended_T2 INTERIM (line 757): `add_sp_imm(3, T2_OFF_TID)` → `adr_w(3, "selected_track_id")`.
+- T5 proactive CHANGED (line 943): `add_sp_imm(3, T5_OFF_FILE_TID)` → `adr_w(3, "selected_track_id")`.
+
+Each instruction site grows by 2 bytes (T1 ADD-SP-imm = 2 B → T3 ADR.W = 4 B); the new const is 8 B + 4 B align. Net trampoline-blob growth: +14 B, well within the LOAD #1 padding budget.
+
+`state[0..7]` and `file[0..7]` still carry the per-track audio_id for trampoline-internal edge detection — only the wire payload changes.
+
+### Patcher state
+
+- `patch_libextavrcp_jni.py`: OUTPUT_MD5 `637e2f18` → `5d1e0fcf1b4049fcc4c96dc0e8077acf`. OUTPUT_DEBUG_MD5 `b1ab1ca5` → `8c427734bcb7887bc4a38fbd006726cd`.
+- `patch_mtkbt.py`: unchanged.
+
+### Verification plan
+
+Post-flash capture from Bolt expected to show `T5emit aid=…` → `T4a=00010xxx` delta < 1 s (parity with TV / Kia / Sonos). If the delta is still > 5 s, the §6.7.2 hypothesis is wrong and we revisit — likely candidates: PLAYBACK_STATUS_CHANGED-as-refresh-trigger (Bolt fetched Track 1 GEA 2.8 s after `T9emit pstat=2`), or AVCTP framing differences. TV / Kia / Sonos expected byte-identical refresh behaviour to current build (their parsers ignore Identifier).
 
 
