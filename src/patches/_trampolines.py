@@ -28,6 +28,7 @@ PLT_memset                     = 0x33fc
 PLT_write                      = 0x3630
 # Resolved via liblog.so DT_NEEDED. Only emitted under build(debug=True).
 PLT_android_log_print          = 0x3300
+PLT_get_capabilities_rsp       = 0x35dc
 PLT_get_element_attributes_rsp = 0x3570
 PLT_track_changed_rsp          = 0x3384
 # Inform PDUs (CT→TG informational acks).
@@ -285,6 +286,64 @@ SEEK_SET = 0
 CLOCK_BOOTTIME = 7
 
 # ---------------------------------------------------------------- builder
+
+# Advertised AVRCP event IDs (per AVRCP 1.3 §5.4.2 + 1.4 NCC/UIDS/etc.):
+#   0x01 PLAYBACK_STATUS, 0x02 TRACK_CHANGED, 0x05 PLAYBACK_POS,
+#   0x08 PLAYER_APPLICATION_SETTING_CHANGED, 0x09 NCC, 0x0a AVAILABLE_PLAYERS,
+#   0x0b ADDRESSED_PLAYER, 0x0c UIDS — 8 events total, all INTERIM-acked.
+T1_ADVERTISED_EVENTS = bytes([0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c])
+
+
+def _emit_t1_extended(a: Asm) -> None:
+    """T1_extended: GetCapabilities trampoline body, relocated from the
+    in-JNI testparmnum slot at 0x7308.
+
+    The in-JNI slot is now a thin 4-byte `b.w T1_extended` bridge. Moving
+    the body here frees us from the 40-byte testparmnum budget and lets us
+    splice in a `clear_event_database` call at the GetCapabilities entry
+    — without that clear, the .bss-backed per-event subscription gates
+    leak across CT disconnect/reconnect (the com.android.bluetooth
+    process stays alive, so .bss survives CT churn). GetCapabilities is
+    the canonical first CMD on every CT→TG connection per AVRCP 1.3
+    §5.4.1 setup flow, so clearing the database here is a reliable
+    "fresh session" signal.
+
+    Entry: r0 = PDU (set by stock dispatcher); r5 = avrcp_state ptr (conn
+    at r5+8). Falls through to extended_T2 via b.w for non-GetCaps PDUs.
+    """
+    a.label("T1_extended")
+
+    # Re-read PDU from sp+382 (caller's stack frame; same offset T4 uses).
+    a.ldrb_w(0, 13, 382)
+    a.cmp_imm8(0, 0x10)
+    a.bne("t1ext_not_getcaps")
+
+    # GetCapabilities path. Clear the per-event database first so any
+    # subscriptions cached from a previous CT connection don't gate-pass
+    # T5/T9 emits in this fresh session.
+    a.bl_w("clear_event_database")
+
+    # btmtk_avrcp_send_get_capabilities_rsp(conn, 0, count, *events_array)
+    a.add_imm_t3(0, 5, 8)                     # r0 = conn (= r5 + 8)
+    a.movs_imm8(1, 0)                         # r1 = 0 (success)
+    a.movs_imm8(2, len(T1_ADVERTISED_EVENTS)) # r2 = 8
+    a.adr_w(3, "t1_events_table")             # r3 = &events_table
+    a.blx_imm(PLT_get_capabilities_rsp)
+
+    # Jump back to the stock dispatcher's response-epilogue.
+    a.labels["t1ext_epilogue_target"] = EPILOGUE
+    a.b_w("t1ext_epilogue_target")
+
+    a.label("t1ext_not_getcaps")
+    # Non-GetCapabilities PDUs fall through to extended_T2 for further
+    # dispatch (RegisterNotification / GetElementAttributes / etc.).
+    a.b_w("extended_T2")
+
+    a.align(4)
+    a.label("t1_events_table")
+    a.raw(T1_ADVERTISED_EVENTS)
+    a.align(4)
+
 
 def _emit_t4(a: Asm) -> None:
     """T4: GetElementAttributes handler at 0xac54.
@@ -1854,6 +1913,47 @@ def _emit_save_event_seq_id_subroutine(a: Asm) -> None:
     a._fixup(_emit_lit, 4)
 
 
+def _emit_clear_event_database_subroutine(a: Asm) -> None:
+    """Emit the shared clear_event_database subroutine.
+
+    Pre: (none)
+    Post: g_avrcp_req_event_database[0..14] = 0; r0 / r1 / r2 / r3 / lr clobbered.
+
+    Called from T1_extended whenever the CT issues a fresh GetCapabilities
+    request — by the AVRCP 1.3 §5.4.1 connection-setup flow, that's the
+    first CMD on every new CT→TG connection. Clearing the database here
+    means subscriptions from a previous CT session can't leak forward
+    into the new connection's session-scope gate (database[event_id] != 0).
+
+    .bss being zeroed on process restart handles the cross-process case;
+    this subroutine handles the within-process CT disconnect/reconnect
+    case (com.android.bluetooth stays alive across CT churn, so .bss
+    persists).
+
+    14 B code + 2 B align + 4 B literal = 20 B total.
+    """
+    a.label("clear_event_database")
+    a.ldr_lit_w(2, "clear_event_database_lit")
+    a.label("clear_event_database_add_pc")
+    a.add_reg(2, 15)                          # add r2, pc → r2 = absolute db vaddr
+    a.movs_imm8(0, 0)                         # r0 = 0
+    # Database is 15 bytes (0xd2b5..0xd2c3). Write four u32 zeros to clear
+    # 16 bytes — the trailing byte at 0xd2c4 is .bss padding before
+    # g_avrcp_auto_browse_connect at 0xd2d5, safe to overwrite (already zero).
+    # str (immediate) T1: 0110 0 imm5 Rn Rt — encoded inline.
+    for word_off in (0, 4, 8, 12):
+        imm5 = word_off >> 2
+        hw = 0x6000 | (imm5 << 6) | (2 << 3) | 0
+        a.raw(bytes([hw & 0xFF, (hw >> 8) & 0xFF]))
+    a.bx(14)                                  # bx lr
+    a.align(4)
+    a.label("clear_event_database_lit")
+    def _emit_lit(_pc: int) -> bytes:
+        offset = G_AVRCP_REQ_EVENT_DATABASE_VADDR - (a.labels["clear_event_database_add_pc"] + 4)
+        return (offset & 0xFFFFFFFF).to_bytes(4, "little")
+    a._fixup(_emit_lit, 4)
+
+
 def _emit_event_subscribed_subroutine(a: Asm) -> None:
     """Emit the shared event_subscribed subroutine.
 
@@ -2677,6 +2777,7 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     a.labels["t4_to_epilogue"] = EPILOGUE
     a.labels["jni_get_avrcp_state"] = JNI_GET_AVRCP_STATE
 
+    _emit_t1_extended(a)
     _emit_t4(a)
     _emit_extended_t2(a)
     _emit_t5(a)
@@ -2698,6 +2799,7 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     _emit_restore_conn_tid_subroutine(a)
     _emit_save_event_seq_id_subroutine(a)
     _emit_event_subscribed_subroutine(a)
+    _emit_clear_event_database_subroutine(a)
 
     # Path strings, 4-byte-aligned for clean ADR offsets.
     a.align(4)

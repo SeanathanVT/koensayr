@@ -41,36 +41,33 @@ NATIVE_TRACK_CHANGED_VADDR = 0x3bc0
 NATIVE_PLAY_STATUS_CHANGED_VADDR = 0x3c88
 
 STOCK_MD5         = "fd2ce74db9389980b55bccf3d8f15660"
-OUTPUT_MD5        = "a8c12aa635b3848dda5b233ede6d3375"
+OUTPUT_MD5        = "e958c85f9c39cf6356dc083f53905844"
 
 # --debug: splices __android_log_print calls into T5/T6/T8/T9 emit sites
 # (tag "Y1T"). Release builds remain byte-identical without the env var.
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "36efa993086e9b4e5c3ed34b55de8a8f"
+OUTPUT_DEBUG_MD5  = "15d3eb1b852057b3c52a1a4fa1b2903b"
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
 # ---------------------------------------------------------------- T1
 
 # T1 — GetCapabilities trampoline at 0x7308 (overwrites testparmnum, 40 of
-# 48 bytes). Advertised set: 0x01 PLAYBACK_STATUS, 0x02 TRACK_CHANGED,
-# 0x05 PLAYBACK_POS, 0x08 PLAYER_APPLICATION_SETTING_CHANGED, plus 1.4
-# IDs 0x09..0x0c (T8 INTERIM-only, no CHANGED). Strict CTs gate their
-# metadata-pane render on the 1.4 IDs being acked even from a 1.3 TG.
-T1_TRAMPOLINE = bytes([
-    0x9D, 0xF8, 0x7E, 0x01,                  # ldrb.w r0, [sp, #382]
-    0x10, 0x28,                               # cmp r0, #0x10
-    0x0D, 0xD1,                               # bne.n 0x732c (bridge to T2)
-    0x04, 0xA3,                               # adr r3, 0x7324
-    0x05, 0xF1, 0x08, 0x00,                  # add.w r0, r5, #8
-    0x00, 0x21,                               # movs r1, #0
-    0x08, 0x22,                               # movs r2, #8   (events count = 8)
-    0xFC, 0xF7, 0x60, 0xE9,                  # blx 0x35dc (PLT: get_capabilities_rsp)
-    0xFF, 0xF7, 0x04, 0xBF,                  # b.w 0x712a (epilogue)
-    0x00, 0xBF,                               # nop
-    0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c,  # advertised events
-    0xFF, 0xF7, 0xD2, 0xBF,                  # b.w 0x72d4 (T2 stub)
-])
-assert len(T1_TRAMPOLINE) == 40
+# T1 is the testparmnum overlay at 0x7308; reduced to a 4-byte `b.w
+# T1_extended` bridge since the body now lives in the trampoline blob
+# (see `_emit_t1_extended` in `_trampolines.py`). The relocation gives
+# T1's GetCapabilities path room to bl clear_event_database — that call
+# resets the per-event subscription database on every fresh CT
+# connection, fixing ghost-arm leaks across CT disconnect/reconnect.
+# The remaining 36 bytes of the testparmnum slot are zero-padded
+# (never executed; reached only via the b.w bridge above which jumps
+# out to the trampoline blob).
+def _t1_bridge(t1_extended_vaddr: int) -> bytes:
+    a = Asm(0x7308)
+    a.labels["target"] = t1_extended_vaddr
+    a.b_w("target")
+    while len(a.buf) < 40:
+        a.buf.append(0x00)
+    return a.resolve()
 
 # Stock testparmnum first 40 bytes.
 TESTPARMNUM_STOCK = bytes([
@@ -173,6 +170,7 @@ def build_patches() -> tuple[list[dict], int]:
     """Build the patch list. Returns (patches, new_load1_size)."""
     blob, addrs = build_trampolines(debug=DEBUG_LOGGING)
     extended_t2_vaddr = addrs["extended_T2"]
+    t1_extended_vaddr = addrs["T1_extended"]
     t5_vaddr = addrs["T5"]
     t9_vaddr = addrs["T9"]
     new_load1_size = T4_VADDR + len(blob)
@@ -215,10 +213,13 @@ def build_patches() -> tuple[list[dict], int]:
             "after":  bytes([0x00, 0xBF, 0x00, 0xBF]),  # nop ; nop (Thumb-2)
         },
         {
-            "name": "T1: GetCapabilities trampoline (testparmnum) at 0x7308",
+            "name": (
+                f"T1: testparmnum → b.w T1_extended (0x{t1_extended_vaddr:x})"
+                f" bridge at 0x7308"
+            ),
             "offset": 0x7308,
             "before": TESTPARMNUM_STOCK,
-            "after":  T1_TRAMPOLINE,
+            "after":  _t1_bridge(t1_extended_vaddr),
         },
         {
             "name": (
