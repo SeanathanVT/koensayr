@@ -1903,6 +1903,13 @@ def _emit_save_event_seq_id_subroutine(a: Asm) -> None:
     CHANGEDs in fresh sessions where the CT hasn't actually subscribed,
     which strict-§3.3.5 CTs (Bolt) reject and disengage over.
 
+    Caller obligation: the `adds r1, #1` inside this subroutine SETS
+    flags. If the next instruction in the caller is a conditional
+    branch, that branch will test the adds-derived Z (= r1+1 == 0,
+    only true if inbound seq_id was 0xFF — basically never for a valid
+    seq_id). extended_T2 dodges this by doing a fresh `cmp r0, 0x02`
+    after the call, which overwrites the flags.
+
     14 B code + alignment + 4 B literal = 18 B total.
     """
     a.label("save_event_seq_id")
@@ -2039,6 +2046,12 @@ def _emit_event_subscribed_subroutine(a: Asm) -> None:
         bl   event_subscribed
         beq  skip_emit_label
         ... emit code (eventually bl restore_conn_tid + blx *_rsp) ...
+
+    CRITICAL invariant: the `beq` MUST be the very next instruction after
+    the `bl`. The subroutine's `cmp r0, 0` is what sets Z; `bx lr` preserves
+    it, but any intervening instruction that sets flags (movs, cmp, adds,
+    or a PLT blx with __android_log_print) will overwrite Z and the gate
+    fails open. Don't splice debug logs between the bl and the beq.
 
     12 B code + alignment + 4 B literal = 16 B total.
     """
