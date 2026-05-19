@@ -35,10 +35,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _thumb2asm import Asm
 
 STOCK_MD5         = "3af1d4ad8f955038186696950430ffda"
-OUTPUT_MD5        = "7493acdad352bc6d7f6d65fc3251e221"
+OUTPUT_MD5        = "9c4e462241169c3a181574db157c8df7"
 
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "d603e68a263d6a3e46e42f0959b681cf"
+OUTPUT_DEBUG_MD5  = "03da20024a8bc750f0c60ab4f828de2f"
 
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
@@ -50,10 +50,11 @@ EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 PLT_android_log_print = 0xaef8
 
 # LOAD #1 sizing. Stock filesz = 0xf366c (16 bytes before M5's cave end). M5
-# extends to 0xf3690. The DEBUG cave adds a TID-source wire-frame log past
-# that and the segment must be extended further to cover it.
+# extends to 0xf3698 (M5 cave is 24 bytes after the M7 unconditional-sync
+# extension). The DEBUG cave adds a TID-source wire-frame log past that and
+# the segment must be extended further to cover it.
 LOAD1_STOCK_END      = 0xf366c
-LOAD1_RELEASE_END    = 0xf3690
+LOAD1_RELEASE_END    = 0xf3698
 DEBUG_CAVE_VADDR     = 0xf36a0
 
 # 12-byte descriptor table entry: attrID:LE16, len:LE16, ptr:LE32, zeros:LE32
@@ -429,23 +430,54 @@ BASE_PATCHES = [
     },
     {
         # Cave content at vaddr 0xf3680 (file 0xf3680, since LOAD #1 has
-        # file_off == vaddr). 16 bytes:
+        # file_off == vaddr). 24 bytes:
         #   68 7b              ldrb r0, [r5, 0xd]       — original 1st insn
         #   2a 7a              ldrb r2, [r5, 8]          — discriminator load
         #   01 2a              cmp r2, 1                  — outbound = 1
-        #   01 d0              beq +2 (skip strb)
+        #   01 d0              beq +2 (skip inbound strb, fall into M7 sync)
         #   84 f8 29 00        strb.w r0, [r4, 0x29]      — original 2nd insn
-        #   79 f7 7e bd        b.w 0x6d18c                — return into Path B
-        "name":   "[M5-CAVE] TID echo trampoline blob @ 0xf3680 (16 bytes in LOAD #1 padding)",
+        #   94 f8 99 0b        ldrb.w r0, [r4, 0xb99]     — M7: load chan+0xba9 (inbound-RX TID stash)
+        #   84 f8 29 00        strb.w r0, [r4, 0x29]      — M7: sync chan+0x39 unconditionally
+        #   79 f7 7a bd        b.w 0x6d18c                — return into Path B
+        #
+        # M7 closes the gap where M5's discriminator (packet[+8] == 1) fails
+        # for the msg=544 RegNotif INTERIM/CHANGED IPC path — that path
+        # routes through libextavrcp.so::AVRCP_SendMessage → BT_SendMessage
+        # with an allocator that doesn't set packet[+8] = 1, so M5's strb
+        # fires with packet[+0xd] = 0 and clobbers chan+0x39 to TID=0. CTs
+        # that cycle AV/C TIDs across 0-15 (Bolt, observed empirically:
+        # mtkbt btlog `transId:N` with N ∈ {3,6,7,8,9,12,13} inbound while
+        # M5wire c39=00 on every outbound) then fail the AVCTP §3.3.5
+        # echo check on every RegNotif response and retry-storm. CTs that
+        # use TID=0 exclusively (Sonos/TV/Kia) match the clobbered value
+        # by coincidence and aren't affected.
+        #
+        # The new tail (offsets 0xf368c..0xf3693) loads the per-channel
+        # inbound-RX TID stash at chan+0xba9 (latched by fcn.0x11374:0x11436
+        # `strb.w sl, [r4, 0xba9]` on every inbound AV/C cmd) and forces
+        # chan+0x39 to mirror it. Runs unconditionally on both paths:
+        # - inbound (beq not taken): writes packet[+0xd] = TID, then re-
+        #   writes the same value from chan+0xba9. Idempotent.
+        # - outbound (beq taken): skips inbound strb, falls into M7 sync,
+        #   chan+0x39 = chan+0xba9 = latest inbound TID. Wire builder
+        #   fcn.0xae418 then emits the correct §3.3.5 echo TID regardless
+        #   of which IPC allocator originated the response packet.
+        #
+        # Why r4+0xb99 (and not +0xba9): in Path B r4 = chan+0x10, so the
+        # offset from r4 to chan+0xba9 is 0xba9 - 0x10 = 0xb99. Thumb-2
+        # ldrb.w T2 form (12-bit unsigned imm12) supports up to 0xfff.
+        "name":   "[M5-CAVE] TID echo trampoline blob @ 0xf3680 (24 bytes in LOAD #1 padding; includes M7 unconditional chan+0xba9 → chan+0x39 sync)",
         "offset": 0xf3680,
-        "before": bytes([0x00] * 16),
+        "before": bytes([0x00] * 24),
         "after":  bytes([
             0x68, 0x7b,                    # ldrb r0, [r5, 0xd]
             0x2a, 0x7a,                    # ldrb r2, [r5, 8]
             0x01, 0x2a,                    # cmp r2, 1
             0x01, 0xd0,                    # beq +2
             0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]
-            0x79, 0xf7, 0x7e, 0xbd,        # b.w 0x6d18c
+            0x94, 0xf8, 0x99, 0x0b,        # ldrb.w r0, [r4, 0xb99]   (chan+0xba9)
+            0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]    (sync chan+0x39)
+            0x79, 0xf7, 0x7a, 0xbd,        # b.w 0x6d18c
         ]),
     },
     # LOAD #1 filesz / memsz entries are emitted by build_patches() so the

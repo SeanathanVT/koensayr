@@ -150,33 +150,37 @@ M3 NOPs the SET (not the CHECK). After M3 the flag is never set, so `cbnz r3, 0x
 
 `fcn.0x6d0f0` is byte-for-byte structurally identical to M2's `fcn.0x6d048`: same `fcn.0x6ccdc` list-contains check at `0x6d110`, same INTERIM/CHANGED discriminator at `0x6d11e`, same drop target `movs r0, 0xd; pop {r3, r4, r5, pc}` at `0x6d19c`. Unlike Path A on busy A2DP-heavy CTs, Path B's list-contains check fails on most invocations, dropping the majority of `msg=544` emits before the wire frame is built. Subscription-class CTs that depend on RegNotif INTERIM responses (ev=01 / 05 / 08 / 0A) then retry-storm on the AVCTP V13 §3.3.5 3 s timer until they disengage AVRCP TG. M4 NOPs the analogous `beq 0x6d19c` at `0x6d116`, so `fcn.0x6d0f0` unconditionally builds the wire frame and tail-calls `b.w 0xae5e4` (`L2CAP_SendData`). `fcn.0x6d0f0` skips `fcn.0x6df20` entirely, so M3's chip-busy SET has no analogue on Path B.
 
-**M5 — TID echo trampoline: code-cave at `0xf3680`** (4 sites, 6 + 16 + 4 + 4 bytes):
+**M5 + M7 — TID echo trampoline: code-cave at `0xf3680`** (4 sites, 6 + 24 + 4 + 4 bytes):
 
 | | offset | before | after |
 |---|---|---|---|
 | call site | `0x6d186` | `68 7b 84 f8 29 00` (`ldrb r0, [r5, 0xd]; strb.w r0, [r4, 0x29]`) | `86 f0 7b ba 00 bf` (`b.w 0xf3680; nop`) |
-| cave blob | `0xf3680` | 16 × `00` (LOAD #1 page padding) | `68 7b 2a 7a 01 2a 01 d0 84 f8 29 00 79 f7 7e bd` (Thumb-2 conditional store + return) |
-| LOAD #1 filesz | `0x84` | `6c 36 0f 00` (`0xf366c`) | `90 36 0f 00` (`0xf3690`) |
-| LOAD #1 memsz | `0x88` | `6c 36 0f 00` (`0xf366c`) | `90 36 0f 00` (`0xf3690`) |
+| cave blob | `0xf3680` | 24 × `00` (LOAD #1 page padding) | `68 7b 2a 7a 01 2a 01 d0 84 f8 29 00 94 f8 99 0b 84 f8 29 00 79 f7 7a bd` (Thumb-2 M5 conditional store + M7 unconditional sync + return) |
+| LOAD #1 filesz | `0x84` | `6c 36 0f 00` (`0xf366c`) | `98 36 0f 00` (`0xf3698`) |
+| LOAD #1 memsz | `0x88` | `6c 36 0f 00` (`0xf366c`) | `98 36 0f 00` (`0xf3698`) |
 
-Path B at `0x6d186` writes `chan[+0x29]` from `packet[+0xd]`. The same site is reached from two callers: the INBOUND CMD chain (`fcn.0x11374 → fcn.0xed0a → Path B`), where `r5` points at the per-channel stash struct and `r5[+0xd]` is the inbound AV/C command's transId (latched by `fcn.0x11374:0x11436`); and the OUTBOUND RESPONSE chain (`fcn.0x11894 → fcn.0xf0bc → Path B`), where `r5` points at a freshly-allocated IPC packet and `packet[+0xd] = 0` unconditionally (`fcn.0x11894:0x11924-0x11927` writes `movs r6, 0; strb r6, [r4, 0xd]`). Unpatched Path B propagates the inbound transId on inbound calls but clobbers `chan[+0x29]` with 0 on outbound calls before the wire-frame builder `fcn.0xae418` reads it at `0xae448 ldrb r6, [r4, 0x15]`. Every Path B wire response then encodes byte 0 as `(0 << 4) + 4 + pkt[8]` per AVCTP V13 §6.1.1, i.e. transId=0 regardless of the originating command.
+Path B at `0x6d186` writes `chan[+0x29]` from `packet[+0xd]`. The same site is reached from two callers: the INBOUND CMD chain (`fcn.0x11374 → fcn.0xed0a → Path B`), where `r5` points at the per-channel stash struct and `r5[+0xd]` is the inbound AV/C command's transId (latched by `fcn.0x11374:0x11436 strb.w sl, [r4, 0xba9]`); and the OUTBOUND RESPONSE chain (`fcn.0x11894 → fcn.0xf0bc → Path B`), where `r5` points at a freshly-allocated IPC packet and `packet[+0xd] = 0` unconditionally (`fcn.0x11894:0x11924-0x11927` writes `movs r6, 0; strb r6, [r4, 0xd]`). Unpatched Path B propagates the inbound transId on inbound calls but clobbers `chan[+0x29]` with 0 on outbound calls before the wire-frame builder `fcn.0xae418` reads it at `0xae448 ldrb r6, [r4, 0x15]`. Every Path B wire response then encodes byte 0 as `(0 << 4) + 4 + pkt[8]` per AVCTP V13 §6.1.1, i.e. transId=0 regardless of the originating command.
 
 CTs that cycle AV/C transIds across the 0-15 range (`AVCTP §6.1` transaction-label rotation, observed via `[AVRCP] transId:%d` btlog entries) see all their RegNotif INTERIM / CHANGED responses with TID=0, fail the `AVCTP §6.5` command-response TID echo and `§6.7.2` subscription TID match, and retry-storm on the V13 §3.3.5 3 s AVCTP retry timer until they disengage AVRCP TG. CTs that use transId=0 exclusively (no rotation) match accidentally and work pre-M5.
 
-M5 places a conditional-store trampoline in the LOAD #1 page-padding region (same ELF-extension trick used by `patch_libextavrcp_jni.py` for its trampoline blob — extend the segment's filesz / memsz to claim previously-unmapped zero-padding bytes as R+E). The trampoline discriminates outbound vs inbound at the Path B strb site via `packet[+8]`: the allocator path writes `packet[8] = 1` unconditionally at `fcn.0x11894:0x11908`, while the inbound stash struct's `+8` is the low byte of a per-channel resolved address `ip + (chnl << 11)` (stored at `fcn.0x11374:0x11458`, where `ip` is the PC-relative resolution of the literal `0xeaba8` at `fcn.0x11374:0x1142c-0x1143e`; static resolution `0xfbfea`, runtime LSB constant `0xea`). The cave loads `packet[+8]`, compares to 1, and skips the strb on outbound while executing it on inbound. Outbound responses then read the most recent inbound-latched transId at `chan+0x39` via Path B's downstream `add.w r0, r4, 0x14; b.w fcn.0xae5e4 → fcn.0xae418`, and the wire frame echoes the correct §6.5 / §6.7.2 transId.
+The cave places a conditional-store trampoline in the LOAD #1 page-padding region (same ELF-extension trick used by `patch_libextavrcp_jni.py` for its trampoline blob — extend the segment's filesz / memsz to claim previously-unmapped zero-padding bytes as R+E). M5 discriminates outbound vs inbound at the Path B strb site via `packet[+8]`: the standard IPC allocator at `fcn.0x11894:0x11908` writes `packet[8] = 1` for outbound packets, while the inbound stash struct's `+8` is the low byte of a per-channel resolved address (`ip + (chnl << 11)`, runtime LSB constant `0xea`). M5 alone, however, fails for the `msg=544` RegNotif INTERIM/CHANGED IPC path — that path routes through `libextavrcp.so::AVRCP_SendMessage → BT_SendMessage(msg=0x220)` with an allocator that doesn't set `packet[+8] = 1`, so M5's strb fires with `packet[+0xd] = 0` and clobbers `chan+0x39` exactly as the unpatched code would. M7 adds an unconditional `chan+0xba9 → chan+0x39` sync after M5's conditional branch: regardless of which IPC allocator the response originated from, the wire builder reads the correct §3.3.5 TID echo from `chan+0xba9` (the per-channel inbound-RX stash slot latched by `fcn.0x11374:0x11436`).
 
-Cave disassembly (16 bytes at `0xf3680`):
+Cave disassembly (24 bytes at `0xf3680`):
 
 ```
-0xf3680  68 7b           ldrb r0, [r5, 0xd]        ; original 1st insn
-0xf3682  2a 7a           ldrb r2, [r5, 8]           ; discriminator: outbound=1, inbound=0xea+
-0xf3684  01 2a           cmp r2, 1
-0xf3686  01 d0           beq 0xf368c                ; skip strb on outbound
-0xf3688  84 f8 29 00     strb.w r0, [r4, 0x29]      ; original 2nd insn (inbound only)
-0xf368c  79 f7 7e bd     b.w 0x6d18c                ; return into Path B
+0xf3680  68 7b           ldrb r0, [r5, 0xd]        ; M5: original 1st insn (load packet[+0xd])
+0xf3682  2a 7a           ldrb r2, [r5, 8]           ; M5: discriminator load
+0xf3684  01 2a           cmp r2, 1                   ; M5: outbound = 1
+0xf3686  01 d0           beq 0xf368c                 ; M5: skip strb on outbound
+0xf3688  84 f8 29 00     strb.w r0, [r4, 0x29]      ; M5: original 2nd insn (inbound only)
+0xf368c  94 f8 99 0b     ldrb.w r0, [r4, 0xb99]     ; M7: load chan+0xba9 (inbound-RX TID stash)
+0xf3690  84 f8 29 00     strb.w r0, [r4, 0x29]      ; M7: sync chan+0x39 unconditionally
+0xf3694  79 f7 7a bd     b.w 0x6d18c                ; return into Path B
 ```
 
-LOAD #1 filesz / memsz expand from `0xf366c` to `0xf3690` (a 36-byte extension — the cave at `0xf3680` is 16 bytes; the 20 bytes of preceding zero-padding `0xf366c..0xf3680` are absorbed harmlessly into the extended segment). No section headers are modified; the kernel ELF loader maps segments by program headers exclusively.
+For inbound (`beq` not taken), M5 writes `packet[+0xd] = TID` to `chan+0x39`, then M7 re-writes the same value from `chan+0xba9` — idempotent. For outbound (`beq` taken), M5 preserves whatever was at `chan+0x39`, then M7 forces it to `chan+0xba9` (latest inbound TID). The wire builder at `fcn.0xae418:0xae448` then reads the correct TID via `ldrb r6, [r4, 0x15]` and emits `byte0 = (TID << 4) | …` per AVCTP V13 §6.1.1.
+
+LOAD #1 filesz / memsz expand from `0xf366c` to `0xf3698` (a 44-byte extension — the cave at `0xf3680` is 24 bytes; the 20 bytes of preceding zero-padding `0xf366c..0xf3680` are absorbed harmlessly). No section headers are modified; the kernel ELF loader maps segments by program headers exclusively.
 
 **MD5s:** Stock `3af1d4ad8f955038186696950430ffda` → Output `dc01a7c1337ad2dc6573819bdc22834d`.
 

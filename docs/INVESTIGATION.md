@@ -5235,3 +5235,67 @@ If `T8reg ev=09` is missing entirely, the M1+M6 dispatch isn't routing the INTER
 ### Sonos restart-loop verification
 
 The c85ed7b revert (806fb4b) restored Sonos boot. This re-land keeps release-build bytes structurally identical to 806fb4b plus the `_emit_subscription_write` expansion (50 bytes), well inside the 220-byte release headroom. No new LOAD #2 overlap risk.
+
+## Trace #66 (2026-05-19) — M5's coincident-match was masking a TID-echo gap; M7 lands
+
+### Discovery
+
+Post-252cd8a (Step 2 revert re-landed), the Sonos / TV / Bolt / Kia matrix gave a clean per-CT comparison:
+
+| CT | `T8reg ev=09` count | re-subscribe pattern | `M5wire c39` distribution |
+|---|---|---|---|
+| Sonos 2125 | 6× | re-subscribes within 11 ms of CHANGED | 100% TID=0 (36 frames) |
+| TV 2135    | 4× | re-subscribes within 15–200 ms      | 100% TID=0 (27 frames) |
+| Kia 2157   | 1× | one-shot subscription               | 100% TID=0 (134 frames) |
+| Bolt 2159  | 1× (then ev=0a retry-storm 10×, ev=01 retry-storm 10×, ev=05 retry-storm 12×, ev=08 retry-storm 8×) | retries every 3 s and gives up after ~10× | **87% TID=0, 13% non-zero** (1, 3, 4, 5, 6, 6, 7, 8, 8, 9, 9, c, d in 98 frames) |
+
+Bolt's per-event retry-storm is the AVCTP V13 §3.3.5 / §6.5 retry timer firing because the response TID didn't echo the inbound CMD TID. mtkbt btlog confirms inbound `transId:N` with N ∈ {3, 6, 7, 8, 9, 12, 13} during the same window; the outbound responses go with `M5wire c39=0` on every `T8reg ev=01` retry. Three other matrix CTs use TID=0 exclusively and accidentally match — the "M5 verified" claim from Trace #59 was a coincident-match artifact, not a real verification (the falsifying evidence is the cycling-TID CT, per `feedback_verify_before_inferring.md`).
+
+### Why M5 specifically fails for RegNotif responses
+
+`libextavrcp.so::AVRCP_SendMessage` (called from every `btmtk_avrcp_send_reg_notievent_*_rsp` helper) passes `msg_id = 0x220` (= 544) to `BT_SendMessage`. The msg=544 path's IPC allocator does *not* set `packet[+8] = 1` the way `fcn.0x11894:0x11908` does for "normal" outbound packets. M5's discriminator (`cmp r2, 1; beq skip`) misclassifies the msg=544 packet as inbound, fires the original `strb.w r0, [r4, 0x29]`, and writes `packet[+0xd] = 0` (allocator-zeroed) to `chan+0x39`. The wire builder at `fcn.0xae418:0xae448` reads `chan+0x39` and emits AVCTP byte 0 with TID nibble = 0.
+
+Other AV/C response paths (GetCapabilities / GetPlayStatus / GetElementAttributes / PASSTHROUGH) route through different msg IDs whose allocators do set `packet[+8] = 1`, so M5's discriminator works correctly for them. This is why the Bolt 2159 capture shows non-zero `c39` values clustered outside the RegNotif response windows.
+
+### M7: unconditional sync after M5's branch
+
+The fix extends the M5 cave at `0xf3680` from 16 to 24 bytes. After M5's conditional `strb`, the cave loads the per-channel inbound-RX TID stash slot at `chan+0xba9` (latched by `fcn.0x11374:0x11436 strb.w sl, [r4, 0xba9]` on every inbound AV/C cmd) and unconditionally writes it to `chan+0x39`. The wire-frame builder at `fcn.0xae418:0xae448` then always reads the correct echo TID, regardless of which IPC allocator originated the response packet.
+
+Cave layout (24 bytes at `0xf3680`):
+
+```
+0xf3680  68 7b           ldrb r0, [r5, 0xd]        ; M5: original 1st insn
+0xf3682  2a 7a           ldrb r2, [r5, 8]           ; M5: discriminator
+0xf3684  01 2a           cmp r2, 1                   ; M5: outbound = 1
+0xf3686  01 d0           beq 0xf368c                 ; M5: skip strb on outbound
+0xf3688  84 f8 29 00     strb.w r0, [r4, 0x29]      ; M5: original 2nd insn (inbound only)
+0xf368c  94 f8 99 0b     ldrb.w r0, [r4, 0xb99]     ; M7: load chan+0xba9 (inbound-RX TID stash)
+0xf3690  84 f8 29 00     strb.w r0, [r4, 0x29]      ; M7: sync chan+0x39 unconditionally
+0xf3694  79 f7 7a bd     b.w 0x6d18c                ; return into Path B
+```
+
+For inbound (`beq` not taken), M5 writes `packet[+0xd] = TID` to `chan+0x29 = chan+0x39`, then M7 re-writes the same value from `chan+0xba9` — idempotent. For outbound (`beq` taken), M5 preserves whatever was at `chan+0x39`, then M7 forces it to `chan+0xba9` (latest inbound TID). For the broken msg=544 outbound path (where M5 mis-fires `strb` and writes 0), M7's unconditional copy overwrites the 0 with the correct TID.
+
+### LOAD #1 budget
+
+mtkbt has 1748 bytes of LOAD #1 padding budget (0xf3d40 − 0xf366c). The cave grew from 16 to 24 bytes; total mtkbt usage including the D1 debug cave still well under budget. `LOAD1_RELEASE_END` updated `0xf3690 → 0xf3698`.
+
+### Patcher state
+
+- `patch_mtkbt.py`: OUTPUT_MD5 `7493acda` → `9c4e462241169c3a181574db157c8df7`. OUTPUT_DEBUG_MD5 `d603e68a` → `03da20024a8bc750f0c60ab4f828de2f`.
+- `patch_libextavrcp_jni.py`: unchanged from 252cd8a.
+
+### Verification plan
+
+Post-flash, the gold standard test is Bolt (the only cycling-TID CT in the matrix). Expected behaviour change:
+
+1. `T8reg ev=01` followed by `M5wire c39=NN` where NN ≠ 0 — TID echoes Bolt's inbound cmd TID.
+2. No more 3-second retry-storm on ev=01 / 05 / 08 / 0a — Bolt sees the response, transitions to "subscribed", waits for CHANGED.
+3. `T5ncc` and `T5emit aid=` fire on track edges; Bolt re-subscribes ev=09 / 02 within ~15 ms (the spec-correct §6.7.1 pattern observed on Sonos/TV/Kia).
+4. `T4a=00010xxx` (GEA query) follows the CHANGED burst within < 1 s — interrupt-driven refresh, parity with the Pixel-4-as-TG reference latency table.
+
+Sonos / TV / Kia byte-identical wire behaviour (their TIDs were already 0, so M7's unconditional copy of `chan+0xba9 = 0` produces the same wire bytes as pre-M7). No regression expected on the working CTs.
+
+### Why Trace #59 missed this
+
+`T9tid c17` was the only TID-source log site; it surfaced `conn[+17]` (which IS the inbound TID, correctly latched JNI-side) but the matching `M5wire c39` always read 0 on Sonos because Sonos's inbound TID was 0. The "match" was structural coincidence. Memory `architecture_y1_m5_regnotif_gap.md` documents the verification path forward — cycling-TID CTs (Bolt, Kia under different conditions, future captures) are required for any future TID-related claim.
