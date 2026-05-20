@@ -7085,4 +7085,39 @@ If Bolt still re-issues GetCapabilities after a track skip post-M8, the bug isn'
 
 ### Pixel reference status
 
-The Pixel↔Bolt btsnoop at `/work/logs/pixel4-bugreport-20260518-1959/FS/data/misc/bluetooth/logs/btsnoop_hci.log.last` contains zero AVDTP / AVCTP / AVRCP frames — only two SDP queries 16 s apart. The capture predates any actual audio streaming session between the two devices, so "Pixel works with Bolt" is unverifiable from this artifact. User has anecdotal experience that Pixel drives Bolt cleanly; if a fresh Pixel+Bolt capture eventually shows Pixel responding to AVDTP CLOSE without tearing down AVCTP, that confirms the M8 direction. Until then M8 stands on the AVRCP V13 §4 spec argument alone.
+The newer Pixel↔Bolt btsnoop at `/work/logs/pixel4-bugreport-20260518-1959/FS/data/misc/bluetooth/logs/btsnoop_hci.log.last` contains zero AVDTP / AVCTP / AVRCP frames — only two SDP queries. The older capture at `/work/logs/pixel4-bugreport/FS/data/misc/bluetooth/logs/btsnoop_hci.log` is more useful: 292 AVDTP/AVCTP/AVRCP frames including one full A2DP+AVRCP session ending at relative time t=145.78 s.
+
+Pixel's session AVDTP timeline:
+- t=96.59 setup: DISCOVER → GET_ALL_CAPABILITIES → SET_CONFIGURATION → DELAYREPORT → OPEN (5 signals)
+- t=103.73, t=104.67, t=104.84: START/SUSPEND cycles (track changes / pause/resume mid-session)
+- t=144.79 SUSPEND, t=145.78 **CLOSE** — only one CLOSE in the entire 49 s of active playback, at the session end
+
+Bolt with Pixel uses **SUSPEND** for inter-track transitions; CLOSE only fires once when playback fully ends.
+
+Bolt with Y1 uses **CLOSE** on every inter-track transition (3 CLOSEs in the 1543 session, matching 3 metadata-frozen reconnect cycles). The escalation from SUSPEND→CLOSE is Y1-specific. Y1's btlog under-sampling hides any SUSPEND attempts Bolt might try first, but the pattern of CLOSE-per-track shows Bolt has given up on the SUSPEND/RESUME path for this peer.
+
+### Deeper finding: Bolt doesn't re-RegisterNotification on reconnect
+
+Y1 logcat across the 1543 session (T2reg debug tag emits once per inbound RegisterNotification):
+```
+15:43:59.962  T2reg ev=01
+15:44:00.024  T2reg ev=01   ← Bolt's initial session
+15:44:00.042  T2reg ev=02
+15:44:00.073  T2reg ev=08
+15:44:00.094  T2reg ev=09
+15:44:00.145  T2reg ev=0b
+15:44:00.147  T2reg ev=0c
+(no more T2reg events for the remaining 90 s of the session)
+```
+
+Bolt registered notifications **once** at session start. Across the 4 subsequent reconnect cycles (15:44:34, 15:45:38, 15:46:56), Bolt's CT-side state retains the prior registrations and skips re-subscription on the AVCTP wire. But Y1's `T1_extended` calls `clear_event_database` on every inbound GetCapabilities — which Bolt issues on each reconnect — wiping the per-event TID table. Post-reset, `g_avrcp_req_event_database[ev]` is 0 for every event Bolt thinks it's still subscribed to, so `event_subscribed` returns false and T5/T9 silently drop their CHANGED emits.
+
+This means **M8 is necessary but not sufficient**. Even with AVCTP preserved (M8) so Bolt's CT layer doesn't have to renegotiate AVRCP transport, the per-event database is still session-scoped via `clear_event_database`. If M8 prevents Bolt from CT-side teardown of AVCTP, Bolt may also skip the entire reconnect (no fresh GetCapabilities, no database clear) — that's the M8 win condition. If Bolt still issues a fresh GetCapabilities on its next AV/C command, the database clear still fires and M8 alone won't restore metadata.
+
+### Possible follow-up directions if M8 alone insufficient
+
+1. **Remove `clear_event_database` from `T1_extended`.** Lets the per-event TID table persist across CT sessions within a single mtkbt lifetime. Risk: stale TIDs in cross-session emits if CT genuinely re-registers — current behavior is "silent drop", new behavior would be "emit with wrong TID, CT discards" — same net UI impact, but may affect well-behaved CTs differently.
+2. **Move `clear_event_database` to an L2CAP/AVCTP teardown hook instead of GetCapabilities.** Cleaner spec semantics (subscription state is bound to AVCTP session, not GetCap PDU). Requires finding the AVCTP-side disconnect handler in libextavrcp_jni.so.
+3. **Figure out why Bolt escalates SUSPEND→CLOSE on Y1.** Possible causes: malformed AVDTP responses, unfavorable DelayReport values, codec-config differences, AVDTP version negotiation quirks. Requires a fresh Pixel+Bolt capture with explicit track-skip events to compare against Y1.
+
+(1) is cheap to try empirically. (2) is the principled fix. (3) is the upstream investigation.
