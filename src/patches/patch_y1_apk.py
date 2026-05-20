@@ -2048,14 +2048,17 @@ DBG_VALUE_PATCHES_TRACKINFOWRITER = [
         "    # Reset position anchor and re-flush.\n",
         "onTrackEdge.EDGE",
     ),
-    # flushLocked: 4-line summary just before the FileOutputStream write —
+    # flushLocked: 4-line summary just before the RandomAccessFile write —
     # captures exactly what got written to y1-track-info this flush
     # (audio_id, mPositionAtStateChange, mLastKnownDuration, mPlayStatus).
+    # Anchor updated post-mmap rewrite: flushLocked switched from
+    # FileOutputStream tmp + rename to RandomAccessFile in-place double-
+    # buffer writes so the libextavrcp_jni.so trampolines can mmap the
+    # same inode for race-free reads.
     (
         "    invoke-static {v1, v0, v2, v7}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->putUtf8Padded([BIILjava/lang/String;)V\n"
         "\n"
-        "    # Atomic write to filesDir/y1-track-info.tmp -> rename to y1-track-info\n"
-        "    new-instance v0, Ljava/io/File;\n",
+        "    # RandomAccessFile-based double-buffer in-place write to y1-track-info.\n",
         "    invoke-static {v1, v0, v2, v7}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->putUtf8Padded([BIILjava/lang/String;)V\n"
         "\n"
         "    # === DEBUG: log final flush state ===\n"
@@ -2074,8 +2077,7 @@ DBG_VALUE_PATCHES_TRACKINFOWRITER = [
         "    invoke-static {v0, v2, v3}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->_dbgKV(Ljava/lang/String;J)V\n"
         "    # === END DEBUG ===\n"
         "\n"
-        "    # Atomic write to filesDir/y1-track-info.tmp -> rename to y1-track-info\n"
-        "    new-instance v0, Ljava/io/File;\n",
+        "    # RandomAccessFile-based double-buffer in-place write to y1-track-info.\n",
         "flushLocked.summary",
     ),
     # onSeek entry: log input position (pre-suppression check).

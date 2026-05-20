@@ -3,11 +3,19 @@
 .source "TrackInfoWriter.smali"
 
 
-# Singleton holder + atomic writer for /data/data/com.innioasis.y1/files/y1-track-info.
+# Singleton holder + double-buffer writer for /data/data/com.innioasis.y1/files/y1-track-info.
 #
-# 1104-byte schema, byte offsets 0..1103. Read by the libextavrcp_jni.so trampolines
-# (T1/T2/extended_T2/T4/T5/T6/T8/T9/T_papp/T_charset/T_battery) directly via
-# open(2)+read(2).
+# Schema (2213 bytes): file[0]=active_slot, file[1..3]=RFA, file[4..1107]=slot[0],
+# file[1108..2211]=slot[1], file[2212]=RFA. Each slot holds the 1104-byte track-info
+# image (audio_id / title / artist / album / position / status / battery / papp /
+# etc.) at the same per-field offsets that pre-mmap code used at file[0..1103].
+#
+# flushLocked picks inactive = 1 - active_slot, writes the 1104-byte image into the
+# inactive slot via RandomAccessFile.seek+write, then atomically updates file[0]
+# to point at the just-written slot. Single-byte writes to offset 0 are atomic on
+# ARMv7 (aligned strb), so libextavrcp_jni.so's reader (mmap'd) never sees a torn
+# slot — at any instant slot[file[0]] is the consistent snapshot from the last
+# completed flush.
 #
 # All public mutators are synchronized on INSTANCE. flushLocked() is called inline
 # from the calling thread (Static.setPlayValue runs on main; callbacks are off-main
@@ -263,6 +271,19 @@
     const-string v1, "y1-papp-set"
 
     const/4 v2, 0x2
+
+    invoke-direct {p0, v1, v2}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->ensureFile(Ljava/lang/String;I)V
+
+    # Pre-size y1-track-info to the double-buffer schema (2213 bytes:
+    # active_slot byte + 3 RFA + slot[0] 1104 B + slot[1] 1104 B + 1 RFA).
+    # The libextavrcp_jni.so trampolines mmap this file lazily on first
+    # read; mmap requires the file to be at least the mapping size before
+    # the first map call. ensureFile zeros the file content, so initial
+    # active_slot = 0 and both slots are empty until flushLocked overwrites
+    # slot[0]'s area on its first call.
+    const-string v1, "y1-track-info"
+
+    const/16 v2, 0x8a5
 
     invoke-direct {p0, v1, v2}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->ensureFile(Ljava/lang/String;I)V
     :try_end_0
@@ -923,7 +944,9 @@
 
 
 # The actual file writer. Caller must hold monitor.
-# 1104-byte buffer; atomic tmp+rename; world-readable on creation.
+# Fills a 1104-byte buffer with the current track image, then writes it to the
+# inactive slot of the 2213-byte double-buffer file via RandomAccessFile +
+# atomic single-byte active_slot flip. World-readable so mtkbt can mmap.
 .method private flushLocked()V
     .locals 14
 
@@ -1255,50 +1278,91 @@
 
     invoke-static {v1, v0, v2, v7}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->putUtf8Padded([BIILjava/lang/String;)V
 
-    # Atomic write to filesDir/y1-track-info.tmp -> rename to y1-track-info
+    # RandomAccessFile-based double-buffer in-place write to y1-track-info.
+    # Schema: file[0]=active_slot, file[1..3]=RFA, file[4..1107]=slot[0],
+    # file[1108..2211]=slot[1], file[2212]=RFA. Reader (libextavrcp_jni.so
+    # trampolines via the read_track_info subroutine) reads file[0] once,
+    # dispatches to slot[active], mmaps the same inode across the writer's
+    # in-place updates — no tmpfile + rename which would orphan the
+    # reader's mapped page.
     new-instance v0, Ljava/io/File;
 
     iget-object v2, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mFilesDir:Ljava/io/File;
 
-    const-string v3, "y1-track-info.tmp"
+    const-string v3, "y1-track-info"
 
     invoke-direct {v0, v2, v3}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
 
-    new-instance v2, Ljava/io/File;
+    new-instance v3, Ljava/io/RandomAccessFile;
 
-    iget-object v3, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mFilesDir:Ljava/io/File;
+    const-string v2, "rw"
 
-    const-string v4, "y1-track-info"
-
-    invoke-direct {v2, v3, v4}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
-
-    new-instance v3, Ljava/io/FileOutputStream;
-
-    invoke-direct {v3, v0}, Ljava/io/FileOutputStream;-><init>(Ljava/io/File;)V
+    invoke-direct {v3, v0, v2}, Ljava/io/RandomAccessFile;-><init>(Ljava/io/File;Ljava/lang/String;)V
 
     :try_start_inner
-    invoke-virtual {v3, v1}, Ljava/io/FileOutputStream;->write([B)V
+    # setLength(2213) — extends an upgrade-from-old-schema file (1104 B)
+    # to the new size and zeros the new tail bytes. No-op on a properly
+    # sized file (RandomAccessFile.setLength on size==N is documented
+    # idempotent on Android).
+    const/16 v2, 0x8a5
+
+    int-to-long v4, v2
+
+    invoke-virtual {v3, v4, v5}, Ljava/io/RandomAccessFile;->setLength(J)V
+
+    # Read active_slot byte at offset 0.
+    const-wide/16 v4, 0x0
+
+    invoke-virtual {v3, v4, v5}, Ljava/io/RandomAccessFile;->seek(J)V
+
+    invoke-virtual {v3}, Ljava/io/RandomAccessFile;->read()I
+
+    move-result v2
+
+    # inactive_slot = 1 - (active_slot & 1). Mask first so an EOF return
+    # (-1) is treated as 0 for the flip computation — yields inactive=1
+    # which writes to slot[1] and flips active to 1 on the first post-
+    # upgrade flush, leaving slot[0] still holding stale-or-zero data
+    # until the next flush. Subsequent flushes alternate cleanly.
+    and-int/lit8 v2, v2, 0x1
+
+    rsub-int/lit8 v6, v2, 0x1
+
+    # inactive_byte_offset = 4 + inactive_slot * 1104.
+    const/16 v7, 0x450
+
+    mul-int/2addr v7, v6
+
+    add-int/lit8 v7, v7, 0x4
+
+    int-to-long v4, v7
+
+    # Seek to inactive slot, write the 1104-byte buffer.
+    invoke-virtual {v3, v4, v5}, Ljava/io/RandomAccessFile;->seek(J)V
+
+    invoke-virtual {v3, v1}, Ljava/io/RandomAccessFile;->write([B)V
+
+    # Atomic flip: seek to 0, write the new active_slot byte (= inactive).
+    # RandomAccessFile.write(int) writes only the low 8 bits — single-byte
+    # store, atomic on ARMv7 / cacheline-aligned offset 0.
+    const-wide/16 v4, 0x0
+
+    invoke-virtual {v3, v4, v5}, Ljava/io/RandomAccessFile;->seek(J)V
+
+    invoke-virtual {v3, v6}, Ljava/io/RandomAccessFile;->write(I)V
     :try_end_inner
     .catchall {:try_start_inner .. :try_end_inner} :catchall_inner
 
-    invoke-virtual {v3}, Ljava/io/FileOutputStream;->close()V
+    invoke-virtual {v3}, Ljava/io/RandomAccessFile;->close()V
 
-    invoke-virtual {v0, v2}, Ljava/io/File;->renameTo(Ljava/io/File;)Z
+    # Ensure world-readable so mtkbt (separate uid bluetooth) can mmap.
+    # Idempotent; covers the case where ensureFile or some external
+    # cleanup re-chmod'd the file.
+    const/4 v2, 0x1
 
-    move-result v3
+    const/4 v4, 0x0
 
-    if-nez v3, :cond_renamed
-
-    invoke-virtual {v0}, Ljava/io/File;->delete()Z
-
-    return-void
-
-    :cond_renamed
-    const/4 v0, 0x1
-
-    const/4 v3, 0x0
-
-    invoke-virtual {v2, v0, v3}, Ljava/io/File;->setReadable(ZZ)Z
+    invoke-virtual {v0, v2, v4}, Ljava/io/File;->setReadable(ZZ)Z
     :try_end_top
     .catch Ljava/lang/Throwable; {:try_start_top .. :try_end_top} :catch_top
 
@@ -1307,7 +1371,7 @@
     :catchall_inner
     move-exception v4
 
-    invoke-virtual {v3}, Ljava/io/FileOutputStream;->close()V
+    invoke-virtual {v3}, Ljava/io/RandomAccessFile;->close()V
 
     throw v4
 
