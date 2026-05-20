@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
 patch_mtkbt.py — SDP shape + AV/C op_code dispatch + outbound-frame gates
-against the stock mtkbt Bluetooth daemon. Shapes the served AVRCP TG SDP
-record to AVRCP 1.3 / AVCTP 1.2 (V1+V2), A2DP/AVDTP 1.3 (V3+V4), drops the
-1.4 Browse PSM advertisement (V7), clears the 1.4 GroupNavigation feature
-bit (V8), inserts a 0x0100 ServiceName attribute (S1), reroutes the daemon
-to the v=14 SDP template (V6), force-emits PASSTHROUGH dispatch for all
-AV/C frames (P1), best-effort aliases AVDTP sig 0x0c → 0x02 (V5), widens
-the RegNotif INTERIM/CHANGED dispatch cmp from 1 to 0x0F (M1), NOPs the
++ AVDTP-CLOSE/AVRCP transport independence against the stock mtkbt
+Bluetooth daemon. Shapes the served AVRCP TG SDP record to AVRCP 1.3 /
+AVCTP 1.2 (V1+V2), A2DP/AVDTP 1.3 (V3+V4), drops the 1.4 Browse PSM
+advertisement (V7), clears the 1.4 GroupNavigation feature bit (V8),
+inserts a 0x0100 ServiceName attribute (S1), reroutes the daemon to the
+v=14 SDP template (V6), force-emits PASSTHROUGH dispatch for all AV/C
+frames (P1), best-effort aliases AVDTP sig 0x0c → 0x02 (V5), widens the
+RegNotif INTERIM/CHANGED dispatch cmp from 1 to 0x0F (M1), NOPs the
 hardcoded CHANGED-ctype write so non-INTERIM ctype values pass through to
 the wire (M6 — enables JNI-side trampolines to emit AV/C ctypes other
-than 0x0D for the RegNotif response path), and removes the outbound-frame
+than 0x0D for the RegNotif response path), removes the outbound-frame
 builder's chip-readiness list-contains check + chip-busy flag SET (M2 +
 M3 — eliminate ambiguity in "did this CHANGED reach the wire?" by
 removing two gates whose practical wire-side effect couldn't be
-distinguished from btlog sampling under sustained traffic).
+distinguished from btlog sampling under sustained traffic), and NOPs the
+`AVRCP_HandleA2DPInfo` info=1 disconnect call so the AVCTP control
+channel survives AVDTP CLOSE/REOPEN cycles per AVRCP V13 §4 transport
+independence (M8).
 
 Per-patch byte-level reference (offsets, before/after, rationale, ICS row
 coverage, spec citations): docs/PATCHES.md.
@@ -35,10 +39,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _thumb2asm import Asm
 
 STOCK_MD5         = "3af1d4ad8f955038186696950430ffda"
-OUTPUT_MD5        = "80d9275ab1ae7f71f0f6c57412d214a6"
+OUTPUT_MD5        = "bf2f8ba06cd7e71bf85993a6466db681"
 
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "19429e3cd2498a14dc23605e5f29d687"
+OUTPUT_DEBUG_MD5  = "6771dd447b4a7fb7d3e191cfee32ffca"
 
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
@@ -312,6 +316,51 @@ BASE_PATCHES = [
         "offset": 0x12244,
         "before": bytes([0x0d, 0x21]),  # movs r1, 0xD
         "after":  bytes([0x00, 0xbf]),  # nop
+    },
+    {
+        # M8 — preserve AVRCP transport across AVDTP CLOSE.
+        #
+        # `AVRCP_HandleA2DPInfo` (fcn.0xf8e0) is mtkbt's notification sink
+        # for A2DP stream-state changes. Path info=1 logs "AVRCP: disconnect
+        # because a2dp is lost" and at file 0xfa38 calls fcn.0x1117c — the
+        # AVRCP per-handle cleanup routine that emits L2CAP DisconnectReq
+        # on the AVCTP control channel + any remaining AVRCP-owned channels.
+        # The same routine is also called from the info=0 ("a2dp connected
+        # with other device") branch at 0xf9b8; we only NOP the info=1 site.
+        #
+        # Trigger chain on the wire (dual-bolt-20260520-1543, t=603547):
+        #   1. CT (Bolt) sends AVDTP CLOSE (sig 0x08, SEID 1) on cid 0x42
+        #      — normal stream teardown on track skip.
+        #   2. mtkbt's AVDTP upper layer tears down PSM 0x19 L2CAP channels;
+        #      `AvdtpSigMgrConnCallback ... stat:5` fires.
+        #   3. mtkbt then calls `AVRCP_HandleA2DPInfo(1, 0)` — wrongly
+        #      treating CLOSE as "A2DP link lost" rather than the per-AVDTP-
+        #      §8.13 STREAMING→OPEN state transition it actually is.
+        #   4. info=1 path calls fcn.0x1117c which emits DisconnectReq for
+        #      the AVCTP control channel(s).
+        #   5. CT reconnects everything fresh on the next AV/C command,
+        #      issuing a new GetCapabilities that resets
+        #      `g_avrcp_req_event_database` (via libextavrcp_jni.so's
+        #      `clear_event_database` in T1_extended). The post-reset
+        #      session has no per-event TIDs, so subsequent T5/T9 emits
+        #      go silent — CT's UI freezes on stale metadata.
+        #
+        # AVRCP's transport (AVCTP signaling channel) is independent of
+        # the A2DP audio stream per AVRCP V13 §4. CTs are allowed to
+        # CLOSE/REOPEN the audio stream without disturbing the AVRCP
+        # session. Y1 tearing down AVCTP on every CLOSE is a stack
+        # implementation defect; M8 removes the disconnect call so the
+        # AVRCP session survives audio stream cycles.
+        #
+        # Replaces a single 4-byte BL.W with two 16-bit NOPs. fcn.0x1117c
+        # has only two callers (info=0 + info=1); info=0 still fires —
+        # multi-device A2DP collisions still tear AVRCP down. True ACL
+        # link loss (peer powered off / out of range) is caught by the
+        # baseband link-supervision-timeout independently of this path.
+        "name":   "[M8] Preserve AVCTP across AVDTP CLOSE: NOP info=1 disconnect (mtkbt 0xfa38)",
+        "offset": 0xfa38,
+        "before": bytes([0x01, 0xf0, 0xa0, 0xfb]),  # bl 0x1117c
+        "after":  bytes([0x00, 0xbf, 0x00, 0xbf]),  # nop ; nop
     },
     {
         # M2 — TG-side outbound-frame drop gate at fcn.0x6d048.

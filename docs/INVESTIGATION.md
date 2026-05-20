@@ -7011,3 +7011,78 @@ After Tier 2 ships, the AVRCP-metadata pipeline has **zero on-disk reads in the 
 | y1-trampoline-state | (dead file, still ensure-created) | never read or written by trampolines | cosmetic cleanup deferred |
 
 The writer-side `RandomAccessFile.seek+write` is the architectural floor — you can't have cross-process page-cache propagation without the kernel write syscall path. That's the irreducible minimum.
+
+---
+
+## Trace #85 — 2026-05-20 Bolt churn root cause: mtkbt tears down AVCTP on AVDTP CLOSE
+
+### Symptom
+
+Bolt EV CT shows "metadata frozen after the first track" across multiple sessions (dual-bolt-20260519-1647, 20260520-0625, 20260520-1543). Pre-Trace #85 analysis (Traces #74, #75, #76, #77) attributed this to either AVRCP-side state issues, slow CT polling, or wire-frame fragmentation. None of those explained why the session-wide `g_avrcp_req_event_database` looked unsubscribed after the first track — the database is wiped by `clear_event_database` in `T1_extended` on every GetCapabilities, but in normal operation that fires once per CT session. Bolt was running it 3-5 times per session.
+
+### What the btlog actually shows
+
+Per-session count of `AVRCP_HandleA2DPInfo info:1` events in `dual-bolt-20260520-1543/btlog.bin`: **3**. Each is preceded by:
+
+```
+[BT] , 2, 33, 0, 7, 0, 3, 0, 42, 0, 40, 8, 4
+```
+
+Decode: HCI ACL handle 0x033 len 7, L2CAP len 3 cid 0x42 (Bolt's AVDTP signaling channel), AVDTP payload `40 08 04` = TxLabel=4 / PT=Single / MsgType=Command / **SignalID=0x08 CLOSE** / ACP_SEID=1. Bolt is closing the stream endpoint cleanly on every track skip — normal AVDTP behaviour under AVDTP V13 §8.13 (STREAMING → OPEN → IDLE).
+
+Y1's mtkbt then cascades:
+1. Tears down PSM 0x19 L2CAP channels (AVDTP signaling + stream)
+2. `[AvdtpSigMgrConnCallback]AVDTP_CONN_EVENT_DISCONNECT strm conn stat:5` fires
+3. Y1 sends DisconnectReq for PSM 0x17 channels (AVCTP signaling) — visible at `0xfa38 bl 0x1117c`
+4. `AVCTP_EVENT:3` (AVCTP disconnect)
+5. `AVRCP_HandleA2DPInfo info:1 data:0x0` log
+6. AVRCP per-handle cleanup at `fcn.0x1117c` emits more L2CAP DisconnectReqs
+
+Step 6 is the actively-harmful one: it tears down the AVCTP control channel that Bolt is still using for AVRCP commands.
+
+### RE walkthrough
+
+`AVRCP_HandleA2DPInfo` is in `bin/mtkbt`, not `libextavrcp.so`. Found by `grep "HandleA2DPInfo"` across all `.so` and binaries. Format string at file `0xc8b4f`; function entry at `fcn.0xf8e0`.
+
+Function signature (inferred from r0/r1 usage + log format):
+```
+void AVRCP_HandleA2DPInfo(int info_id, void* data_ptr);
+```
+
+`r0=info_id` dispatch in `fcn.0xf8e0`:
+- `info_id == 0`: "A2DP connected" event with new device address; compares against current AVRCP peer addr; if different → log "AVRCP: disconnect because a2dp is connected with other device" → call `fcn.0x1117c` at `0xf9b8`
+- `info_id == 1`: "A2DP lost" event; log "AVRCP: disconnect because a2dp is lost" → call `fcn.0x1117c` at `0xfa38`
+- `info_id == 2 or 3`: fall through to exit / different cleanup
+
+`fcn.0x1117c` is the AVRCP per-handle cleanup routine. Iterates a 0x1420-byte per-channel state table at offset `r0 * 0x1420` (zero for info=1 since the caller always passes r0=0), emits L2CAP DisconnectReq on the channels.
+
+Caller chain to `info_id == 1`:
+- `fcn.0xe79c` always sets `r0=1, r1=0` before `bl 0xf8e0`. Two call sites:
+  - `0xe18c` in some dispatcher; reached when state byte `[r5+0xb] != 5` && `[r5+12] != 7`
+  - `0xe204` after setting `[r5+3] = 5`; reached when `[r5+3] == 0` && `[r5+4] != 0,7`
+- `fcn.0xe748` sets `r0=1, r1=0` conditionally on its first arg being `0x100`
+  - reached from `fcn.0xe178` when `[r5+12] == 7`
+
+These dispatchers live in mtkbt's AVDTP-event handler. The state bytes look like AVDTP Stream Endpoint state (per ETSI ES 200 936): state 7 = `ABORTING`, state 5 = `STREAMING`. Y1 fires the info=1 disconnect on the AVDTP STREAMING → IDLE transition that AVDTP CLOSE triggers — which is wrong because **AVCTP signaling is independent of AVDTP audio per AVRCP V13 §4**. The two protocols are layered on L2CAP independently; a CT is free to cycle the audio stream without disturbing the AVRCP session.
+
+### The fix (M8)
+
+Replace `bl 0x1117c` at file `0xfa38` with two 16-bit NOPs:
+```
+before: 01 f0 a0 fb   bl 0x1117c
+after:  00 bf 00 bf   nop ; nop
+```
+
+After M8, the info=1 path still runs (the upper-layer cascade still happens through L2CAP), but mtkbt stops sending the additional DisconnectReq for the AVCTP control channel. The control channel stays up across the audio stream cycle. Bolt's AVRCP commands continue working without a re-handshake, so `clear_event_database` doesn't fire mid-session and the per-event TID table persists.
+
+### Why this is the right narrowing
+
+`fcn.0x1117c` has 2 call sites; only the info=1 one is being NOPed. The info=0 site (multi-device A2DP collision) still tears AVRCP down — appropriate for that case. True ACL link loss (peer powered off / out of range) is caught by the baseband link-supervision-timeout independently of this software path.
+
+### Falsifiable
+
+If Bolt still re-issues GetCapabilities after a track skip post-M8, the bug isn't in this path — likely in `AvdtpSigMgrConnCallback`'s own AVCTP teardown logic at step 3 of the cascade. Capture a fresh Bolt session after the patch; count `g_avrcp_req_event_database` reset cycles via the existing `T1tab` debug tag and the `M5dbg pd=%02x` cave.
+
+### Pixel reference status
+
+The Pixel↔Bolt btsnoop at `/work/logs/pixel4-bugreport-20260518-1959/FS/data/misc/bluetooth/logs/btsnoop_hci.log.last` contains zero AVDTP / AVCTP / AVRCP frames — only two SDP queries 16 s apart. The capture predates any actual audio streaming session between the two devices, so "Pixel works with Bolt" is unverifiable from this artifact. User has anecdotal experience that Pixel drives Bolt cleanly; if a fresh Pixel+Bolt capture eventually shows Pixel responding to AVDTP CLOSE without tearing down AVCTP, that confirms the M8 direction. Until then M8 stands on the AVRCP V13 §4 spec argument alone.
