@@ -6508,3 +6508,91 @@ Worth doing — closes the last remaining significant performance delta vs Pixel
 If the Bolt 0625-followup capture (post the 50 ms Handler delay fix from Trace #76) shows the metadata freeze is GONE, this plan becomes a "Pixel parity polish" effort rather than a critical fix. If the freeze persists, Phase 2's lower latency may also help — Bolt's GEA bursts arrive within ~80 ms and Y1's current ~25 ms per response means Bolt sometimes moves on before we answer.
 
 Wait for Bolt 0625-followup capture before committing time to this.
+
+## Trace #78 (2026-05-20) — Kia 0707: rate-limit gate eats PositionTicker ticks; resetWakeRateLimit bypass
+
+### User report
+
+"New test seems to have improved response times on the Kia but it regressed track position a bit. Track length updates but track position does not (at least after the initial tick)."
+
+### Big-picture shift on Kia
+
+Kia 0707 vs Kia 2107 (the previous capture before P_PN0/P_PN1 + rate-limit + ProviderName + PSC pulse landed):
+
+| metric | Kia 2107 | Kia 0707 |
+|---|---|---|
+| T2reg total | 0 | **143** |
+| ev=05 PlaybackPosition | 0 | 47 |
+| ev=09 NowPlayingContent | 0 | 45 |
+| ev=01 PlaybackStatus | 0 | 34 |
+| ev=02 TrackChanged | 0 | 13 |
+| T5tc TrackChanged emits | 0 | 12 |
+| T9ps PlaybackStatus emits | 0 | 33 |
+| T9papp PApp emits | 0 | 2 |
+
+**Kia switched from polling-only to subscribe-based.** Most likely cause: the ProviderName=" " addition (P_PN0/P_PN1 in `f19ad7c`). Kia's SDP parser was probably rejecting Y1's TG record absent `0x0102`, falling back to GEA polling. With ProviderName present the record passes Kia's validation and Kia subscribes normally.
+
+This is the biggest CT-side behavior shift we've seen from a single patch. It validates the Pixel-parity SDP analysis from Trace #74.
+
+### The regression — PositionTicker ticks getting eaten
+
+Comparing PositionTicker firings to Kia's ev=05 RegNotif acks (Kia strict §6.7.1 = one re-register per PPC CHANGED received):
+
+- 86 `PositionTicker.run` firings (Y1Patch trace)
+- 47 Kia ev=05 RegNotifs (M5 cave on inbound)
+- **~39 ticks lost between Java-side wake and AVCTP wire emit**
+
+Position values in `y1-track-info` are tracked correctly — `fL.pos` log markers show ms-accurate growth (e.g., 9301ms → 9301ms-anchored, 153ms → 153ms-anchored after a track edge, advancing to 10026ms ~10 s later). So the music app is computing position correctly, T9 has access to correct file content. The gap is elsewhere.
+
+### Root cause
+
+The 800 ms rate-limit gate in `wakePlayStateChanged` (commit `105eef5`):
+
+```
+if (now - mLastWakePlayStateAt < 800ms && mPlayStatus == mLastWakePlayStatus):
+    return // suppress broadcast
+```
+
+Designed to coalesce the 3-wake cascade around track edges (onPlayValue + onPrepared + onPlayerPreparedTail in <200 ms succession, same mPlayStatus). But PositionTicker's 1 Hz heartbeat with PLAYING status also matches "same status AND <800 ms" when:
+
+1. PSC pulse phase 2 fires at track-edge settle (sets `mLastWakePlayStateAt` = now, `mLastWakePlayStatus` = PLAYING)
+2. PositionTicker tick lands 600-900 ms later (still PLAYING)
+3. Gate: `now - mLastWakePlayStateAt < 800` AND `PLAYING == PLAYING` → **SUPPRESS**
+4. No broadcast → mtkbt's BluetoothAvrcpReceiver doesn't fire → T9 doesn't run → no PPC CHANGED on the wire
+
+After the next status edge (PAUSE/PLAY toggle, or natural state transition) the gate clears and PositionTicker resumes — until the next pulse fires, repeating the cycle.
+
+User's exact symptom: "Track length updates but track position does not after the initial tick." The initial tick that DOES work is the PSC pulse's phase 2 emit (which includes a POSITION CHANGED in T9's run because file[792]==1 after phase 2 write). Subsequent PositionTicker ticks get gated until the next status edge.
+
+### Fix
+
+PositionTicker.run resets the rate-limit state before each `wakePlayStateChanged`:
+
+```smali
+.method public run()V
+    sget-object v0, TrackInfoWriter.INSTANCE
+    invoke-virtual {v0}, resetWakeRateLimit()V    ← new
+    invoke-virtual {v0}, wakePlayStateChanged()V
+    ... re-post Handler ...
+```
+
+`resetWakeRateLimit()` writes `mLastWakePlayStateAt = 0`. The gate's delta calculation `now - 0` then evaluates to a huge value, bypassing the suppression. Status-edge cascades around track changes still get coalesced because their call sites don't reset.
+
+PositionTicker.run remains the single source of 1 Hz heartbeat — the gate now applies only to the cascading wakes that motivated it.
+
+### Why not lower the rate-limit threshold
+
+Considered changing 800 ms → 400 ms or 300 ms. Two reasons against:
+
+1. **No principled threshold value**: PositionTicker is nominally 1000 ms but observed cadence is 0.7 Hz (some ticks run late under load). A 400 ms threshold would still occasionally suppress.
+2. **Track-edge cascades have variable spacing**: the 3 wakes around a track edge land 150-300 ms apart on slow days, 50-100 ms apart under load. A 400 ms threshold catches the typical case but a 200 ms threshold would miss bursts under load. The current 800 ms generously covers all cascade timings — preserving that for cascades while letting PositionTicker bypass is the right call.
+
+### Why not differentiate by `mPlayStatus`
+
+Considered: gate only when `mPlayStatus` is unchanged. Already done. The problem is that cascade wakes AND PositionTicker ticks both have unchanged status during steady playback. Bypass-by-caller is the clean separation.
+
+### Side note on the Kia subscription shift
+
+This is a strong signal that the ProviderName addition was load-bearing. Hypothesis: Kia's CT-side SDP parser rejected the Y1 TG record before P_PN0/P_PN1 because attribute `0x0102 ProviderName` was missing, falling back to polling-only metadata refresh. With ProviderName present, Kia accepts the TG and uses subscribe-based refresh.
+
+If true, this same path may also affect any other CT in the matrix that's been "lagging" (Kia's lag was traced to polling cadence). Worth re-running the TV / Sonos captures after this commit to see if their behavior changed too.

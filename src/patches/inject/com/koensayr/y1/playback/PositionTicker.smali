@@ -128,6 +128,13 @@
     :try_start_0
     sget-object v0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->INSTANCE:Lcom/koensayr/y1/trackinfo/TrackInfoWriter;
 
+    # Bypass wakePlayStateChanged's same-status <800ms rate-limit gate.
+    # PositionTicker's 1Hz heartbeat must always emit; the gate was
+    # intended only to coalesce multi-wake cascades around track
+    # edges. See TrackInfoWriter.resetWakeRateLimit docstring + Trace
+    # #78 in docs/INVESTIGATION.md.
+    invoke-virtual {v0}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->resetWakeRateLimit()V
+
     invoke-virtual {v0}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->wakePlayStateChanged()V
 
     sget-object v0, Lcom/koensayr/y1/playback/PositionTicker;->sHandler:Landroid/os/Handler;

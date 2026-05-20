@@ -1886,3 +1886,38 @@
 
     throw v0
 .end method
+
+
+# Reset wake rate-limit so the NEXT wakePlayStateChanged() call always
+# fires its broadcast, regardless of how recently the previous wake
+# fired or whether mPlayStatus changed.
+#
+# The rate-limit gate inside wakePlayStateChanged was designed to
+# coalesce the 3-wake cascade around track edges (onPlayValue +
+# onPrepared + onPlayerPreparedTail in tight succession, <200 ms apart,
+# same mPlayStatus). PositionTicker's 1 Hz heartbeat shouldn't be
+# subject to that gate — but if the previous wake landed <800 ms ago
+# with the same mPlayStatus (e.g., PSC pulse phase 2 settled to PLAYING,
+# then PositionTicker tick lands 600 ms later), the gate suppresses
+# the broadcast and T9 never runs → no PLAYBACK_POS_CHANGED on the
+# wire → CT's playhead freezes after the initial track-change tick.
+#
+# Empirical: Kia 0707 (2026-05-20) had 86 PositionTicker.run firings
+# but only 47 Kia ev=05 RegNotif acks (strict §6.7.1 = one re-register
+# per PPC CHANGED received). ~39 ticks were dropped by the rate-limit.
+# User reported "track length updates but track position does not
+# after the initial tick" — the exact symptom predicted by the gate
+# eating PositionTicker.
+#
+# PositionTicker.run calls this method before each wakePlayStateChanged,
+# which makes the gate's `now - mLastWakePlayStateAt` calculation see
+# a huge delta (current uptime minus 0) → bypass → broadcast fires.
+.method public resetWakeRateLimit()V
+    .locals 2
+
+    const-wide/16 v0, 0x0
+
+    iput-wide v0, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mLastWakePlayStateAt:J
+
+    return-void
+.end method
