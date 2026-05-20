@@ -6187,3 +6187,324 @@ The 50 ms Handler delay is the simplest correct solution.
 - New file: `src/patches/inject/com/koensayr/y1/playback/PscPulse.smali`
 - `TrackInfoWriter.pulsePlayStatusForCT` reduced to: check `mPlayStatus == PLAYING`, call `PscPulse.fire()`.
 - `patch_y1_apk.py`: PscPulse registered in `PATCH_B5_INJECT_FILES` and the rebuilt-DEX manifest. Debug-mode marker logs for `PscPulse.fire (phase 1)` and `PscPulse.run (phase 2 +50ms)`.
+
+## Trace #77 (2026-05-20) — Plan: mmap-backed y1-track-info for race-free, syscall-free trampoline reads
+
+### Motivation
+
+Pixel-as-TG vs Y1 GEA response latency: 1-3 ms vs 21-30 ms (Trace #74). The 10-20× delta comes from T4's `open` + `SYS_read` + `close` syscall chain reading 1104 bytes from `/data/data/com.innioasis.y1/files/y1-track-info` on EVERY inbound GetElementAttributes from the CT. T5/T6/T8/T9 all do the same syscall chain — order of magnitude 20-50 reads of the same 1104-byte file per minute under normal use, multiplied during track-skip sessions.
+
+Same disk-IO design also produced the PSC pulse race in Trace #76 — T9 reads the file at run time, not at broadcast-queued time, so concurrent writes from the music app can race past T9's invocation. The 50 ms Handler delay is a workaround; the real fix is to eliminate the disk hop entirely.
+
+### Design — file-backed mmap with double-buffered atomic swap
+
+Use mmap'd shared memory between the music app (writer) and mtkbt's bluetooth process (reader). The file lives at the same path (`/data/data/com.innioasis.y1/files/y1-track-info`) so failure paths fall back to the existing `open`+`read` semantics gracefully.
+
+**Schema extension** (1104 B → 2213 B):
+
+| offset | size | content |
+|---|---|---|
+| `0` | 1 B | `active_slot` byte — `0` or `1` — single-byte atomic write |
+| `1..3` | 3 B | RFA padding (align slot[0] to 4) |
+| `4..1107` | 1104 B | **slot[0]** — existing 1104-byte schema (audio_id / title / artist / album / position / status / battery / papp / etc.) |
+| `1108..2211` | 1104 B | **slot[1]** — second copy of the same schema |
+| `2212` | 1 B | RFA padding |
+
+Single-byte atomic store on `active_slot` is race-free on ARMv7 (8-bit aligned `strb`). Reader reads `active_slot` once, dispatches to the corresponding slot. Writer writes to the *other* slot first, then atomically updates `active_slot` to point at the freshly-written one. Reader never sees a partial write because slot[0] and slot[1] are never both being touched simultaneously.
+
+**Writer flow (music app `TrackInfoWriter.flushLocked`):**
+
+```
+mmap once at init  →  mapped_base
+loop {
+    inactive = 1 - mapped_base[0]
+    fill_struct(&local_buf)
+    memcpy(&mapped_base[4 + inactive*1104], &local_buf, 1104)
+    mapped_base[0] = inactive   // atomic byte store
+}
+```
+
+**Reader flow (any trampoline):**
+
+```
+mmap once at first call  →  mapped_base (cached in .bss)
+active = ldrb [mapped_base, 0]
+src = mapped_base + 4 + active * 1104
+memcpy(&local_stack_buf, src, 1104)   // or read individual fields directly
+... existing per-trampoline logic on local_buf ...
+```
+
+The reader takes a snapshot via `memcpy` rather than reading fields in-place from the slot. Snapshot ensures a consistent view even if `active_slot` flips mid-read (we'd read the now-inactive slot, but its contents are still the consistent snapshot from the previous write).
+
+### Why double-buffer vs seqlock
+
+Seqlock requires a retry loop on the reader side and barrier instructions to prevent reordering. ARMv7's memory model is weakly ordered — a naive seqlock without `dmb` barriers would race. Adding `dmb ish` instructions costs cycles and is fiddly to get right in Thumb-2 inline assembly.
+
+Double-buffer needs only:
+- Reader: one `ldrb` (atomic) + memcpy from the chosen slot
+- Writer: memcpy to the inactive slot + one `strb` (atomic) of the new flag
+
+ARMv7 guarantees single-byte `ldrb`/`strb` to aligned addresses are atomic. No barriers needed for the producer-consumer pattern because:
+- Writer completes the inactive-slot memcpy *before* updating the flag
+- Reader reads the flag *before* dereferencing the slot
+- The flag write/read serves as the happens-before edge
+
+Slight memory waste (1104 extra bytes on disk + in the page cache) is the only cost. Trivial.
+
+### Trampoline-side changes
+
+**New .bss bytes** (in `g_avrcp_req_event_database` neighbourhood at vaddr `0xd2b5+`):
+
+```
+g_y1_track_info_mmap_base : 4 B   // pointer to mmap'd region, NULL until lazy-init
+g_y1_track_info_mmap_failed : 1 B  // sticky failure flag — fall back to open+read forever
+```
+
+**New shared subroutine** (`_emit_mmap_track_info_subroutine` in `_trampolines.py`):
+
+```
+mmap_track_info:
+    ldr.w r0, [g_y1_track_info_mmap_base]
+    cbz r0, do_mmap                    // NULL → lazy-init
+    bx lr                              // already mapped → return ptr
+
+do_mmap:
+    ldrb [g_y1_track_info_mmap_failed]
+    cbnz r0, return_null               // previously failed → don't retry
+
+    // open(path_track_info, O_RDONLY, 0)
+    adr_w r0, path_track_info
+    mov   r1, O_RDONLY
+    movs  r2, 0
+    blx   PLT_open
+    cmp   r0, 0
+    blt   set_failed
+
+    // mmap2(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0)
+    mov   r4, r0                       // r4 = fd
+    movs  r0, 0
+    mov   r1, 0x1000                   // 1 page = 4096 B (covers 2213 B file)
+    movs  r2, 1                        // PROT_READ
+    movs  r3, 1                        // MAP_SHARED
+    push  {r0, r1}                     // syscall stack args: pgoff
+    svc   192                          // NR_mmap2
+    add   sp, 8
+    cmp   r0, 0
+    blt   close_and_fail
+
+    // store mapped ptr, close fd, return ptr
+    str.w r0, [g_y1_track_info_mmap_base]
+    mov   r5, r0                       // save ptr across close
+    mov   r0, r4
+    blx   PLT_close
+    mov   r0, r5
+    bx    lr
+
+close_and_fail:
+    mov   r0, r4
+    blx   PLT_close
+set_failed:
+    strb  #1, [g_y1_track_info_mmap_failed]
+return_null:
+    movs  r0, 0
+    bx    lr
+```
+
+Cost estimate: ~80-100 bytes of trampoline code (one-time).
+
+**Per-trampoline read path changes**:
+
+Each trampoline currently does:
+
+```
+adr_w   r0, path_track_info
+movs    r1, O_RDONLY
+movs    r2, 0
+blx     PLT_open                    // ~30 bytes total for the open
+cmp r0, 0
+blt     skip
+mov     r4, r0
+mov     r0, r4
+add_sp_imm r1, OFF_FILE
+movw    r2, 1104
+movs    r7, NR_read
+svc     0                            // syscall — slow
+mov     r0, r4
+blx     PLT_close
+```
+
+Replaced with:
+
+```
+bl      mmap_track_info              // r0 = ptr or NULL
+cbz     r0, fallback_open_read
+ldrb    r1, [r0, #0]                 // active_slot
+add_imm r2, 4
+muls?   ... add r0, r0 to slot start
+mov     r0, slot_src
+add_sp_imm r1, OFF_FILE
+movw    r2, 1104
+blx     PLT___memcpy_chk             // copy slot → stack buffer
+b       after_read
+
+fallback_open_read:
+    ... existing open+read+close path ...
+
+after_read:
+```
+
+Cost estimate: ~30-40 bytes added per trampoline (5 trampolines × ~35 B = ~175 B). 80 B for the mmap subroutine. Total ~255 B added; current debug-build headroom is 504 B, release-build 624 B. Comfortable fit.
+
+### Music-app-side changes
+
+`TrackInfoWriter.flushLocked` currently writes via `FileOutputStream` to a tmp file then `renameTo` for atomic visibility. **Rename creates a NEW inode** — any process that has the old inode mmap'd would see stale content forever. So we must switch to in-place updates.
+
+New `flushLocked`:
+
+```java
+private MappedByteBuffer mTrackInfoMmap;  // lazy-init
+
+private MappedByteBuffer ensureMmap() {
+    if (mTrackInfoMmap != null) return mTrackInfoMmap;
+    try {
+        File f = new File(mFilesDir, "y1-track-info");
+        // Ensure file is exactly 2213 bytes before mmap
+        try (RandomAccessFile raf = new RandomAccessFile(f, "rw")) {
+            raf.setLength(2213);
+        }
+        FileChannel ch = new RandomAccessFile(f, "rw").getChannel();
+        mTrackInfoMmap = ch.map(FileChannel.MapMode.READ_WRITE, 0, 2213);
+        // FileChannel.close() doesn't unmap the buffer per Java spec; mapping persists
+    } catch (Throwable t) {
+        Log.w("Y1Patch", "mmap init failed: " + t);
+        // fallback path leaves mTrackInfoMmap = null; flushLocked uses old write path
+    }
+    return mTrackInfoMmap;
+}
+
+private void flushLocked() {
+    byte[] buf = buildBuf();  // existing 1104-byte struct fill
+
+    MappedByteBuffer m = ensureMmap();
+    if (m != null) {
+        int active = m.get(0) & 0xFF;
+        int inactive = 1 - (active & 1);
+        int slotOffset = 4 + inactive * 1104;
+        m.position(slotOffset);
+        m.put(buf, 0, 1104);
+        m.put(0, (byte) inactive);     // atomic flag flip
+        return;
+    }
+
+    // Fallback: existing tmp+rename path (slower but works without mmap)
+    ...
+}
+```
+
+Java `MappedByteBuffer.put(byte)` is a single STR — atomic on the underlying memory. `put(int, byte)` is similar.
+
+`ensureMmap` is called only on flushLocked (which is synchronized). No concurrent mmap init race.
+
+### Failure modes & fallback
+
+| Failure | Detection | Action |
+|---|---|---|
+| `open(y1-track-info)` returns -ENOENT (file not created yet) | Reader: `bl mmap_track_info` returns NULL | Fall back to existing `open`+`read` path (file might exist via TrackInfoWriter.init by next call) |
+| `mmap2` returns -ENOMEM or -EINVAL | Reader: subroutine sets `g_y1_track_info_mmap_failed = 1`, returns NULL | All future reads use the open+read fallback for this process lifetime |
+| Music app process restart | New mmap on next flushLocked | mtkbt's mmap'd view is stale until music app writes — kernel-managed page cache keeps it consistent |
+| Music app crashes mid-write to inactive slot | Reader's `active_slot` byte still points at the PREVIOUS slot which has the LAST consistent snapshot | Reader gets stale-but-valid data; next successful write resyncs |
+| `setLength(2213)` race between music app and trampoline open | Reader sees a 1104-byte file briefly | Reader's mmap of a 4096-byte page maps the underlying file content; if file is only 1104 B at mmap time, reading offsets > file size returns SIGBUS; need to ensure music app `setLength` *before* writing slot 1 content |
+
+Mitigation for the last one: TrackInfoWriter's `init(Context)` runs on Y1Application.onCreate and `setLength(2213)` before any flush. By the time mtkbt-side trampolines run (after music app is up), the file is already 2213 B.
+
+### Implementation phases
+
+To keep bisection space manageable, ship as separate commits in this order:
+
+**Phase 1 — Music app side: switch from tmp+rename to in-place + schema extension** (one commit)
+- `TrackInfoWriter.init()` sets file length to 2213, writes initial `active_slot = 0` + slot[0] defaults.
+- `flushLocked()` switches to mmap'd `MappedByteBuffer` writes with double-buffer flip.
+- Existing trampolines continue using `open`+`read` (reading slot[0] at offsets `4..1107` works because that's where the new schema places the active default state at init time — but if the active_slot has flipped to 1, trampolines reading offset 0+1104 would see stale data).
+- **Wait, this breaks compatibility with old trampolines**. Phase 1 must include a tiny trampoline shim that ALWAYS reads the active slot (1 extra `ldrb` + add).
+
+Hmm, that means Phase 1 = music-app + trampoline schema understanding. They have to ship together.
+
+Better Phase 1: **trampolines learn double-buffer schema, music app still writes tmp+rename of OLD schema** (1104 bytes). Trampolines look at file size — if 2213, parse new schema; if 1104, parse old. Backward compat.
+
+Then Phase 2: music app switches to in-place double-buffer writes. Trampolines already know how to read it.
+
+Then Phase 3: trampolines switch to mmap (still falling back to open+read).
+
+Let me re-order:
+
+**Phase 1 — Trampolines: read active-slot schema (with backward compat)**
+- Trampolines read `active_slot` byte at file[0], then read slot at `file[4 + active*1104]`.
+- If file size is < 2213, fall back to reading from offset 0 (old schema).
+- Music app unchanged — still writes 1104 bytes at offset 0 (which corresponds to `active_slot=0` + 3 bytes RFA + first 1100 bytes of slot[0] — wait, that doesn't work; the byte at offset 0 in the old schema is part of audio_id, not 0).
+
+Bad backward compat. Old schema has audio_id at file[0..7]. New schema has `active_slot` at file[0].
+
+Alternative: trampolines DETECT new vs old schema by checking file size at mmap/read time. If file size is exactly 1104, use old offsets. If file size is 2213, use new offsets.
+
+Phase 1: Music app extends file to 2213 bytes. file[0..3] = active_slot + padding (initialised to 0). file[4..1107] = slot[0] (new home of audio_id etc.). file[1108..2211] = slot[1] (zero-filled until first flip). Music app writes both slots? No — only writes inactive slot then flips. On init, both slots are zero or have the same content.
+
+flushLocked writes to inactive slot. So first flush: active=0 initially, inactive=1, writes slot[1], flips to active=1. Second flush: active=1, inactive=0, writes slot[0], flips to active=0. And so on.
+
+Trampolines see size=2213 → parse active_slot, dispatch to correct slot.
+
+If trampolines are deployed BEFORE music app's phase 1 (e.g., separate flash of /system/lib/libextavrcp_jni.so without music app update), the trampoline would size-check, see 1104 (old file size), and use old offsets. Music app's old writes still land at offsets 0..1103 which is what trampolines read.
+
+OK Phase 1 split:
+
+**Phase 1a — Trampolines: dual-schema reads** (small commit)
+- Add file-size check
+- If size >= 2213: read active_slot, dispatch to slot
+- Else: read offset 0 as before (old behaviour)
+- Compatible with old music app
+
+**Phase 1b — Music app: extend file to 2213 bytes, write to inactive slot, flip active_slot** (separate commit)
+- Music app's flushLocked switches to active-slot-aware
+- File grows from 1104 to 2213 bytes on first flush
+- tmp+rename path drops in favour of in-place write (slot writes are bounded to one slot; flag flip is atomic)
+
+After Phase 1b: Y1's pipeline works with the new schema. Race-free across writes because writer never touches the slot reader is currently using.
+
+**Phase 2 — Trampolines: mmap-backed reads with open+read fallback**
+- New `mmap_track_info` subroutine in trampoline blob
+- Each trampoline tries `bl mmap_track_info`; if NULL falls back to `open`+`read`
+- Latency drops from ~30 ms to ~5 μs per read
+
+After Phase 2: GEA latency hits parity with Pixel-as-TG (~1-3 ms).
+
+**Phase 3 — Music app: mmap-backed writes** (optional)
+- TrackInfoWriter writes via MappedByteBuffer directly (no kernel write syscall on the hot path)
+- Marginal perf gain on the writer side (writes are already infrequent)
+- Worth doing only if Phase 1b's FileChannel writes become a bottleneck (unlikely)
+
+### Verification per phase
+
+**Phase 1a (trampoline dual-schema)**: existing 1104-byte file continues to work. Run TV/Sonos/Bolt/Kia captures to verify no regression. T9ps/T5tc emit rates unchanged.
+
+**Phase 1b (music app double-buffer)**: file size = 2213 B post-init. `od -An -tx1 -N1 y1-track-info` shows alternating `00` / `01` after track changes. Trampolines read correct slot content.
+
+**Phase 2 (mmap)**: GEA response latency measurement — EXTADP_AVRCP timestamps should drop from ~21 ms to <5 ms. Bolt's GEA-burst-of-3 should now get all 3 responses before Bolt times out.
+
+### Cost / benefit summary
+
+| | Current | Post-mmap |
+|---|---|---|
+| GEA response latency | 21-30 ms | <5 ms (Pixel parity) |
+| Reads per minute | 20-50 | 0 (memory loads only) |
+| Disk I/O on hot path | ~150 syscalls / 5 min session | 0 |
+| LOAD #1 budget impact | n/a | ~255 B (504 B free in debug, 624 B in release) |
+| File size on disk | 1104 B | 2213 B (~2× — negligible) |
+| Code risk | n/a | Medium — touches all 5 trampoline read paths + music app's flushLocked |
+| Bisection space | n/a | 4 commits (Phase 1a, 1b, 2, optional 3) |
+
+### Decision
+
+Worth doing — closes the last remaining significant performance delta vs Pixel. Phase 1a+1b are the prerequisite; Phase 2 is the actual win. Phase 3 is optional.
+
+If the Bolt 0625-followup capture (post the 50 ms Handler delay fix from Trace #76) shows the metadata freeze is GONE, this plan becomes a "Pixel parity polish" effort rather than a critical fix. If the freeze persists, Phase 2's lower latency may also help — Bolt's GEA bursts arrive within ~80 ms and Y1's current ~25 ms per response means Bolt sometimes moves on before we answer.
+
+Wait for Bolt 0625-followup capture before committing time to this.
