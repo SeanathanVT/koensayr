@@ -541,9 +541,9 @@ Between LOAD #1's end at file `0xac54` and LOAD #2's start at file `0xbc08`, the
 
 The patcher does this with three PATCHES entries:
 
-1. Write the trampoline blob at file 0xac54. **Current size: 2036 bytes (extended_T2 + T4 + T5 + T_charset + T_battery + T_continuation + T6 + T_papp + T8 + T9 + path strings + sentinel + PApp data tables); ~1984 bytes still free in the 4020-byte padding region.** U1 is a separate 4-byte NOP elsewhere in the binary that doesn't grow the blob.
-2. Update LOAD #1 program-header `p_filesz` at file 0x64: `0xac54 → 0xb2c8` (current).
-3. Update LOAD #1 program-header `p_memsz` at file 0x68: `0xac54 → 0xb2c8`.
+1. Write the trampoline blob at file 0xac54. The blob holds T1_extended (relocated from `testparmnum` to host the wider event table), T2_extended, T4, T5, T6, T8, T9, T_charset, T_battery, T_continuation, T_papp, five shared subroutines (`restore_conn_tid` / `save_event_seq_id` / `event_subscribed` / `clear_event_database` / `incr_and_get_track_identifier`), path strings, sentinels, and PApp data tables. Cap is hard-locked at 4020 bytes; the patcher asserts on overflow and prints the exact post-build size on every run. U1 is a separate 4-byte NOP elsewhere in the binary that doesn't grow the blob.
+2. Update LOAD #1 program-header `p_filesz` at file 0x64 from `0xac54` to whatever value the post-build size lands at.
+3. Update LOAD #1 program-header `p_memsz` at file 0x68 to the same value as `p_filesz`.
 
 The trampoline at 0xac54 is reachable from the existing trampolines via `b.w` (24-bit signed offset, ±16 MB range — distance from 0x72f4 to 0xac54 is ~0x395c, well within range).
 
@@ -754,7 +754,7 @@ The JNI trampoline blob is built dynamically by `src/patches/_trampolines.py` us
 
 **Wire-level `Identifier` choice.**
 
-The wire-level `Identifier` field in TRACK_CHANGED INTERIM / CHANGED notifications is 8 zero bytes per AVRCP 1.3 §6.7.2: "For TG conforming to AVRCP 1.3, the Identifier shall always be set to 0x00...00." Non-zero values (a per-track UID, for example) are an AVRCP 1.4+ Browseable Player extension; strict 1.3 parsers silently drop CHANGED carrying a non-zero Identifier and revert to polling-only metadata refresh, producing a ~22 s lag between TRACK_CHANGED CHANGED on the wire and the CT's next GetElementAttributes (vs <1 s for permissive parsers on the same build). Backed by a single static const (`selected_track_id`) in the trampoline data section, referenced from all three emit sites: T4 reactive CHANGED, extended_T2 INTERIM, T5 proactive CHANGED.
+The wire-level `Identifier` field in TRACK_CHANGED INTERIM / CHANGED notifications is an 8-byte monotonic counter — bytes 0..6 stay zero, byte 7 increments by 1 on every emit. AVRCP 1.3 §6.7.2 specifies that the Identifier "shall be set to 0x00…00" for 1.3 TGs that don't support Browseable Player UIDs, but at least one CT in the test matrix empirically gates metadata refetch on Identifier-change detection across successive TRACK_CHANGED frames and never refetches when the same Identifier repeats. A reference 1.3 TG observed on the wire ships the same monotonic shape; spec-compliant 1.3 parsers treat the Identifier as opaque, so a monotonic counter is indistinguishable from zero for them while satisfying the change-detection CTs. Backed by `g_y1_avrcp_track_identifier` in `.bss` padding adjacent to the event database (vaddr `0xd2c4`, 8 bytes), bumped by the shared `incr_and_get_track_identifier` subroutine, referenced from all three emit sites: T4 reactive CHANGED, extended_T2 INTERIM, T5 proactive CHANGED. The counter is zeroed alongside `g_avrcp_req_event_database` on every CT-connection boundary via `clear_event_database` (called from T1 GetCapabilities).
 
 Per-track CHANGED edge information is delivered by T4 / T5 detecting divergence between `y1-track-info[0..7]` and `y1-trampoline-state[0..7]`. Both buffers still hold the per-track audio_id — only the wire payload is constrained to spec. The state file's audio_id is the synthetic value derived in `TrackInfoWriter.syntheticAudioId` (= `(path.hashCode() & 0xFFFFFFFFL) | 0x100000000L`).
 
@@ -765,14 +765,14 @@ See [`INVESTIGATION.md`](INVESTIGATION.md) "Hardware test history per CT" for th
 Three files, all in `/data/data/com.innioasis.y1/files/`:
 
 - **y1-track-info** (1104 B, mode 0644 so the BT process can open it). Written by `TrackInfoWriter` on every state change atomically via tmp+rename. Full byte-level layout in [`BT-COMPLIANCE.md`](BT-COMPLIANCE.md) §4.
-- **y1-trampoline-state** (16 B, mode 0666, world-rw, pre-created by `TrackInfoWriter.prepareFiles` at music-app startup, updated by the trampolines):
+- **y1-trampoline-state** (24 B in-memory; on-disk may be smaller from historical short writes — short reads zero-fill. Mode 0666, world-rw, pre-created by `TrackInfoWriter.prepareFiles` at music-app startup, updated by the trampolines):
   - 0..7  = last track_id we told the CT about (updated by T4 after emitting CHANGED, and by extended_T2 / T5 after emitting CHANGED)
-  - 8     = last RegisterNotification transId (updated by extended_T2)
+  - 8     = last RegisterNotification transId (T5 mirror, legacy — no longer read; per-event TIDs now live in `g_avrcp_req_event_database`)
   - 9     = last_play_status (T9 edge-detect)
   - 10    = last_battery_status (T9 edge-detect)
-  - 11    = last_repeat (T9 edge-detect)
-  - 12    = last_shuffle (T9 edge-detect)
-  - 13..15 = padding
+  - 11    = last_repeat_avrcp (T9 papp edge-detect)
+  - 12    = last_shuffle_avrcp (T9 papp edge-detect)
+  - 13..23 = padding (formerly per-event subscription gate bytes; the trampoline no longer reads or writes these — subscription state moved into `g_avrcp_req_event_database` at vaddr `0xd2b5`, `.bss`, session-scope)
 - **y1-papp-set** (2 B, mode 0666). Written by T_papp 0x14 with `[attr_id, value]` on every PApp Set; consumed by `PappSetFileObserver` in the music app, which dispatches to `SharedPreferencesUtils.setMusicRepeatMode` / `setMusicIsShuffle`.
 
 `TrackInfoWriter.prepareFiles()` ensures the BT process can reach all three files: `setExecutable(true, false)` on the files dir adds world-x for traversal; each file is created with `setReadable(true, false)` and (for the two writable from the BT side) `setWritable(true, false)`.
@@ -781,11 +781,13 @@ Three files, all in `/data/data/com.innioasis.y1/files/`:
 
 | Region | Address | Size | Used by |
 |--------|---------|------|---------|
-| `testparmnum` | 0x7308 | 48 bytes | T1 (40 bytes used) |
+| `testparmnum` | 0x7308 | 48 bytes | T1 redirect (4 bytes used — `b.w` into the in-blob T1_extended; remaining 44 bytes idle but preserved) |
 | `classInitNative` | 0x72d0 | 48 bytes | T2 stub (8 bytes used; remaining 40 zero-filled, unreachable) |
 | `notificationTrackChangedNative` | 0x3bc0 | 200 bytes | T5 entry stub (4 bytes `b.w T5` used; remaining 196 unreachable) |
 | `notificationPlayStatusChangedNative` | 0x3c88 | 200 bytes | T9 entry stub (4 bytes `b.w T9` used; remaining unreachable) |
-| LOAD #1 padding | 0xac54..0xbc07 | 4020 bytes | trampoline blob (2736 B), ~1284 free |
+| LOAD #1 padding | 0xac54..0xbc07 | 4020 bytes | full trampoline blob: T1_extended (relocated from `testparmnum` to free up the bigger event table), T2_extended, T4, T5, T6, T8, T9, T_charset, T_battery, T_continuation, T_papp + five shared subroutines (`restore_conn_tid`, `save_event_seq_id`, `event_subscribed`, `clear_event_database`, `incr_and_get_track_identifier`). Patcher asserts on overflow; the assert is currently armed at the 4020-byte ceiling. |
+| `.bss` (existing) | 0xd2b5..0xd2c3 | 15 bytes | `g_avrcp_req_event_database` — per-event subscription / TID table. Session-scope (cleared on every T1 GetCapabilities via `clear_event_database`). |
+| `.bss` (existing) | 0xd2c4..0xd2cb | 8 bytes | `g_y1_avrcp_track_identifier` — monotonic counter for TRACK_CHANGED Identifier payload. Cleared alongside the event database. |
 | `getPlayerId` | 0x7300 | 4 bytes | (preserved, returns 0 — not touched) |
 | `getMaxPlayerNum` | 0x7304 | 4 bytes | (preserved, returns 20 — not touched) |
 
@@ -828,7 +830,7 @@ When adding a new T-trampoline (e.g., GetPlayStatus PDU 0x30):
    - Buffer reset condition (when does it `memset` the internal buffer?)
    - Send trigger condition (which args make it call `AVRCP_SendMessage`?)
    - Where transId comes from (usually `conn[17]`, not an arg)
-3. **Allocate cave space** in the LOAD #1 padding region (currently ~1284 bytes free past 0xb704 — the trampoline blob is 2736 B; the padding region is 4020 B total, ending at LOAD #2's start at 0xbc08).
+3. **Allocate cave space** in the LOAD #1 padding region (4020 B total, ending at LOAD #2's start at 0xbc08). The patcher prints the post-build trampoline size on every run; remaining headroom is `4020 - blob_size`. The hard-cap assert in `patch_libextavrcp_jni.py` will fail the build before it can corrupt LOAD #2's GOT.
 4. **Wire it into the chain**: change the previous trampoline's "unknown" branch (the `b.w` to `0x65bc` or to the next trampoline) to point at your new entry.
 5. **End with**:
    - `b.w 0x712a` for the success path (lands on stack-canary check + epilogue).

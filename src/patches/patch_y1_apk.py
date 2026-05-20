@@ -2157,10 +2157,12 @@ DBG_VALUE_PATCHES_TRACKINFOWRITER = [
         "    iget-byte v0, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mPlayStatus:B\n",
         "setPlayStatus.entry",
     ),
-    # wakeTrackChanged pre-broadcast: dump trampoline-state[13..19] so we can
-    # see the §6.7.1 gates (especially state[13]=TRACK_CHANGED) at the moment
-    # we kick T5. If it stays armed across two consecutive wakes, T5 didn't
-    # emit between them (gated out, no re-RegisterNotification from CT yet).
+    # wakeTrackChanged pre-broadcast: dump trampoline-state[0..23] so we can
+    # see the last-synced track_id mirror at [0..7] and the last_* edge
+    # mirrors at [9..12] at the moment we kick T5. Subscription gating
+    # itself now lives in the JNI's g_avrcp_req_event_database (vaddr
+    # 0xd2b5, .bss), not in this file; bytes [13..23] are legacy padding
+    # the trampoline no longer reads or writes.
     (
         ".method public wakeTrackChanged()V\n"
         "    .locals 5\n"
@@ -2178,13 +2180,12 @@ DBG_VALUE_PATCHES_TRACKINFOWRITER = [
         "    iget-object v0, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mContext:Landroid/content/Context;\n",
         "wakeTrackChanged.preBroadcast",
     ),
-    # wakePlayStateChanged pre-broadcast: same diagnostic for state[14]
-    # (PLAYBACK_STATUS) / state[15] (POS) / state[16] (BATT) / state[17]
-    # (PAPP) — the four T9-emitted gates. Critical for diagnosing the
-    # play/pause icon non-update issue: if state[14] stays non-zero across
-    # successive wakes, T9 isn't emitting PLAYBACK_STATUS_CHANGED on the
-    # wire (likely because gate cleared from a prior wake, CT hasn't
-    # re-RegisterNotification'd yet).
+    # wakePlayStateChanged pre-broadcast: same diagnostic, observing the
+    # T9-mirror bytes at state[9] (last_play_status) / state[10]
+    # (last_battery_status) / state[11..12] (last_repeat_avrcp /
+    # last_shuffle_avrcp). Whether T9 actually emitted CHANGED on the
+    # wire is read off these mirrors (e.g. state[9] flips from 1 to 2
+    # after a PAUSE iff T9 emitted PLAYBACK_STATUS_CHANGED).
     (
         ".method public wakePlayStateChanged()V\n"
         "    .locals 5\n"
@@ -2203,11 +2204,12 @@ DBG_VALUE_PATCHES_TRACKINFOWRITER = [
         "wakePlayStateChanged.preBroadcast",
     ),
     # wakeTrackChanged post-broadcast: schedule a ~50 ms delayed
-    # trampoline-state read so we can compare pre vs post and answer
-    # definitively whether T5 emitted TRACK_CHANGED CHANGED on the wire
-    # (state[13] cleared between pre and post) or got gated out (byte
-    # stayed armed). Anchored on the "album" putExtra line that's unique
-    # to wakeTrackChanged.
+    # trampoline-state read so we can compare pre vs post. T5 updates the
+    # last-synced track_id mirror at state[0..7] after emitting
+    # TRACK_CHANGED CHANGED on the wire — pre[0..7] differing from
+    # post[0..7] is the positive signal that T5 actually emitted.
+    # Anchored on the "album" putExtra line that's unique to
+    # wakeTrackChanged.
     (
         "    const-string v2, \"album\"\n"
         "\n"
