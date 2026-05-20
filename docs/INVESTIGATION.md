@@ -6711,3 +6711,87 @@ Next capture should show:
 - After a natural track end (last track of session) + BT reconnect + press play, the new T5tc/T9ps/PSC pulse sequence carries `pos=0` not `pos≥duration`
 - Kia display advances from 0:00 for the first track of the session
 - No regression on Bolt's existing track-switch behavior (audio_id changes → reset path; same-track re-prepare with active playback → no natural-end latch → no spurious reset)
+
+---
+
+## Trace #80 — 2026-05-20 Pixel-as-TG audit, Y1 deviation map
+
+### Trigger
+
+Bolt 1242 capture (`/work/logs/dual-bolt-20260520-1242/`) showed Y1 emitting healthy GetEA RSP + PASSTHROUGH ACKs but zero `msg=544`, zero `T2reg`, zero `size:13 RegNotif` inbound — Bolt connected with cached bond, sent PLAY + ONE GetEA query at 12:42:42, no subscriptions all session, no display refresh after the FORWARD-triggered + natural auto-advance track changes that followed. User flagged "did not display any metadata this time" and established a durable rule: **for every AVRCP TG design question, first ask "what does the Pixel 4 in AVRCP 1.3 mode do?"** Pixel↔Bolt btsnoop is at `/work/logs/pixel4-bugreport-20260518-1959/FS/data/misc/bluetooth/logs/btsnoop_hci.log`.
+
+### Original hypothesis (wrong)
+
+Initial framing: Y1's session-scope subscription gate (`g_avrcp_req_event_database` in `libextavrcp_jni.so` .bss, wiped on every JNI lib load) is too strict — when Y1 reboots while the CT's AVRCP L2CAP channel persists, our DB drops to zero while the CT still considers itself subscribed; subsequent state-edge `wakeTrackChanged` / `wakePlayStateChanged` calls are gated to NOPs even though the CT is waiting for CHANGEDs. Proposed "emit preemptive CHANGED on state edge regardless of DB state, matching Pixel" — citing INVESTIGATION.md lines 2884/2903 as evidence Pixel emits unsolicited CHANGED outside §6.7.1.
+
+### Audit, byte-by-byte against the Pixel↔Bolt btsnoop
+
+Parsed every Pixel↔Bolt AVRCP frame with `tshark -V`. Key findings:
+
+**TID handling**: traced TIDs for PSC across frames 632 → 1359:
+
+| Frame | Dir | Kind | TID | Notes |
+|---|---|---|---|---|
+| 632  | CMD | Notify | 0x2 | initial subscribe |
+| 633  | RSP | Interim | 0x2 | Pixel echoes |
+| 730  | RSP | **Changed (unsolicited)** | **0x2** | uses stored TID=0x2 from frame 632 |
+| 741  | CMD | Notify | 0x2 | Bolt re-registers same TID |
+| 921  | RSP | Changed (unsolicited) | 0x2 | still uses 0x2 |
+| 926  | CMD | Notify | 0xe | Bolt **switches TID** |
+| 937  | RSP | Changed (unsolicited) | **0xe** | Pixel **updates stored TID** |
+| 1080 | RSP | Changed (unsolicited) | 0x6 | (Bolt switched again at frame 945) |
+| 1350 | RSP | Changed (unsolicited) | 0xe | (Bolt switched back at 1091) |
+
+Pixel's "unsolicited CHANGED" is **gated on having a stored per-event TID from a prior `RegisterNotification` CMD on the current L2CAP channel**. The stored TID updates every time the CT issues a fresh `Notify`. When Pixel has no stored TID for an event (= CT never subscribed), Pixel **does not emit** CHANGED for that event.
+
+This is byte-for-byte what Y1's `g_avrcp_req_event_database` + `_emit_check_event_subscribed` + `_emit_restore_conn_tid_from_db` already implement. **The original "preemptive CHANGED" fix premise was wrong** — Pixel does NOT emit when its database equivalent is empty. The earlier INVESTIGATION.md observation at line 2884 ("emits CHANGED unsolicited on every value change, doesn't wait for re-registration") is correct *only when the DB is populated*; once the DB has a stored TID, Pixel doesn't wait for re-register before emitting. The pre-DB-populate case is identical between Pixel and Y1.
+
+### Full Pixel ↔ Y1 deviation table
+
+| Behavior | Pixel | Y1 Current | Match? |
+|---|---|---|---|
+| GetCapabilities Events count | 8 | 8 | ✓ |
+| GetCapabilities Events list | 01,02,05,08,09,0a,0b,0c | same (T1\_ADVERTISED\_EVENTS) | ✓ |
+| GetCapabilities Companies | Bluetooth SIG only (00:19:58) | stock libextavrcp default | ✓ (single SIG companyID) |
+| GetEA: missing-attr handling | omit from response | emit `valueLen=0` (E1 patch) | **NO** |
+| GetEA: charset | UTF-8 (106) | UTF-8 | ✓ |
+| PASSTHROUGH RSP ctype | Accepted (0x09) | stock libextavrcp (Accepted) | ✓ |
+| InformDisplayableCharacterSet (PDU 0x17) RSP | Rejected (Invalid Command) | NOT\_IMPLEMENTED via UNKNOW\_INDICATION | ✓ (both reject) |
+| RegNotif first RSP ctype | Interim (0x0F) | Interim | ✓ |
+| RegNotif follow-up RSP ctype | Changed (0x0D) | Changed | ✓ |
+| Per-event TID echo on CHANGED | stored TID from RegNotif CMD | `g_avrcp_req_event_database` | ✓ |
+| Preemptive CHANGED on state edges | yes, uses stored TID | yes, gated on DB[event_id]≠0 | ✓ |
+| Emit CHANGED when DB empty | NO | NO | ✓ |
+| Clear subscription state on GetCap | NO (cleared on L2CAP disconnect) | YES (T1\_extended.clear\_event\_database) | NO (deliberate Y1 workaround for the .bss-persists-across-CT-churn model) |
+| PSC INTERIM initial PlayStatus | current state | current state | ✓ |
+| TC INTERIM Identifier | 0x00...00 (selected) | 0x00...00 | ✓ |
+| TC CHANGED Identifier | per-track counter | per-track counter | ✓ |
+| PPC CHANGED cadence | ~1 Hz | 1 Hz (PositionTicker) | ✓ |
+| Track-edge emit set | PPC=0, TC, NPCC | T5 emits same triple | ✓ |
+| SetPlayerApplicationSettingValue (PDU 0x14) | Rejected (Invalid Param) | Accepted (T_papp implements Repeat+Shuffle) | NO (deliberate Y1 feature — Pixel doesn't support PApp) |
+| BluetoothProfileDescList AVRCP version | 0x0103 | 0x0103 (V1 patch) | ✓ |
+| SupportedFeatures bits | 0x0001 | 0x0001 (V8 patch) | ✓ |
+| AVCTP TID per-event tracking | yes | yes (since d4efb6c) | ✓ |
+
+### Net conclusions
+
+**Y1 is Pixel-equivalent on every load-bearing wire behavior.** The only non-deliberate deviation is **E1**: libextavrcp.so emits zero-length attribute entries for unsupported AttributeIDs in GetEA responses; Pixel omits them entirely. The §5.3.4 strict reading (E1's original justification) is ambiguous on whether unsupported attrs must emit `valueLen=0` or may be omitted; Pixel takes the omit interpretation.
+
+**Bolt 1242's "no metadata displayed" symptom is not addressable from Y1 side.** Bolt did not send `RegisterNotification` in this session; without subscriptions, Pixel-equivalent behavior is silence (no `msg=544` outbound), and Bolt's lack of re-query after the FORWARD+auto-advance keeps its display stale. We do not have evidence of any wire byte we could change that would induce Bolt to subscribe — the prior Bolt 0625 session, which did subscribe, used byte-identical Y1 SDP + GetCapabilities responses.
+
+This shape also matches Kia's ~11% per-session polling-mode rate (see Trace #79's table) — CT-side subscription decisions vary across sessions for reasons not visible to the TG.
+
+### Open decision: revert E1?
+
+E1 is the one non-deliberate Pixel deviation. Reverting:
+
+- Removes `[E1] GetElementAttributes empty-attr drop -> NOP (§5.3.4 zero-length emit)` from `patch_libextavrcp.py` PATCHES list
+- Net wire delta: GetEA RSP no longer carries `attr_id=0x08` (BIP cover handle, always empty on Y1) and any other attrs T4 emits with `valueLen=0`
+- Risk: if any untested CT relied on the zero-length entries, that CT loses an entry it expected. No evidence such a CT exists in the test matrix.
+- Net: byte-for-byte Pixel parity on GetEA shape.
+
+Reverting **does not** fix Bolt 1242 (E1's behavior was never triggered there — all 7 attrs Bolt requested had data). It is a clean Pixel-parity improvement with no clear downside, but should land with explicit user sign-off given E1's deliberate prior addition.
+
+### Open decision: capture Bolt with pre-pair-initiated `dual-capture.sh`
+
+To narrow whether Bolt 1242's no-subscribe behavior is repeatable or session-state-dependent, capture the next Bolt session with `dual-capture.sh` started BEFORE pairing (or at least before AVRCP channel open). The pre-pair window will contain `connect_ind`/`CONNECT_CNF` and any GetCapabilities + RegNotifs in the clear, letting us see whether Bolt is doing the handshake at all.
