@@ -29,10 +29,12 @@ declare the `<service>` MtkBt's `bindService` resolves to.
   `getAudioId` (27), `getTrackName` (28), `getAlbumName` (29),
   `getArtistName` (31), `getRepeatMode` (19), `getShuffleMode` (17), and
   `getCapabilities` (5) — by reading live values from
-  `/data/data/com.innioasis.y1/files/y1-track-info` (the 1104-byte file
-  maintained by the music app's injected `TrackInfoWriter`, world-readable
-  per `setReadable(true, false)`). The Binder thread reads on every call
-  so MtkBt's Java mirror always reflects current state. Callback-register,
+  `/data/data/com.innioasis.y1/files/y1-track-info` (the 2213-byte double-
+  buffer file maintained by the music app's injected `TrackInfoWriter`,
+  world-readable per `setReadable(true, false)`). `MediaBridgeService.readTrackInfo`
+  dispatches `file[0]` to the active 1104-byte slot before per-field
+  parsing. The Binder thread reads on every call so MtkBt's Java mirror
+  always reflects current state. Callback-register,
   notification-register, setter, and passthrough codes (1, 2, 3, 4, 6–14,
   16, 18, 20, 22, 23, 32–37) ack with the success replies that keep
   `BTAvrcpMusicAdapter.mRegBit` armed.

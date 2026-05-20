@@ -173,6 +173,20 @@ If we ever do exhaust LOAD #1 padding, the fallback is to extend the same trick 
 
 ## 4. y1-track-info schema (cumulative)
 
+File-level wrapper (since v[Unreleased]; mmap-rework):
+
+| File offset | Size | Contents |
+|---|---|---|
+| 0 | 1 B | `active_slot` — single-byte indicator (0 or 1). Reader's atomic load → dispatch. Writer's atomic store after slot fill flips this. |
+| 1..3 | 3 B | RFA padding (4-B align slot[0]). |
+| 4..1107 | 1104 B | **slot[0]** — 1104-byte schema below (in-place when `active_slot == 0` on read, fresh write target when `active_slot == 1`). |
+| 1108..2211 | 1104 B | **slot[1]** — second copy. |
+| 2212 | 1 B | RFA padding. |
+
+Total file: **2213 B**. Reader (`libextavrcp_jni.so` trampolines via `get_or_init_mmap` + `read_track_info`) memory-maps the file once per process, reads `file[0]` per emit to pick the slot, byte-copies the 1104-byte payload (or any sub-range via `slot_offset`) into the trampoline's stack `file_buf`. Writer (`TrackInfoWriter.flushLocked`) writes the inactive slot via `RandomAccessFile.seek+write`, then atomically flips `file[0]` to point at the just-written slot — readers never observe a torn slot.
+
+Per-slot schema (offsets relative to the active slot's start):
+
 | Offset | Field | Size | Status | Source |
 |---|---|---|---|---|
 | 0..7 | track_id (synthetic) | 8 | shipped | `Song.getId()` or `syntheticAudioId(path)` fallback (read live from `PlayerService.getCurrentSong()` in `TrackInfoWriter.flushLocked`) |
@@ -194,7 +208,7 @@ If we ever do exhaust LOAD #1 padding, the fallback is to extend the same trick 
 | 832..847 | PlayingTime (UTF-8 ASCII decimal ms) | 16 | shipped | derived from `duration_ms` |
 | 848..1103 | Genre (UTF-8) | 256 | shipped | `MediaStore.Audio.Genres` / `METADATA_KEY_GENRE` |
 
-Total file size: **1104 B**. Page-aligned write is still single-block. Schema bumps are append-only; we never relocate existing fields, so older trampolines keep working against a newer file (T6 / T8 / T9 only read up to offset 792 and are unaffected by attrs 4-7 being appended past 800).
+Total slot size: **1104 B**. Per-slot schema is append-only; we never relocate existing fields. The file-level wrapper (1 B `active_slot` + 3 B pad + 2 × 1104 B slots + 1 B pad = 2213 B) keeps reader / writer race-free without `tmpfile + rename`.
 
 The numeric AVRCP §5.3.4 attrs (4 / 5 / 7) are stored pre-formatted as ASCII decimal strings rather than binary u16 / u32 with a Thumb-2 itoa, keeping the T4 trampoline a uniform strlen+memcpy loop.
 

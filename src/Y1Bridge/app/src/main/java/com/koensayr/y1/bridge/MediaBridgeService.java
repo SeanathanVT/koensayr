@@ -24,8 +24,10 @@ import java.nio.charset.Charset;
  * {@code docs/ARCHITECTURE.md}). The bridge process therefore hosts the
  * Binder. State queries from {@code BTAvrcpMusicAdapter} are answered live
  * from {@code /data/data/com.innioasis.y1/files/y1-track-info}, the
- * 1104-byte file maintained by the music app's injected
- * {@code TrackInfoWriter} (Patch B5).
+ * 2213-byte double-buffer file maintained by the music app's injected
+ * {@code TrackInfoWriter} (Patch B5). {@link #readTrackInfo()} dispatches
+ * the active slot and returns the 1104-byte slot content so per-field
+ * offsets stay slot-relative.
  *
  * <p>The proactive {@code IBTAvrcpMusicCallback} dispatch path is handled
  * out-of-band by the music-app-side wake helpers plus MtkBt's cardinality
@@ -42,7 +44,14 @@ public class MediaBridgeService extends Service {
 
     private static final String TRACK_INFO_PATH =
             "/data/data/com.innioasis.y1/files/y1-track-info";
-    private static final int TRACK_INFO_SIZE = 1104;
+    // Double-buffer schema (post-mmap rework): file[0] = active_slot,
+    // file[1..3] = RFA, file[4..1107] = slot[0], file[1108..2211] = slot[1],
+    // file[2212] = RFA. readTrackInfo() returns the 1104-byte active slot
+    // contents so the rest of this class's field offsets (OFF_AUDIO_ID,
+    // OFF_TITLE, ...) remain slot-relative and unchanged.
+    private static final int TRACK_INFO_FILE_SIZE = 2213;
+    private static final int TRACK_INFO_SLOT_SIZE = 1104;
+    private static final int TRACK_INFO_SLOT0_OFF = 4;
     // y1-papp-set — 2-byte (attr_id, AVRCP value) tuple consumed by the
     // music app's PappSetFileObserver. World-writable per ensureFile
     // (TrackInfoWriter.smali:243-245). Backstop sink when a Java-routed
@@ -86,15 +95,31 @@ public class MediaBridgeService extends Service {
     }
 
     private static byte[] readTrackInfo() {
-        byte[] buf = new byte[TRACK_INFO_SIZE];
+        // Read the full double-buffer file, dispatch on active_slot, return
+        // the 1104 active-slot bytes so the rest of this class continues to
+        // index via slot-relative OFF_* offsets.
+        byte[] raw = new byte[TRACK_INFO_FILE_SIZE];
+        byte[] slot = new byte[TRACK_INFO_SLOT_SIZE];
         FileInputStream in = null;
         try {
             in = new FileInputStream(TRACK_INFO_PATH);
             int total = 0;
-            while (total < TRACK_INFO_SIZE) {
-                int n = in.read(buf, total, TRACK_INFO_SIZE - total);
+            while (total < TRACK_INFO_FILE_SIZE) {
+                int n = in.read(raw, total, TRACK_INFO_FILE_SIZE - total);
                 if (n < 0) break;
                 total += n;
+            }
+            if (total >= TRACK_INFO_FILE_SIZE) {
+                int active = raw[0] & 0x1;
+                int srcOff = TRACK_INFO_SLOT0_OFF + active * TRACK_INFO_SLOT_SIZE;
+                System.arraycopy(raw, srcOff, slot, 0, TRACK_INFO_SLOT_SIZE);
+            } else if (total >= TRACK_INFO_SLOT_SIZE) {
+                // Pre-mmap-upgrade transient: a 1104-byte file still on disk
+                // from an older firmware version. Treat as flat slot data
+                // (active=0, no leading byte). This branch becomes unreachable
+                // once the music app's prepareFilesLocked extends the file to
+                // 2213 B on next boot.
+                System.arraycopy(raw, 0, slot, 0, TRACK_INFO_SLOT_SIZE);
             }
         } catch (IOException ignored) {
             // Cold boot / music app not yet up. Zero-filled buffer = sensible
@@ -102,7 +127,7 @@ public class MediaBridgeService extends Service {
         } finally {
             if (in != null) try { in.close(); } catch (IOException ignored) {}
         }
-        return buf;
+        return slot;
     }
 
     private static long readBeU64(byte[] buf, int off) {
