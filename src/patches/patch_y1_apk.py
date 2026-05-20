@@ -2027,20 +2027,25 @@ DBG_VALUE_PATCHES_TRACKINFOWRITER = [
         "    # === END DEBUG ===\n",
         "onTrackEdge.newAudioId",
     ),
-    # onTrackEdge: log when the EDGE branch fires (audio_ids differed →
-    # we'll reset mPositionAtStateChange to 0 + stamp mLastFreshTrackChangeAt).
+    # onTrackEdge: log when the reset branch fires. Two triggers funnel here:
+    #   1. audio_id changed (real track edge)
+    #   2. mPreviousTrackNaturalEnd was set (EOS-replay-same-track — see
+    #      Trace #79 in docs/INVESTIGATION.md)
+    # Inject AFTER :cond_force_reset so both paths emit the log.
     (
         "    if-eqz v4, :cond_same_track\n"
         "\n"
-        "    # Real track edge — reset position anchor and re-flush.\n",
+        "    :cond_force_reset\n"
+        "    # Reset position anchor and re-flush.\n",
         "    if-eqz v4, :cond_same_track\n"
         "\n"
+        "    :cond_force_reset\n"
         "    # === DEBUG: edge detected ===\n"
         "    const-string v4, \"onTE.EDGE_DETECTED\"\n"
         "    invoke-static {v4}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->_dbg(Ljava/lang/String;)V\n"
         "    # === END DEBUG ===\n"
         "\n"
-        "    # Real track edge — reset position anchor and re-flush.\n",
+        "    # Reset position anchor and re-flush.\n",
         "onTrackEdge.EDGE",
     ),
     # flushLocked: 4-line summary just before the FileOutputStream write —
