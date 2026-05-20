@@ -6961,3 +6961,53 @@ The on-disk `y1-trampoline-state` file is no longer read or written by any tramp
 ### `path_state` literal removed
 
 The "/data/data/com.innioasis.y1/files/y1-trampoline-state" string in the trampoline data section is no longer referenced. Removed. -56 B from the blob.
+
+---
+
+## Trace #84 — 2026-05-20 Y1Bridge readTrackInfo → mmap (Tier 2)
+
+### Motivation
+
+Last remaining hot on-disk read in the AVRCP-metadata pipeline: `MediaBridgeService.readTrackInfo()` did a full `FileInputStream` open + read + close on every `IBTAvrcpMusic` Binder query (`getPlayStatus` / `position` / `duration` / `getAudioId` / `getTrackName` / `getAlbumName` / `getArtistName` / `getRepeatMode` / `getShuffleMode`). MtkBt's `BTAvrcpMusicAdapter` issues these whenever its Java mirror needs refresh — under heavy CT polling that can be tens of queries/sec.
+
+### Change
+
+`MediaBridgeService` now lazy-inits a `MappedByteBuffer` over `/data/data/com.innioasis.y1/files/y1-track-info` via `FileChannel.map(READ_ONLY, 0, 2213)` at first read. The buffer is held in a `static volatile MappedByteBuffer sTrackInfoMap` (process-global; `AvrcpBinder` is a `private static final class` so the read path must be static-reachable). Subsequent calls hit the cached buffer; `readTrackInfo()` dispatches `file[0]` to the active 1104-byte slot and bulk-copies into a return buffer via `MappedByteBuffer.duplicate().position(srcOff).get(byte[])`.
+
+Cross-process correctness: the music app's `TrackInfoWriter.flushLocked` does in-place `RandomAccessFile.seek+write` against the same inode. Kernel page cache propagates writes through the shared mapping pages; Y1Bridge's reader sees current state without re-opening the file. Same shared-inode pattern used by the trampoline chain in `libextavrcp_jni.so` on the BT-process side.
+
+Lazy-init failure semantics match the trampoline side's `get_or_init_mmap`: no sticky failure flag, every cache-miss call retries the open + map. Handles the cold-boot case where Y1Bridge starts before the music app's `prepareFilesLocked` has created the file.
+
+### Per-query savings
+
+Old:
+- 1 × `open(2)` syscall
+- ≥1 × `read(2)` syscall (loop until full 2213 B copied)
+- 1 × `close(2)` syscall
+- Per-call `byte[] raw = new byte[2213]` heap allocation + `System.arraycopy` slot extraction
+
+New:
+- 1 × `MappedByteBuffer.get(0)` (single-byte memory load — active_slot)
+- 1 × `duplicate()` (cheap; just a buffer-state copy, no data copy)
+- 1 × bulk `get(byte[], 0, 1104)` (JNI memcpy from shared page-cache pages)
+- Still allocates the return `byte[1104]` (could be cached too, but minor)
+
+Net: 3 syscalls eliminated per Binder query. Under heavy CT polling (~20-30 queries/sec observed in TV captures), that's ~60-90 syscalls/sec saved on the Y1Bridge side.
+
+### Verification path
+
+Requires `cd src/Y1Bridge && ./gradlew --stop && ./gradlew assembleDebug` before `apply.bash --bluetooth` since Java source changed. Y1Bridge.apk MD5 will shift; not pinned by patcher.
+
+### End-state on-disk inventory (AVRCP metadata path)
+
+After Tier 2 ships, the AVRCP-metadata pipeline has **zero on-disk reads in the hot path**. Remaining file I/O surface:
+
+| Path | Direction | Frequency | Treatment |
+|---|---|---|---|
+| y1-track-info | music app writes (`RandomAccessFile.seek+write`) | per state edge | kernel page cache propagates to mmap readers (BT process + Y1Bridge); reader-side has zero syscalls |
+| y1-track-info | trampolines read (`mmap2`) | per AVRCP frame | served from page cache (RAM) |
+| y1-track-info | Y1Bridge reads (`MappedByteBuffer.get`) | per Binder query | served from same page cache (RAM) |
+| y1-papp-set | mtkbt writes via T_papp 0x14 | per CT-initiated Repeat/Shuffle Set | still file-based; FileObserver CLOSE_WRITE wakes music app. Rare; not worth converting. |
+| y1-trampoline-state | (dead file, still ensure-created) | never read or written by trampolines | cosmetic cleanup deferred |
+
+The writer-side `RandomAccessFile.seek+write` is the architectural floor — you can't have cross-process page-cache propagation without the kernel write syscall path. That's the irreducible minimum.

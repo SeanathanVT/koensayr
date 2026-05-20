@@ -9,10 +9,11 @@ import android.os.RemoteException;
 import android.os.SystemClock;
 import android.util.Log;
 
-import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
 
 /**
@@ -25,9 +26,13 @@ import java.nio.charset.Charset;
  * Binder. State queries from {@code BTAvrcpMusicAdapter} are answered live
  * from {@code /data/data/com.innioasis.y1/files/y1-track-info}, the
  * 2213-byte double-buffer file maintained by the music app's injected
- * {@code TrackInfoWriter} (Patch B5). {@link #readTrackInfo()} dispatches
- * the active slot and returns the 1104-byte slot content so per-field
- * offsets stay slot-relative.
+ * {@code TrackInfoWriter} (Patch B5). The file is mmap'd once at first
+ * read via {@link #getOrInitTrackInfoMap()} and held for the Service
+ * lifetime; per-query reads become memory loads (no syscall, no
+ * allocation per query) — same shared-inode trick the trampoline chain
+ * in {@code libextavrcp_jni.so} uses on the BT-process side.
+ * {@link #readTrackInfo()} dispatches the active slot and returns the
+ * 1104-byte slot content so per-field offsets stay slot-relative.
  *
  * <p>The proactive {@code IBTAvrcpMusicCallback} dispatch path is handled
  * out-of-band by the music-app-side wake helpers plus MtkBt's cardinality
@@ -78,6 +83,22 @@ public class MediaBridgeService extends Service {
 
     private final IBinder mBinder = new AvrcpBinder();
 
+    // Lazy-init mmap of y1-track-info shared with the music app's
+    // TrackInfoWriter (same inode). The music app writes in-place via
+    // RandomAccessFile.seek+write, the kernel page-cache propagates those
+    // writes to this mapping, and per-query reads become memory loads —
+    // no syscall per IBTAvrcpMusic Binder query.
+    //
+    // Static (process-global): readTrackInfo is invoked from AvrcpBinder
+    // (which is a `private static final class`) and must therefore be
+    // static itself. Holding the mmap as a static field is fine — there's
+    // only one Y1Bridge process per Y1, the inode is always the same, and
+    // the mapping lives until process exit. Java spec: closing the
+    // FileChannel does NOT unmap the buffer; the mapping persists as long
+    // as the buffer is referenced.
+    private static volatile MappedByteBuffer sTrackInfoMap;
+    private static final Object TRACK_INFO_MAP_LOCK = new Object();
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -94,39 +115,55 @@ public class MediaBridgeService extends Service {
         return true;
     }
 
-    private static byte[] readTrackInfo() {
-        // Read the full double-buffer file, dispatch on active_slot, return
-        // the 1104 active-slot bytes so the rest of this class continues to
-        // index via slot-relative OFF_* offsets.
-        byte[] raw = new byte[TRACK_INFO_FILE_SIZE];
-        byte[] slot = new byte[TRACK_INFO_SLOT_SIZE];
-        FileInputStream in = null;
-        try {
-            in = new FileInputStream(TRACK_INFO_PATH);
-            int total = 0;
-            while (total < TRACK_INFO_FILE_SIZE) {
-                int n = in.read(raw, total, TRACK_INFO_FILE_SIZE - total);
-                if (n < 0) break;
-                total += n;
+    private static MappedByteBuffer getOrInitTrackInfoMap() {
+        MappedByteBuffer m = sTrackInfoMap;
+        if (m != null) return m;
+        synchronized (TRACK_INFO_MAP_LOCK) {
+            if (sTrackInfoMap != null) return sTrackInfoMap;
+            RandomAccessFile raf = null;
+            try {
+                raf = new RandomAccessFile(TRACK_INFO_PATH, "r");
+                FileChannel ch = raf.getChannel();
+                m = ch.map(FileChannel.MapMode.READ_ONLY, 0, TRACK_INFO_FILE_SIZE);
+                // FileChannel can be closed safely — the mapping lives in the
+                // MappedByteBuffer's referent and persists across raf.close().
+                sTrackInfoMap = m;
+                return m;
+            } catch (IOException e) {
+                // Cold boot / file not yet at 2213 B / no permission. Caller
+                // gets null and falls back to zero-filled defaults. Subsequent
+                // calls retry init (no sticky-failure flag — same semantic as
+                // the trampoline-side get_or_init_mmap).
+                return null;
+            } finally {
+                if (raf != null) try { raf.close(); } catch (IOException ignored) {}
             }
-            if (total >= TRACK_INFO_FILE_SIZE) {
-                int active = raw[0] & 0x1;
-                int srcOff = TRACK_INFO_SLOT0_OFF + active * TRACK_INFO_SLOT_SIZE;
-                System.arraycopy(raw, srcOff, slot, 0, TRACK_INFO_SLOT_SIZE);
-            } else if (total >= TRACK_INFO_SLOT_SIZE) {
-                // Pre-mmap-upgrade transient: a 1104-byte file still on disk
-                // from an older firmware version. Treat as flat slot data
-                // (active=0, no leading byte). This branch becomes unreachable
-                // once the music app's prepareFilesLocked extends the file to
-                // 2213 B on next boot.
-                System.arraycopy(raw, 0, slot, 0, TRACK_INFO_SLOT_SIZE);
-            }
-        } catch (IOException ignored) {
-            // Cold boot / music app not yet up. Zero-filled buffer = sensible
-            // defaults (play_status=STOPPED, duration=0, empty strings).
-        } finally {
-            if (in != null) try { in.close(); } catch (IOException ignored) {}
         }
+    }
+
+    private static byte[] readTrackInfo() {
+        // mmap path: dispatch active_slot, byte-copy 1104 active-slot bytes
+        // into the return buffer (so per-field OFF_* offsets stay slot-
+        // relative for the existing readBeU64 / readUtf8 helpers).
+        //
+        // System.arraycopy on a MappedByteBuffer slice is a JNI memcpy — much
+        // cheaper than the prior open + read + close syscall chain.
+        byte[] slot = new byte[TRACK_INFO_SLOT_SIZE];
+        MappedByteBuffer m = getOrInitTrackInfoMap();
+        if (m != null) {
+            int active = m.get(0) & 0x1;
+            int srcOff = TRACK_INFO_SLOT0_OFF + active * TRACK_INFO_SLOT_SIZE;
+            // MappedByteBuffer.get(int) reads a single byte; for bulk copy
+            // we duplicate, position, and get(byte[]) to avoid affecting
+            // shared buffer position (the buffer is shared across all
+            // Binder threads via the volatile field).
+            MappedByteBuffer dup = (MappedByteBuffer) m.duplicate();
+            dup.position(srcOff);
+            dup.get(slot, 0, TRACK_INFO_SLOT_SIZE);
+        }
+        // m == null leaves slot zero-filled — sensible AVRCP defaults
+        // (play_status=STOPPED, duration=0, empty strings). Same fallback
+        // semantic as the prior FileInputStream-failure path.
         return slot;
     }
 
