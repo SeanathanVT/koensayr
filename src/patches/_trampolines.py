@@ -880,21 +880,23 @@ def _emit_t5(a: Asm) -> None:
 
     a.label("t5_changed")
 
-    # ---- emit NowPlayingContentChanged (event 0x09) ----
-    # NowPlayingContent CHANGED on every track edge. Gate on database[9] !=
-    # 0 (i.e., Bolt sent RegisterNotification(ev=09) this session). Database
-    # is in .bss (wiped on every libextavrcp_jni.so load), so ghost-arms
-    # from previous sessions can't trigger spurious CHANGEDs after reboot
-    # or process restart. event_subscribed also clobbers r0 (= database
-    # byte) — we re-load r0 = conn after the gate.
-    _emit_check_event_subscribed(a, 0x09, "t5_skip_now_playing")
-    a.add_imm_t3(0, 4, 8)                     # r0 = conn
-    _emit_restore_conn_tid_from_db(a, 0, 0x09, "t5_ncc")
-    a.movs_imm8(1, 0)                         # success
-    a.movs_imm8(2, REASON_CHANGED)
-    a.blx_imm(PLT_reg_notievent_now_playing_content_rsp)
-
-    a.label("t5_skip_now_playing")
+    # ---- Emit order matches Pixel-as-TG-in-AVRCP-1.3-mode observed on
+    # the wire (Pixel↔Bolt btsnoop, frames 967/968/973): PPC=0 →
+    # TC → NPCC. Position reset arrives first so the CT zeroes the
+    # playhead before processing the identity change; TC arrives second
+    # so the CT registers the new track ID before NPCC's now-playing
+    # refresh hits. Empirically (Trace #82), Y1's prior NPCC-first
+    # ordering caused the now-playing refresh to land while the CT
+    # still considered the OLD track the "selected" one, briefly
+    # holding the OLD position on screen until TC arrived and forced
+    # a re-query.
+    #
+    # TR_END / TR_START are emitted AFTER the Pixel-parity triple. Pixel
+    # itself doesn't advertise them (GetCap Events list = 01/02/05/08/
+    # 09/0a/0b/0c, no 03/04), so order-relative-to-Pixel is undefined.
+    # Keeping them where they are now (post-TC) maintains backward compat
+    # for any strict-1.3 CT that has subscribed to them via T8 INTERIM
+    # (rare in our test matrix but possible).
 
     # ---- emit PLAYBACK_POS_CHANGED (event 0x05) on track edge ----
     # Carries the current position (= duration_ms on natural end, = 0 on
@@ -910,26 +912,6 @@ def _emit_t5(a: Asm) -> None:
     a.blx_imm(PLT_reg_notievent_pos_changed_rsp)
 
     a.label("t5_skip_pos_changed")
-
-    # ---- emit TRACK_REACHED_END (event 0x03) only if natural AND subscribed ----
-    # AVRCP 1.3 §5.4.2 Table 5.31. ICS Table 7 row 25 (Optional). Two gates:
-    #   1. previous-track-natural-end flag at file[793] (set by music app
-    #      before metachanged broadcast)
-    #   2. sub_track_reached_end bit at state[17] (armed by T8 INTERIM emit;
-    #      stays armed across CHANGEDs — universal §5.4.2 reading).
-    a.ldrb_w(0, 13, T5_OFF_FILE_NATURAL_END)
-    a.cmp_imm8(0, 0)
-    a.beq("t5_skip_reached_end")
-    _emit_check_event_subscribed(a, 0x03, "t5_skip_reached_end")
-
-    # reg_notievent_reached_end_rsp(conn, 0, REASON_CHANGED)
-    a.add_imm_t3(0, 4, 8)                     # r0 = r4 + 8 (conn)
-    _emit_restore_conn_tid_from_db(a, 0, 0x03, "t5_re_end")
-    a.movs_imm8(1, 0)                         # r1 = 0 (success)
-    a.movs_imm8(2, REASON_CHANGED)
-    a.blx_imm(PLT_reg_notievent_reached_end_rsp)
-
-    a.label("t5_skip_reached_end")
 
     # ---- emit TRACK_CHANGED (event 0x02) — gated on subscription ----
     # AVRCP 1.3 §5.4.2 Table 5.30 + §6.7.2: 1.3 TGs shall emit
@@ -966,6 +948,42 @@ def _emit_t5(a: Asm) -> None:
     # is preserved via the database read in _emit_restore_conn_tid_from_db.
 
     a.label("t5_skip_track_changed")
+
+    # ---- emit NowPlayingContentChanged (event 0x09) ----
+    # NowPlayingContent CHANGED on every track edge. Gate on database[9] !=
+    # 0 (i.e., Bolt sent RegisterNotification(ev=09) this session). Database
+    # is in .bss (wiped on every libextavrcp_jni.so load), so ghost-arms
+    # from previous sessions can't trigger spurious CHANGEDs after reboot
+    # or process restart. event_subscribed also clobbers r0 (= database
+    # byte) — we re-load r0 = conn after the gate.
+    _emit_check_event_subscribed(a, 0x09, "t5_skip_now_playing")
+    a.add_imm_t3(0, 4, 8)                     # r0 = conn
+    _emit_restore_conn_tid_from_db(a, 0, 0x09, "t5_ncc")
+    a.movs_imm8(1, 0)                         # success
+    a.movs_imm8(2, REASON_CHANGED)
+    a.blx_imm(PLT_reg_notievent_now_playing_content_rsp)
+
+    a.label("t5_skip_now_playing")
+
+    # ---- emit TRACK_REACHED_END (event 0x03) only if natural AND subscribed ----
+    # AVRCP 1.3 §5.4.2 Table 5.31. ICS Table 7 row 25 (Optional). Two gates:
+    #   1. previous-track-natural-end flag at file[793] (set by music app
+    #      before metachanged broadcast)
+    #   2. sub_track_reached_end bit at state[17] (armed by T8 INTERIM emit;
+    #      stays armed across CHANGEDs — universal §5.4.2 reading).
+    a.ldrb_w(0, 13, T5_OFF_FILE_NATURAL_END)
+    a.cmp_imm8(0, 0)
+    a.beq("t5_skip_reached_end")
+    _emit_check_event_subscribed(a, 0x03, "t5_skip_reached_end")
+
+    # reg_notievent_reached_end_rsp(conn, 0, REASON_CHANGED)
+    a.add_imm_t3(0, 4, 8)                     # r0 = r4 + 8 (conn)
+    _emit_restore_conn_tid_from_db(a, 0, 0x03, "t5_re_end")
+    a.movs_imm8(1, 0)                         # r1 = 0 (success)
+    a.movs_imm8(2, REASON_CHANGED)
+    a.blx_imm(PLT_reg_notievent_reached_end_rsp)
+
+    a.label("t5_skip_reached_end")
 
     # ---- emit TRACK_REACHED_START (event 0x04) — gated on subscription ----
     # AVRCP 1.3 §5.4.2 Table 5.32. ICS Table 7 row 26 (Optional).

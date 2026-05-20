@@ -6839,3 +6839,58 @@ All current readers pass `r2 = 0` except T_papp's PDU 0x13 GetCurrent paths, whi
 ### Open question (preserved from Trace #80)
 
 The Bolt 1336 "metadata froze after 2-3 s of playback" symptom remains unexplained. Wire data verified Pixel-equivalent; mmap doesn't change a byte going out on the wire, only the latency profile. Hypothesis pending wire-byte capture: Y1's 644-byte GetEA RSP frame structure may differ subtly from Pixel's 70-byte response in a way Bolt's parser dislikes. Next investigation step: add a trampoline-side `_emit_native_log_u32` byte-dump of the outbound GetEA RSP, compare against Pixel's btsnoop frame-for-frame.
+
+---
+
+## Trace #82 — 2026-05-20 T5 emit order: NPCC-first → Pixel-parity PPC-first
+
+### Trigger
+
+User recalled an earlier observation: Pixel pre-sets track position to 0:00 before starting the next song, so the playhead is already at 0:00 when audio begins. Y1's behavior appeared opposite — position lingered briefly before snapping to 0:00 / 0:01. Asked whether the Trace #80 audit had missed this. It had.
+
+### What Pixel does (re-parsed from `/work/logs/pixel4-bugreport-20260518-1959/.../btsnoop_hci.log`, frames 961–973 around a FORWARD press)
+
+```
+100.517 s  Rcvd PASS-THROUGH FORWARD (Pushed)
+100.518 s  Sent PASS-THROUGH Accepted
+100.559 s  Rcvd PASS-THROUGH FORWARD (Released)
+100.559 s  Sent PASS-THROUGH Accepted
+100.599 s  Sent Changed - PlaybackPositionChanged - SongPosition: 0ms
+100.604 s  Sent Changed - TrackChanged - 0x0000000000000002
+100.633 s  Sent Changed - NowPlayingContentChanged
+100.657 s  Rcvd Status - GetElementAttributes
+100.659 s  Sent Stable - GetElementAttributes - Title: "DANCE WITH ME"
+100.663 s  Sent Changed - PlaybackPositionChanged - SongPosition: 6ms
+```
+
+Order: **PPC=0 → TC → NPCC**, within 34 ms. Pixel emits PPC=0 first so the CT zeroes the playhead before processing TC. NPCC fires last as content notification.
+
+### What Y1 was doing
+
+T5's track-edge burst emit order in `_emit_t5` was:
+
+```
+NPCC (0x09) → PPC (0x05) → TR_END (0x03, cond) → TC (0x02) → TR_START (0x04, cond)
+```
+
+NPCC first — the now-playing refresh hits the CT while the CT still considers the OLD track to be the "selected" one. The CT's now-playing list re-query lands against the OLD track context. PPC=0 follows but applies to a track ID the CT doesn't know changed yet. TC arrives last, only then is the new track ID registered. Net visible-on-screen effect: brief moment of old-track-at-position-0 (or stale position lingering) before TC forces metadata re-query.
+
+### Fix
+
+Reordered to match Pixel's wire sequence: **PPC → TC → NPCC**. TR_END / TR_START remain in T5, emitted AFTER the Pixel-parity triple — Pixel doesn't advertise events 0x03 / 0x04 (GetCap Events list = `01 02 05 08 09 0a 0b 0c`), so their order is undefined relative to Pixel's behavior; keeping them post-TC preserves backward compat for any subscription-class CT that subscribes to them via T8 INTERIM.
+
+Conservative scope:
+- Reorder only — no events dropped, no payloads changed
+- T8 still advertises 0x03 / 0x04 INTERIM responses (subscription path)
+- TR_END gate still requires `file[793] = 1` (natural-end flag) AND `database[3] != 0`
+- Each emit's existing TID-restore + payload-build logic unchanged
+
+### Regression-risk surface
+
+- **TV / Sonos / Kia**: current captures all work with the NPCC-first order. Reordering changes wire behavior for every CT, not just Bolt. Mitigation: smoke-test all four CTs before claiming success.
+- **Bolt freeze**: untested whether the reorder addresses the Bolt 1336 "metadata frozen after 2-3 s" symptom. Other Trace #80/#81 hypotheses (wire-byte structural mismatch) are still candidates.
+- **Spec position**: AVRCP 1.3 doesn't mandate order for unsolicited CHANGED bursts. Reorder is spec-permissible.
+
+### Blob impact
+
+Pure code reorder, same byte count (3344 B post-reorder = 3344 B pre-reorder). 676 B free of 4020. No budget risk.
