@@ -672,6 +672,22 @@
     # see the new track even if we end up taking the same-track path below.
     invoke-direct {p0}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->flushLocked()V
 
+    # Two independent reset triggers:
+    #   1. audio_id changed (real track edge)
+    #   2. previous track ended naturally (mPreviousTrackNaturalEnd, latched
+    #      from mPendingNaturalEnd above) — covers the EOS-replay-same-track
+    #      case where the player is re-preparing the SAME track that just
+    #      naturally completed. markCompletion left
+    #      mPositionAtStateChange = mLastKnownDuration (freeze at end);
+    #      without a reset here T9's live-extrapolation emits
+    #      live_pos = duration + (now - completion_time) on every PPC tick,
+    #      which CTs render as "playhead at end of track, frozen there"
+    #      even though audio is playing the freshly re-prepared track from 0.
+    #      Trace #79 in docs/INVESTIGATION.md.
+    iget-boolean v4, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mPreviousTrackNaturalEnd:Z
+
+    if-nez v4, :cond_force_reset
+
     # Compare new audio_id (just written) with snapshot.
     iget-wide v2, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mCachedAudioId:J
 
@@ -679,7 +695,8 @@
 
     if-eqz v4, :cond_same_track
 
-    # Real track edge — reset position anchor and re-flush.
+    :cond_force_reset
+    # Reset position anchor and re-flush.
     const-wide/16 v0, 0x0
 
     iput-wide v0, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mPositionAtStateChange:J

@@ -6596,3 +6596,118 @@ Considered: gate only when `mPlayStatus` is unchanged. Already done. The problem
 This is a strong signal that the ProviderName addition was load-bearing. Hypothesis: Kia's CT-side SDP parser rejected the Y1 TG record before P_PN0/P_PN1 because attribute `0x0102 ProviderName` was missing, falling back to polling-only metadata refresh. With ProviderName present, Kia accepts the TG and uses subscribe-based refresh.
 
 If true, this same path may also affect any other CT in the matrix that's been "lagging" (Kia's lag was traced to polling cadence). Worth re-running the TV / Sonos captures after this commit to see if their behavior changed too.
+
+## Trace #79 (2026-05-20) — onTrackEdge dedup leaks markCompletion's "frozen at duration" anchor into the next track's re-prepare
+
+### User report
+
+After commit `8e4b23e` (PositionTicker rate-limit bypass), Kia's position display works correctly EXCEPT: "a quick freeze on the first track played after connecting. It was as if the track playhead was at the end of the track. Not advancing but 'complete' even though audio was still playing. It fixed itself when the track advanced."
+
+### Symptom decomposition
+
+- "First track played after connecting" = after a BT disconnect + reconnect cycle
+- "Audio was still playing" = PlayerService is actually playing the track
+- "Playhead at end of track" = CT renders position ≥ duration
+- "Not advancing" = each PPC CHANGED carries the same/clamped value
+- "Fixed itself when the track advanced" = the second track displays correctly
+
+### Trace
+
+Pre-condition: previous session ended with a natural track end.
+
+1. **Previous session, T = T0**: track plays to natural end → `markCompletion()` runs:
+   - `mPositionAtStateChange = mLastKnownDuration` (intentional "freeze at end")
+   - `mStateChangeTime = elapsedRealtime() at T0`
+   - **`mPlayStatus` STAYS at 1 (PLAYING)** — markCompletion intentionally doesn't change it
+   - `mPendingNaturalEnd = true` (latch)
+   - `flushLocked()` writes: `file[780..783]=duration, file[784..787]=T0, file[792]=1`
+   - PositionTicker stops (via onCompletion path)
+
+2. **BT disconnect**. Music app keeps running. State persists in memory + file.
+
+3. **T = T1 (some hours later)**: user reconnects to Kia.
+
+4. **T = T1+ε**: user presses PLAY on Y1's hardware button.
+
+5. PlayerService.play() → `restartPlay(false)`:
+   - `pause()` → `setPlayValue(3)` PAUSED
+   - `PlaybackStateBridge.onPlayValue` v0=2 → markTrackChange suppression active → **skip both setPlayStatus AND wake** → `mPlayStatus` stays 1, file unchanged
+   - `toRestart()` → `setDataSource(samePath)` → `onEarlyTrackChange` → `onFreshTrackChange()`:
+     - resets `mPositionAtStateChange=0, mLastKnownDuration=0, mStateChangeTime=T1`
+     - `flushLocked()` writes file with fresh values
+   - `prepareAsync()` completes → `OnPreparedListener` → `onPrepared` → `onTrackEdge()`:
+     - Latches `mPendingNaturalEnd` → `mPreviousTrackNaturalEnd = true`
+     - Clears `mPendingNaturalEnd`
+     - **Compares new audio_id vs snapshot — SAME (same track)**
+     - **`:cond_same_track` taken — NO position reset**
+   - `setPlayValue(1)` PLAYING → `setPlayStatus(1)`:
+     - `mPlayStatus` is already 1 → **early-return, no flush, no state update**
+
+6. Result: file state from `onFreshTrackChange` survives (`pos=0, state_time=T1, ps=1`). **No regression here in this trace** — onFreshTrackChange already reset to 0.
+
+Wait — re-tracing, the bug doesn't fully reproduce in this path because `onFreshTrackChange` runs via `onEarlyTrackChange` *before* `onTrackEdge`. The reset DOES happen.
+
+### Re-investigation — the actual bug path
+
+The bug requires a path where `onEarlyTrackChange` doesn't fire. That happens when PlayerService.play() does NOT call `restartPlay(false)` — e.g., when MediaPlayer is at EOS state and `start()` is called directly without re-preparing. Y1's IjkMediaPlayer's behavior in this case is engine-dependent; some implementations replay from start, others throw, others go through prepare again.
+
+In the path WITHOUT onEarlyTrackChange:
+
+5'. User presses PLAY.
+6'. PlayerService.play() — internal logic might call `MediaPlayer.start()` directly on the EOS'd player. No setDataSource. No onEarlyTrackChange.
+7'. MediaPlayer might either:
+    - (a) refuse → user has to press again, restartPlay kicks in
+    - (b) silently transition back to PLAYING from EOS → onPrepared **does NOT fire** (no fresh prepare)
+    - (c) auto-reprepare → onPrepared fires → `onTrackEdge` → dedup → **no reset**
+8'. In paths (b) and (c), `mPositionAtStateChange` stays at `duration` (from markCompletion). `mStateChangeTime` stays at `T0`. file stays at `(duration, T0, 1)`.
+9'. PositionTicker resumes (via onPlayValue(1) cascade). Ticks fire. T9 reads file:
+    - `saved_pos = duration`
+    - `state_change_time = T0`
+    - `live_pos = duration + (T_now - T0)` — past end
+10'. Kia clamps to duration display → "at end, frozen".
+11'. When user manually skips to next track or natural advance fires, `onEarlyTrackChange` runs (because `toRestart()` is now invoked with a new path), resetting everything. Display fixes.
+
+### Fix
+
+Path (c) — onPrepared fires but onTrackEdge's dedup skips reset — is the cleanest to handle. We have an existing signal: `mPreviousTrackNaturalEnd` is latched from `mPendingNaturalEnd` at `onTrackEdge` entry. Use it as a second reset trigger:
+
+```smali
+:try_start_0
+... existing latch transfer ...
+
+iget-wide v0, mCachedAudioId
+invoke-direct flushLocked
+
+# Two reset triggers (changed):
+iget-boolean v4, mPreviousTrackNaturalEnd
+if-nez v4, :cond_force_reset    ; EOS replay of same track
+
+iget-wide v2, mCachedAudioId
+cmp-long v4, v0, v2
+if-eqz v4, :cond_same_track     ; audio_id unchanged AND not EOS-replay → no reset
+
+:cond_force_reset
+... reset position to 0, flushLocked ...
+
+:cond_same_track
+```
+
+After fix:
+- Same-track re-prepare with no natural-end (pause→resume cycles): `mPreviousTrackNaturalEnd=false`, audio_id unchanged → `:cond_same_track` → no reset (existing semantic preserved)
+- Same-track re-prepare AFTER natural end: `mPreviousTrackNaturalEnd=true` → `:cond_force_reset` → reset
+- Audio_id changed: → `:cond_force_reset` → reset (existing behavior)
+
+For paths (a) and (b), the fix doesn't help directly because onTrackEdge isn't called. But path (a) eventually goes through restartPlay (which fires onEarlyTrackChange → onFreshTrackChange — unconditional reset). Path (b) is genuine MediaPlayer-internal replay; if no onPrepared fires, T9 keeps emitting inflated live_pos until a real track edge. We accept that as a residual edge case.
+
+### Implementation
+
+Single edit in `TrackInfoWriter.onTrackEdge()` adding the `mPreviousTrackNaturalEnd` check ahead of the audio_id comparison. The natural-end latch was already being read and propagated — we just use it for one more decision.
+
+Zero new fields. Zero changes to other methods. The reset block code path is identical (now reached by an additional condition).
+
+### Verification post-fix
+
+Next capture should show:
+- After a natural track end (last track of session) + BT reconnect + press play, the new T5tc/T9ps/PSC pulse sequence carries `pos=0` not `pos≥duration`
+- Kia display advances from 0:00 for the first track of the session
+- No regression on Bolt's existing track-switch behavior (audio_id changes → reset path; same-track re-prepare with active playback → no natural-end latch → no spurious reset)
