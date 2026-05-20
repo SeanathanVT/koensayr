@@ -278,6 +278,13 @@
 
     invoke-virtual {v0}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->wakePlayStateChanged()V
 
+    # PSC pulse — synthesise PAUSED→PLAYING edge pair on the AVRCP wire
+    # so CTs that gate metadata refresh on PlaybackStatus CHANGED (not
+    # TrackChanged CHANGED) refetch immediately on track edge instead of
+    # waiting for their polling cycle. See TrackInfoWriter.
+    # pulsePlayStatusForCT docstring + INVESTIGATION.md Trace #75.
+    invoke-virtual {v0}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->pulsePlayStatusForCT()V
+
     return-void
     :try_end_pt
     .catch Ljava/lang/Throwable; {:try_start_pt .. :try_end_pt} :catch_pt

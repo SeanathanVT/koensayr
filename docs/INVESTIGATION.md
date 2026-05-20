@@ -6000,3 +6000,105 @@ If the next Bolt capture still freezes, bisection space is: {rate-limit (105eef5
 ### Decision
 
 Bundle #2+#3+#4 in a single subsequent commit (post user-test of the rate-limit + ProviderName changes). Defer #5 indefinitely (low value-per-LOC vs other fixes). Defer #6 until rate-limit fix is validated.
+
+## Trace #75 (2026-05-19) — Bolt 2221: PSC edges are Bolt's metadata-refresh trigger, not TC; PSC pulse at track-edge implemented
+
+### What the user found
+
+User experimented with rapid PLAY/PAUSE hammering on Bolt's steering-wheel buttons during a Bolt 2221 session and observed: **metadata updated MUCH faster** than the ~40 s natural cycle. Their initial hypothesis: "Y1 is locking up between track changes; PLAY/PAUSE toggling unlocks it."
+
+### What the wire trace proves
+
+Bolt 2221 capture profile vs Bolt 2112 (same patcher build):
+
+| metric | Bolt 2112 (no hammering) | Bolt 2221 (heavy PLAY/PAUSE) |
+|---|---|---|
+| T2reg total | 93 | 51 |
+| T2reg ev=01 PlaybackStatus | 12 | **42** |
+| T2reg ev=05 PlaybackPosition | 75 | 3 |
+| T5tc TrackChanged emits | 5 | 10 |
+| T9ps PlaybackStatus emits | 22 | 63 |
+| PASSTHROUGH key events | 18 | ~120 |
+
+Bolt re-registered PlaybackStatusChanged **42 times** in 2221 (one per real state edge from user button presses) and only **3 times** for PlaybackPosition (because user was mostly paused, no position emits → no re-register).
+
+Overlay GetElementAttributes refetches against PSC edges:
+
+```
+22:19:18 T5tc track-edge      → 22:19:18 GEA refetch (4.1 s after T5tc — refetched)
+22:19:33 T5tc track-edge      → no GEA refetch       (NEXT button, but no PSC edge accompanied it)
+22:19:46 T5tc track-edge      → no GEA refetch       (another track edge, no PSC, no refetch)
+22:19:22 → 22:20:24 = 62-second GEA gap              ← THE "FREEZE"
+22:20:34 NEXT press
+22:20:36 PAUSE press → T9ps   → 22:20:38 GEA refetch (~2 s after PSC edge)
+22:20:38 PLAY press  → T9ps   → 22:20:42 GEA refetch
+22:20:40 PAUSE       → T9ps   → 22:20:46 GEA refetch
+...every PLAY/PAUSE = T9ps emit + GEA refetch within 2-4 s
+```
+
+**Bolt's CT-side metadata-refresh trigger is `PlaybackStatusChanged`, not `TrackChanged`.** TC CHANGED reaches Bolt (T5tc fires on the wire, database[2] gate is armed), but Bolt's parser doesn't refetch on TC alone — it refetches on PSC edges and on PASSTHROUGH key events. The "freeze" symptom is Bolt's refresh logic being dormant without PSC edges.
+
+### Why natural track ends produce zero PSC edges
+
+In the music app's natural track-end → next-track path:
+
+1. `onCompletion` (player engine EOS) — no `setPlayValue` call, file[792] stays at 1 (PLAYING)
+2. `onPrepared` (next track) — `setPlayValue` may fire but PlayerService keeps PLAYING throughout
+3. `setPlayValue(1)` PLAYING — `setPlayStatus(1)` writes file[792]=1 (no change), `wakePlayStateChanged()` fires, T9 reads file[792]=1 vs state[9]=1 → **no edge → no emit**
+
+In the music app's `restartPlay()` (manual NEXT/PREV) path:
+
+1. `pause()` → `setPlayValue(3)` PAUSED → `onPlayValue` v0=2 → **`markTrackChange(1s)` suppresses both setPlayStatus AND wake** → file[792] stays 1, no PSC edge
+2. `setDataSource(newPath)` → `onEarlyTrackChange`
+3. `prepareAsync` → `onPrepared` → `onTrackEdge` + `wakeTrackChanged`
+4. `setPlayValue(1)` PLAYING → `setPlayStatus(1)` → file[792]=1 still, state[9]=1 still → no edge → no emit
+
+Both paths produce zero PSC CHANGED — `markTrackChange` compounds the natural-EOS gap.
+
+### Pixel-as-TG comparison
+
+Pixel's btsnoop (handle 0x0003, Bolt session) ships PSC=Paused CHANGED mid-transition at T+~480 ms after track-switch trigger, then PSC=Playing INTERIM via Bolt's re-register burst. Two PSC edges per track edge — bracketing the TC CHANGED. Bolt refetches twice. Same wire shape we need.
+
+### Fix (commit pending)
+
+Added `TrackInfoWriter.pulsePlayStatusForCT()`:
+
+```
+public synchronized void pulsePlayStatusForCT() {
+    if (mPlayStatus != PLAYING) return;
+    setPlayStatus(PAUSED);             // file[792]=2 + flushLocked
+    wakePlayStateChanged();            // T9 sees edge (state[9]=1 vs file[792]=2) → emits PSC=PAUSED CHANGED
+    setPlayStatus(PLAYING);            // file[792]=1 + flushLocked
+    wakePlayStateChanged();            // T9 sees edge (state[9]=2 vs file[792]=1) → emits PSC=PLAYING CHANGED
+                                       // T9 position branch (gated on file[792]==1) also emits POSITION CHANGED
+}
+```
+
+Called from `PlaybackStateBridge.onPlayerPreparedTail` after the existing `wakeTrackChanged` + `wakePlayStateChanged` calls. `onPlayerPreparedTail` is the canonical end-of-track-edge hook (B5.2c), fires after `iput-boolean playerIsPrepared = true` flips — duration is captured, audio_id is settled, file is consistent.
+
+Wire shape post-fix at every track edge:
+
+```
+T+0       T5tc (TRACK_CHANGED CHANGED, Identifier counter bumped)
+T+0       NowPlayingContentChanged CHANGED
+T+0       PlaybackPositionChanged CHANGED (position=0 for new track)
+T+~5ms    PSC=PAUSED CHANGED        ← pulse phase 1
+T+~10ms   PSC=PLAYING CHANGED       ← pulse phase 2
+T+~10ms   PlaybackPositionChanged CHANGED (position progressing)
+```
+
+Bolt sees two PSC edges per track edge → refreshes metadata pane immediately, no longer waits for polling cycle.
+
+### Why this is safe
+
+- **Rate-limit gate (commit 105eef5)**: bypasses on every real play-status flip. Both pulse wakes flip `mPlayStatus` (1→2, 2→1), so both bypass.
+- **`markTrackChange(1s)` suppression**: lives in `PlaybackStateBridge.onPlayValue`, not in `pulsePlayStatusForCT`. The two are independent gates.
+- **Position drift**: each `setPlayStatus` call advances `mStateChangeTime`. Two calls separated by <5 ms drift `mPositionAtStateChange` by <5 ms — invisible on the CT's playhead.
+- **Audio_id edge detection in `setPlayStatus`**: at `onPlayerPreparedTail` time, `mCachedAudioId` already reflects the new track. Snapshot and post-flushLocked re-read both see the same value → no false audio_id reset.
+- **Other CTs**: TV (gold standard), Sonos, Kia — adding PSC blips at track edges should at worst be wire noise they ignore (TV is "instant" regardless, Sonos doesn't render play-state much, Kia polls). Pixel ships the same wire shape and works on all four — empirical reassurance.
+- **Only fires when PLAYING**: the early return guard means track edges that land while paused/stopped don't get a phantom pulse.
+
+### Decision log
+
+- The simpler fix candidate ("remove `markTrackChange` suppression entirely") was considered and rejected. `markTrackChange` only affects `restartPlay()`'s internal pause→play handshake — natural track ends (the more common case) never go through that path. So removing `markTrackChange` would only help the manual-NEXT case, not the more important auto-advance case. The explicit pulse handles both.
+- Could also have implemented as a trampoline-side change in T5 (emit PSC CHANGED unconditionally after TC), but T5's edge detection is intrinsic to its design — bypassing it cleanly requires bypassing the file→state comparison entirely, which is more invasive than the music-app-side pulse.
