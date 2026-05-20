@@ -1691,13 +1691,16 @@ G_Y1_AVRCP_TRACK_IDENTIFIER_VADDR = 0xd2c4
 # valid across every flush from the writer side.
 G_Y1_TRACK_INFO_MMAP_BASE_VADDR = 0xd2cc
 
-# 13-byte trampoline-state block in .bss padding at the very start of .bss
-# (0xd2a4..0xd2b0). The bytes from `__bss_start` / `_edata` at 0xd2a4 up to
-# the first real stock symbol (g_avrcp_req_event_database at 0xd2b5) are
-# unallocated padding — 17 B of available space; we use the first 13. Layout
-# mirrors the legacy on-disk y1-trampoline-state schema so the T4 / T5 / T9
-# field-offset constants (T*_OFF_STATE + N) work unchanged once the bytes
-# are loaded into the trampoline's stack state_buf:
+# 13-byte trampoline-state block in .bss padding at 0xd2d6..0xd2e2 — the
+# 30-byte gap between stock `g_avrcp_auto_browse_connect` (0xd2d5, 1 B) and
+# `g_avrcp_seq_id_database` (0xd2f4, 113 B). Per-byte radare2 cross-reference
+# analysis (full `aaaa` pass with relocs applied) confirms no stock code
+# accesses any byte in 0xd2d6..0xd2f3 — the methodology was validated by
+# correctly identifying the prior corruption site at 0xd2ac, where
+# stock `fcn.000036c0` reads a pointer that our state[8..11] writes
+# clobber. Layout mirrors the legacy on-disk y1-trampoline-state schema so
+# T4 / T5 / T9's T*_OFF_STATE + N offsets work unchanged once the bytes are
+# loaded into the trampoline's stack state_buf:
 #
 #   state[0..7]  last_seen track_id (T5 / T4 edge detection)
 #   state[8]     unused (was last RegNotif transId; dead since per-event TIDs
@@ -1712,10 +1715,16 @@ G_Y1_TRACK_INFO_MMAP_BASE_VADDR = 0xd2cc
 # sees state[N] = 0 vs current file value → edge detected → one CHANGED per
 # event emitted (gated by subscription database — harmless if CT hasn't
 # re-subscribed yet because the gate skips). The on-disk y1-trampoline-state
-# file is no longer read or written by the trampolines; the music app side
-# still ensureFile-creates it for backward-compat across staged flashes but
-# the bytes are now ignored.
-G_Y1_TRAMPOLINE_STATE_VADDR = 0xd2a4
+# file is no longer read or written by the trampolines.
+#
+# History: the prior block at 0xd2a4 collided with a stripped stock global
+# at 0xd2ac that `fcn.000036c0` reads as a pointer and passes to a vtable
+# method via `blx r3`. Our state[8..11] writes corrupted that pointer, and
+# the next stock call SIGSEGV'd in the BTAvrcpMusicAda thread. The bisection
+# (1c233cc clean / e2719c7 broken) plus the radare2 xref scan at byte
+# granularity identified the exact corruption site and the verified-safe
+# replacement gap. See INVESTIGATION.md Trace #86.
+G_Y1_TRAMPOLINE_STATE_VADDR = 0xd2d6
 Y1_TRAMPOLINE_STATE_SIZE    = 13
 
 

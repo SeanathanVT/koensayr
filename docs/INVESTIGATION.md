@@ -7121,3 +7121,81 @@ This means **M8 is necessary but not sufficient**. Even with AVCTP preserved (M8
 3. **Figure out why Bolt escalates SUSPEND→CLOSE on Y1.** Possible causes: malformed AVDTP responses, unfavorable DelayReport values, codec-config differences, AVDTP version negotiation quirks. Requires a fresh Pixel+Bolt capture with explicit track-skip events to compare against Y1.
 
 (1) is cheap to try empirically. (2) is the principled fix. (3) is the upstream investigation.
+
+---
+
+## Trace #86 — 2026-05-20 Trampoline state .bss collision at 0xd2ac; relocated to 0xd2d6
+
+### Symptom
+
+After commit `e2719c7` (trampoline state → .bss at vaddr `0xd2a4`), the BT process (`iatek.bluetooth` / pid running `libextavrcp_jni.so`) enters a crash loop on every device. dmesg shows `sig 11 to [NNN:BTAvrcpMusicAda]` repeating every ~1 s; debuggerd kills all child threads each cycle; `BTAvrcpMusicAdapter construct` log line repeats in logcat at the restart cadence. CTs see "old metadata, controls don't work" because the AVRCP TG service never reaches a stable state.
+
+Captured on all three CTs in the matrix (Bolt 1859: 75 restarts, TV 1902: 24 restarts, Sonos 1936: 26 restarts), all preceding sessions (1543 / 1534 / 1336 / 1242 / 1150 etc.) had 0 restarts.
+
+### Bisection
+
+User-driven, on the flash box:
+
+| Commit | Date (UTC) | Result | Notes |
+|---|---|---|---|
+| `1c233cc` | 18:36 | **clean** (Sonos 1927, 0 restarts) | Lower bound established |
+| `925a3b6` | 19:17 | **clean** (Sonos 1947, 0 restarts) | T5 emit reorder; immediate parent of e2719c7 |
+| `e2719c7` | 20:25 | **broken** (Sonos 1936, 26 restarts) | Trampoline state → .bss |
+
+Bisection isolated the regression to exactly `e2719c7`.
+
+### Root cause
+
+`e2719c7` chose `G_Y1_TRAMPOLINE_STATE_VADDR = 0xd2a4` based on the inspection that the symbol table shows nothing between `__bss_start` / `_edata` (both at `0xd2a4`, size 0) and the first labeled stock global `g_avrcp_req_event_database` (at `0xd2b5`). That's a 17-byte gap that *looked* like alignment padding.
+
+It wasn't. Per-byte `axt` queries against radare2's `aaaa` full analysis (relocs applied) on stock `libextavrcp.so` show a single xref in the gap:
+
+```
+fcn.000036c0 0x36ca [DATA:r--] add r2, pc
+fcn.000036c0 0x36cc [DATA:r--] ldr r2, [r2]
+```
+
+Resolving by hand: at 0x36ca, `pc = 0x36ce`. Literal at 0x36d4 is `0x9bde`. `add r2, pc` → `r2 = 0xd2ac`. `ldr r2, [r2]` → `r2 = *0xd2ac` (4-byte word at byte offset 8 within our 13-byte state block). Stock `fcn.000036c0` is a thin trampoline:
+
+```
+push {r3, lr}
+ldr r2, [r0]                 ; r2 = vtable (object's first word)
+ldr.w r3, [r2, 0x190]        ; r3 = method ptr at vtable+0x190
+ldr r2, [0x36d4]             ; literal load
+add r2, pc                   ; r2 = 0xd2ac
+ldr r2, [r2]                 ; r2 = global pointer at 0xd2ac
+blx r3                       ; invoke method(arg=r2)
+pop {r3, pc}
+```
+
+So `*0xd2ac` is a stripped-symbol stock global — a pointer to some object instance, passed as the argument to a vtable method.
+
+`e2719c7`'s trampoline state writes overlapped the pointer:
+- `state[8]` (= 0xd2ac, byte 0 of corrupted pointer) — unused in current state schema, but `write_state_block` issues `strb` byte-stores when writing 13 bytes, hitting this offset
+- `state[9..11]` (= 0xd2ad..af) — T9's `last_play_status`, `last_battery_status`, `last_repeat_avrcp` bytes
+
+After even one T9 write, `*0xd2ac` becomes a small int like `0x00040201` (battery+playstatus+repeat). The next call into `fcn.000036c0` dereferences this as a pointer in the vtable method, SIGSEGVs in `BTAvrcpMusicAda`.
+
+The PositionTicker fires `playstatechanged` once per second from the music app, which fans out to MtkBt's notification handlers, which call into JNI paths that route through `fcn.000036c0` or its callers — so the corruption is hit reliably within ~1 s of any music-app activity. Hence the tight crash loop.
+
+### Verification methodology
+
+Per-byte `axt @ <addr>` queries against the full radare2 analysis identify *every* PC-relative access in `.text` that resolves to a given `.bss` address. The methodology was validated end-to-end:
+
+- Known bad spot (`0xd2ac`) → radare2 finds the `fcn.000036c0` xref ✓
+- Other bytes in 0xd2a4..0xd2b4 → no xrefs (those bytes are genuinely unreferenced)
+- Candidate gap 0xd2d6..0xd2f3 (between `g_avrcp_auto_browse_connect` and `g_avrcp_seq_id_database`, 30 bytes) → **0 xrefs across all 30 bytes**
+
+False-negative risk: stripped variables accessed via GOT-indirect or runtime-relocated addresses might escape this static check. For shared libraries on Android with PIE, data globals are typically accessed via PC-relative addressing (which radare2 catches), not absolute literals with GOT relocations (rare for non-extern data). The 0xd2ac case proves the methodology catches the relevant access pattern.
+
+### Fix
+
+Move `G_Y1_TRAMPOLINE_STATE_VADDR` from `0xd2a4` to `0xd2d6`. The new range occupies 13 bytes at `0xd2d6..0xd2e2`, well within the verified-clean 30-byte gap. Layout (state[0..12]) and all `T*_OFF_STATE + N` offsets remain unchanged — only the literal-pool constant in `_emit_read_state_block_subroutine` / `_emit_write_state_block_subroutine` rebases.
+
+Blob size impact: zero (the PC-relative offset changes value but stays 4 bytes). Patcher MD5s repinned (release `ab66739db34f97e5d2e4d6f2a6e00af8`, debug `55ba552ad3372f6fb55505c8377b896d`).
+
+### Lessons
+
+1. `__bss_start` is a hostile location for tucking in new globals. The linker collects uninitialized statics from individual compilation units at the beginning of `.bss`, so stripped/local statics cluster near `__bss_start`. Gaps *between* named globals are safer because the linker has already accounted for both endpoints.
+2. The `axt` query on radare2's full analysis is the cheapest verification for "is this `.bss` address used by stock code". Run it per-byte over any candidate range before committing.
+3. Bisection by flashing successive commits is *much* faster than static analysis when the bug is a single commit's regression. User's flash-box workflow turned this from a multi-day RE problem into a 4-flash bisection in ~45 minutes.
