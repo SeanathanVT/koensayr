@@ -430,6 +430,7 @@ def _emit_t4(a: Asm) -> None:
     # and skips emits naturally. No explicit branch needed.
     a.add_sp_imm(0, T4_OFF_FILE)              # r0 = dst = sp+T4_OFF_FILE
     a.movw(1, T4_FILE_SIZE)                   # r1 = nbytes = 1104
+    a.movs_imm8(2, 0)                         # r2 = slot_offset = 0 (read from slot start)
     a.bl_w("read_track_info")
 
     a.label("t4_skip_track_read")
@@ -725,6 +726,7 @@ def _emit_extended_t2(a: Asm) -> None:
     # ---- copy first 8 B of active slot (track_id) into sp+T2_OFF_TID ----
     a.add_sp_imm(0, T2_OFF_TID)
     a.movs_imm8(1, 8)
+    a.movs_imm8(2, 0)                         # slot_offset = 0
     a.bl_w("read_track_info")
 
     a.label("ext2_after_track_read")
@@ -828,6 +830,7 @@ def _emit_t5(a: Asm) -> None:
     # ---- copy active slot of y1-track-info into file_buf ----
     a.add_sp_imm(0, T5_OFF_FILE)
     a.movw(1, 800)
+    a.movs_imm8(2, 0)                         # slot_offset = 0
     a.bl_w("read_track_info")
 
     a.label("t5_skip_track_read")
@@ -1089,6 +1092,7 @@ def _emit_t6(a: Asm) -> None:
     # ---- copy active slot of y1-track-info into file_buf ----
     a.add_sp_imm(0, T6_OFF_FILE)
     a.movw(1, 800)
+    a.movs_imm8(2, 0)                         # slot_offset = 0
     a.bl_w("read_track_info")
 
     a.label("t6_skip_track_read")
@@ -1400,44 +1404,17 @@ def _emit_t_papp(a: Asm) -> None:
     a.beq_w("papp_gc_n1")
 
     # ---- n != 1: existing two-attr path ----
-    # TODO(mmap-followup): T_papp's gc paths still hit y1-track-info via
-    # the old open + lseek(795) + read pattern. Under the post-mmap
-    # double-buffer schema (file[0] = active_slot, slot data at
-    # file[4 + active*1104]), offset 795 lands inside slot[0]'s Artist
-    # field. The two bytes read here will not be valid Repeat/Shuffle
-    # AVRCP enum values most of the time. The response builder rejects
-    # out-of-spec enum bytes upstream of T_papp; failing that, the
-    # CT-side display will momentarily show garbage Repeat/Shuffle state
-    # until the next T9 PApp CHANGED arrives (T9's emit reads the now
-    # active-slot-correct file_buf and ships the live state). Trampoline
-    # budget can absorb a slot_offset parameter on read_track_info; defer
-    # to the post-ship audit pass.
-    a.adr_w(0, "path_track_info")
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
+    # Read live repeat (slot[795]) + shuffle (slot[796]) bytes from the
+    # active slot via the mmap-backed read_track_info subroutine. sp+8
+    # is in the outgoing-args region — we pass sp+0 as the values
+    # pointer; sp+8..9 is unused by the response builder's stack args,
+    # so it's safe scratch for the 2-byte read.
+    a.add_sp_imm(0, PAPP_OFF_ARGS + 8)        # r0 = dst = sp+8
+    a.movs_imm8(1, 2)                         # r1 = nbytes = 2
+    a.movw(2, 795)                            # r2 = slot_offset = 795 (repeat+shuffle)
+    a.bl_w("read_track_info")
     a.cmp_imm8(0, 0)
-    a.blt("papp_gc_static_fallback")
-    a.mov_lo_lo(4, 0)                     # r4 = fd
-
-    # lseek(fd, 795, SEEK_SET)
-    a.mov_lo_lo(0, 4)
-    a.movw(1, 795)
-    a.movs_imm8(2, SEEK_SET)
-    a.movs_imm8(7, NR_lseek)
-    a.svc(0)
-
-    # read(fd, sp+8, 2) — sp+8 is in the outgoing-args region (we pass
-    # sp+0 as the values pointer; sp+8..9 is unused by the response
-    # builder's stack args, so it's safe scratch).
-    a.mov_lo_lo(0, 4)
-    a.add_sp_imm(1, PAPP_OFF_ARGS + 8)
-    a.movs_imm8(2, 2)
-    a.movs_imm8(7, NR_read)
-    a.svc(0)
-
-    a.mov_lo_lo(0, 4)
-    a.blx_imm(PLT_close)
+    a.beq("papp_gc_static_fallback")          # read_track_info returns 0 on mmap fail
 
     # Pass sp+8 as the live values pointer
     a.add_sp_imm(0, PAPP_OFF_ARGS + 8)
@@ -1476,31 +1453,15 @@ def _emit_t_papp(a: Asm) -> None:
     a.bne_w("papp_gc_n1_reject")
 
     a.label("papp_gc_n1_open")
-    # Open y1-track-info
-    a.adr_w(0, "path_track_info")
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
+    # Read live repeat (slot[795]) + shuffle (slot[796]) bytes from the
+    # active slot via the mmap-backed read_track_info subroutine into
+    # sp+16..17 (aligned scratch; sp+16 = repeat, sp+17 = shuffle).
+    a.add_sp_imm(0, PAPP_OFF_ARGS + 16)
+    a.movs_imm8(1, 2)                     # nbytes = 2
+    a.movw(2, 795)                        # slot_offset = 795 (repeat+shuffle)
+    a.bl_w("read_track_info")
     a.cmp_imm8(0, 0)
-    a.blt("papp_gc_n1_static")
-    a.mov_lo_lo(4, 0)                     # r4 = fd
-
-    # lseek(fd, 795, SEEK_SET)
-    a.mov_lo_lo(0, 4)
-    a.movw(1, 795)
-    a.movs_imm8(2, SEEK_SET)
-    a.movs_imm8(7, NR_lseek)
-    a.svc(0)
-
-    # read(fd, sp+16, 2) — aligned scratch (sp+16 = repeat, sp+17 = shuffle).
-    a.mov_lo_lo(0, 4)
-    a.add_sp_imm(1, PAPP_OFF_ARGS + 16)
-    a.movs_imm8(2, 2)
-    a.movs_imm8(7, NR_read)
-    a.svc(0)
-
-    a.mov_lo_lo(0, 4)
-    a.blx_imm(PLT_close)
+    a.beq("papp_gc_n1_static")            # 0 → mmap unavailable, use static OFF
 
     # Pick the byte matching the requested attr_id: Repeat at +16, Shuffle at +17.
     a.cmp_imm8(6, PAPP_ATTR_SHUFFLE)
@@ -2174,12 +2135,16 @@ def _emit_read_track_info_subroutine(a: Asm) -> None:
     """Copy nbytes from y1-track-info's active slot into caller's buffer.
 
     Pre: r0 = dst buffer (1104-aligned-or-not stack address), r1 = nbytes
-        (1..1104; caller picks the trampoline's existing FILE_SIZE constant).
+        (1..1104; caller picks the trampoline's existing FILE_SIZE constant),
+        r2 = slot_offset (0 to copy from slot start; any value 0..1103 to copy
+        from a non-zero offset within the active slot — e.g., T_papp's
+        GetCurrent passes 795 to read repeat+shuffle bytes).
     Post: r0 = nbytes copied on success, 0 on mmap unavailable. r4-r11
         preserved. Clobbers r1, r2, r3, ip, lr (and r7 transiently inside
         get_or_init_mmap).
 
-    Reads file[0] as active_slot, computes src = mmap_base + 4 + (active*1104),
+    Reads file[0] as active_slot, computes
+        src = mmap_base + 4 + (active * 1104) + slot_offset,
     byte-copies nbytes into dst. Slow path (mmap miss) returns 0; caller
     treats dst as unchanged (already memset-zeroed at trampoline entry).
 
@@ -2194,6 +2159,7 @@ def _emit_read_track_info_subroutine(a: Asm) -> None:
 
     a.mov_lo_lo(4, 0)                           # r4 = dst (preserved across bl)
     a.mov_lo_lo(5, 1)                           # r5 = nbytes (preserved)
+    a.mov_lo_lo(6, 2)                           # r6 = slot_offset (preserved across bl)
 
     a.bl_w("get_or_init_mmap")                  # r0 = mmap base or 0
     a.cmp_imm8(0, 0)
@@ -2210,7 +2176,8 @@ def _emit_read_track_info_subroutine(a: Asm) -> None:
     a.muls_lo_lo(1, 2)                          # r1 = active * 1104
     # adds r1, #4 (T2 ADD imm8): 0011 0 Rdn imm8 → 0x3000 | (1<<8) | 4 = 0x3104.
     a.raw(bytes([0x04, 0x31]))
-    a.adds_lo_lo(1, 1, 0)                       # r1 = src = mmap_base + 4 + active*1104
+    a.adds_lo_lo(1, 1, 0)                       # r1 = mmap_base + 4 + active*1104
+    a.adds_lo_lo(1, 1, 6)                       # r1 = src = above + slot_offset
 
     # Byte-copy loop: r3=i, r5=count, r1=src, r4=dst. Unrolled would be
     # faster but byte loop fits naturally and the bytes-per-call is small
@@ -2328,6 +2295,7 @@ def _emit_t8(a: Asm) -> None:
     # ---- copy active slot of y1-track-info into file_buf ----
     a.add_sp_imm(0, T8_OFF_FILE)
     a.movw(1, 800)
+    a.movs_imm8(2, 0)                         # slot_offset = 0
     a.bl_w("read_track_info")
 
     a.label("t8_skip_track_read")
@@ -2683,6 +2651,7 @@ def _emit_t9(a: Asm) -> None:
     # ---- copy active slot of y1-track-info into file_buf ----
     a.add_sp_imm(0, T9_OFF_FILE)
     a.movw(1, 800)
+    a.movs_imm8(2, 0)                         # slot_offset = 0
     a.bl_w("read_track_info")
 
     a.label("t9_skip_track_read")

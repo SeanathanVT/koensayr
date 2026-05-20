@@ -6819,11 +6819,21 @@ User direction (post-Trace #80 audit): "Can we implement [mmap] anyway, and then
 **Patcher MD5s** (`patch_libextavrcp_jni.py`):
 - `OUTPUT_MD5` and `OUTPUT_DEBUG_MD5` set to `None` for this commit. Patcher prints the computed MD5 on first flash without erroring. Update them once a clean flash + capture cycle confirms the new bytes are correct.
 
-**Trampoline blob size**: 3540 B with new subroutines, before per-site conversion. After all 6 conversions: 3388 B (-8 B vs pre-mmap baseline; net win because the shared subroutine pays for itself across the call sites). Budget 4020 B, free 632 B.
+**Trampoline blob size**: 3540 B with new subroutines, before per-site conversion. After the initial 6 conversions: 3388 B. After folding T_papp's two gc paths into `read_track_info` (with new `slot_offset` r2 parameter): 3340 B (-56 B vs the pre-mmap baseline). Budget 4020 B, 680 B free.
+
+### `read_track_info` ABI
+
+```
+Pre:  r0 = dst buffer, r1 = nbytes (1..1104), r2 = slot_offset (0..1103).
+Post: r0 = nbytes copied (success) or 0 (mmap unavailable).
+      r4..r11 preserved.
+src = mmap_base + 4 + (active_slot * 1104) + slot_offset
+```
+
+All current readers pass `r2 = 0` except T_papp's PDU 0x13 GetCurrent paths, which pass `r2 = 795` to read the 2-byte repeat+shuffle block within the active slot.
 
 ### Known limitations (not blockers; tracked for follow-up)
 
-- **T_papp gc paths (PDU 0x13 GetCurrentPlayerApplicationSettingValue)** still use the legacy `open + lseek(795) + read` pattern. Under the new schema, file offset 795 lands inside slot[0]'s Artist field, not the repeat/shuffle bytes. T_papp's static fallback handles invalid AVRCP enum values gracefully; T9's PApp CHANGED emit reads the file via the new `read_track_info` subroutine, so on-edge updates are still correct. Fix needs a `slot_offset` parameter on `read_track_info`. Deferred.
 - **Upgrade from an older firmware** that wrote a 1104-byte file: `setLength(2213)` extends the file on the first new-schema flush, but `file[0]` momentarily holds whatever the OLD schema's audio_id LSB was — could be any byte. Trampolines reading during that one-flush window dispatch to whichever slot the byte's low bit points at, then read mostly-zero (new tail) or partial-old data. Stabilises after the first flush. Single-flush transient; acceptable.
 
 ### Open question (preserved from Trace #80)
