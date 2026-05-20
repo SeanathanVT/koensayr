@@ -269,7 +269,7 @@ T4 reads the inbound `NumAttributes` byte (caller's sp+394) and:
 
 All values ship as UTF-8 (charset `0x006A`); a missing attribute is signalled by `AttributeValueLength=0`. Y1's emission of zero-length entries requires `patch_libextavrcp.py` E1 to land — the stock `libextavrcp.so` response builder otherwise drops such attributes on the floor (a §5.3.4 violation in the stock code). The numeric attrs (4 / 5 / 7) are stored pre-formatted as ASCII strings by the music app's `TrackInfoWriter` rather than binary u16 / u32 with a Thumb-2 itoa, keeping the trampoline a uniform strlen+memcpy loop.
 
-T4 also detects track-id edges (compares `y1-track-info[0..7]` against `y1-trampoline-state[0..7]`) and emits a reactive CHANGED via `reg_notievent_track_changed_rsp` before the GetElementAttributes response, then writes the new track_id back to state.
+T4 also detects track-id edges (compares the active slot's `track_id` field from `y1-track-info` against the `.bss` trampoline-state block at `G_Y1_TRAMPOLINE_STATE + 0..7`) and emits a reactive CHANGED via `reg_notievent_track_changed_rsp` before the GetElementAttributes response, then writes the new track_id back to the `.bss` state.
 
 Pre-check dispatch table: `0x20 → main`, `0x17 → T_charset`, `0x18 → T_battery`, `0x30 → T6`, `0x40 → T_continuation`, `0x41 → T_continuation`, `0x31+event≠0x02 → T8`, else fall through to "unknow indication".
 
@@ -282,7 +282,7 @@ In LOAD #1 padding. Entered via `b.w T5` from the patched first instruction of `
 | before | `2D E9 F0 47` | `stmdb sp!, {r4, r5, r6, r7, r8, r9, sl, lr}` (function prologue) |
 | after  | `[b.w T5 emitted by patcher]` | branch to T5 trampoline |
 
-T5 obtains the AVRCP per-conn struct via JNI helper at `0x36c0` (the same helper the stock native called), reads `y1-track-info` (full 800 B) and `y1-trampoline-state` (21 B), and on track-id divergence emits a track-edge CHANGED burst:
+T5 obtains the AVRCP per-conn struct via JNI helper at `0x36c0` (the same helper the stock native called), reads `y1-track-info` (active slot, 800 B via the mmap-backed `read_track_info` subroutine) and trampoline state (13 B via `read_state_block` from `.bss`), and on track-id divergence emits a track-edge CHANGED burst:
 
 1. `reg_notievent_now_playing_content_rsp` (PLT `0x330c`, event 0x09) with `r1=0`, `r2=REASON_CHANGED` (`0x0d`). Gated on `database[9] != 0` (subscription armed by T8's INTERIM ack for ev=0x09). Primary metadata-refresh trigger for at least one CT in the test matrix.
 2. `reg_notievent_pos_changed_rsp` (PLT `0x3360`, event 0x05 — Tbl 5.33) with `r1=0`, `r2=REASON_CHANGED`, `r3=REV(file[780..783])` (current position in host order — `duration_ms` on natural end, `0` on NEXT / PREV). Gated on `database[5] != 0`.
@@ -370,7 +370,7 @@ T5's structural twin for events 0x01, 0x06, 0x05, 0x08, 0x09. Entered via `b.w T
 | before | `2D E9 F3 41` | function prologue |
 | after  | `[b.w T9 emitted by patcher]` | branch to T9 trampoline |
 
-T9 reads `y1-track-info` into its file buffer and `y1-trampoline-state` (21 B) into the state buffer, then runs five independent edge / cadence checks:
+T9 reads `y1-track-info` into its file buffer (via `read_track_info` — active slot, mmap-served) and the trampoline state block (13 B via `read_state_block` from `.bss`), then runs five independent edge / cadence checks:
 
 - **play_status:** compare file[792] vs state[9] (`last_play_status`). On inequality, emit `reg_notievent_playback_rsp` via PLT `0x339c` with `r1=0`, `r2=REASON_CHANGED` (`0x0d`), `r3=play_status`. Gated on `database[1] != 0`. The same edge branch also emits `NowPlayingContentChanged` CHANGED alongside the play-status CHANGED, gated on `database[9] != 0`. Both emits use `restore_conn_tid` to echo the per-event TID. Update state[9].
 - **battery_status:** compare file[794] vs state[10] (`last_battery_status`). On inequality, emit `reg_notievent_battery_status_changed_rsp` via PLT `0x3354` with `r3=battery_status`. Gated on `database[6] != 0`. Update state[10].
@@ -650,7 +650,7 @@ On match, reads both live values via `SharedPreferencesUtils.INSTANCE.getMusicRe
 
 **Patch B5** — in-app `y1-track-info` production (`com.koensayr.y1.*` injected classes).
 
-The music app is the canonical writer of the 2213-byte double-buffer `y1-track-info` schema (1-byte `active_slot` + 3 B pad + 2 × 1104-byte slots + 1 B pad), the 16-byte `y1-trampoline-state` (initial create), and the 2-byte `y1-papp-set` (initial create). All three live in `/data/data/com.innioasis.y1/files/`. The trampoline chain in `libextavrcp_jni.so` reads `y1-track-info` via `mmap2` + active-slot dispatch (see [`patch_libextavrcp_jni.py`](#patch_libextavrcp_jnipy) preamble) and reads the other two files via `open + read + close`.
+The music app is the canonical writer of the 2213-byte double-buffer `y1-track-info` schema (1-byte `active_slot` + 3 B pad + 2 × 1104-byte slots + 1 B pad) and the 2-byte `y1-papp-set` (initial create). It also still ensure-creates a 16-byte `y1-trampoline-state` file for backwards-compat across staged flashes, but the file is no longer read or written by any trampoline (state moved to `.bss` at `G_Y1_TRAMPOLINE_STATE_VADDR = 0xd2a4`). All three files live in `/data/data/com.innioasis.y1/files/`. The trampoline chain in `libextavrcp_jni.so` reads `y1-track-info` via `mmap2` + active-slot dispatch (see [`patch_libextavrcp_jni.py`](#patch_libextavrcp_jnipy) preamble), accesses trampoline state via PC-relative loads from `.bss` (zero syscalls), and writes `y1-papp-set` via `open + write + close` (rare — only on CT-initiated PApp Set).
 
 Four new classes under `com/koensayr/y1/` (smali sources at `src/patches/inject/com/koensayr/y1/`, copied into `smali/` — the primary DEX — at patcher time, so they load with `Y1Application` itself; `smali_classes2/` would route through `MultiDex.install`'s cache at `/data/data/com.innioasis.y1/code_cache/secondary-dexes/` which survives `/system/app/` reflashes and stales out the new classes):
 

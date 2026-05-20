@@ -791,11 +791,9 @@ def _emit_t5(a: Asm) -> None:
 
     a.label("t5_skip_track_read")
 
-    # ---- read y1-trampoline-state 21 bytes into state buf (sp+0..23) ----
-    # Default 0×24 (zero-fill all 24 in-memory bytes; we'll only read 21 from
-    # disk — state bytes 21..23 are 4-B alignment padding). zero-fill means
-    # "not subscribed" for every gate byte, which is the safe default if the
-    # state file is shorter than 21 bytes (older sessions).
+    # ---- zero-init state buf (24 B) before reading 13 B from .bss state ----
+    # Zero-fill covers bytes 13..23 (state bytes beyond Y1_TRAMPOLINE_STATE_SIZE
+    # plus 4-B alignment padding) so any reads past offset 12 return zero.
     a.movs_imm8(0, 0)
     a.str_sp_imm(0, T5_OFF_STATE + 0)
     a.str_sp_imm(0, T5_OFF_STATE + 4)

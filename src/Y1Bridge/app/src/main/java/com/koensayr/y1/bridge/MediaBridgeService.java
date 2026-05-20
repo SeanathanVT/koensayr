@@ -12,6 +12,7 @@ import android.util.Log;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
@@ -156,8 +157,12 @@ public class MediaBridgeService extends Service {
             // MappedByteBuffer.get(int) reads a single byte; for bulk copy
             // we duplicate, position, and get(byte[]) to avoid affecting
             // shared buffer position (the buffer is shared across all
-            // Binder threads via the volatile field).
-            MappedByteBuffer dup = (MappedByteBuffer) m.duplicate();
+            // Binder threads via the volatile field). MappedByteBuffer
+            // extends ByteBuffer, and duplicate() returns ByteBuffer in
+            // the JDK ≤ 12 API surface (Java 13+ added a covariant return
+            // type override). Holding as ByteBuffer keeps us compatible
+            // across all Android API levels.
+            ByteBuffer dup = m.duplicate();
             dup.position(srcOff);
             dup.get(slot, 0, TRACK_INFO_SLOT_SIZE);
         }

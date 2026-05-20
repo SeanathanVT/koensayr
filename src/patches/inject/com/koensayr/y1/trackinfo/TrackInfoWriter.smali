@@ -243,8 +243,12 @@
 
 
 # Make filesDir traversable for the BT process (uid bluetooth) and pre-create
-# the state files (y1-trampoline-state, y1-papp-set) world-rw — trampolines
-# open them without O_CREAT, so they must exist before MtkBt's first probe.
+# the state files world-rw. y1-track-info gets pre-sized to 2213 B so the
+# trampolines' first mmap covers a valid file. y1-papp-set is pre-created
+# so T_papp 0x14 can open without O_CREAT on CT-initiated PApp Set.
+# y1-trampoline-state is still ensure-created here for backwards-compat
+# across staged flashes but is no longer read or written — trampoline
+# edge state lives in libextavrcp_jni.so's .bss now.
 .method private prepareFilesLocked()V
     .locals 4
 

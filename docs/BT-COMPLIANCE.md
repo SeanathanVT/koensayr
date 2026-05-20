@@ -212,7 +212,7 @@ Total slot size: **1104 B**. Per-slot schema is append-only; we never relocate e
 
 The numeric AVRCP §5.3.4 attrs (4 / 5 / 7) are stored pre-formatted as ASCII decimal strings rather than binary u16 / u32 with a Thumb-2 itoa, keeping the T4 trampoline a uniform strlen+memcpy loop.
 
-`y1-trampoline-state` (16 B, mode 0666) is the BT-process-writable surface used by T5 / T9 for cross-firing edge state: bytes 0..7 = last_seen track_id (T5), byte 8 = last RegisterNotification transId (T5), byte 9 = last_play_status (T9), byte 10 = last_battery_status (T9), byte 11 = last_repeat_avrcp (T9 papp edge), byte 12 = last_shuffle_avrcp (T9 papp edge), bytes 13..15 = padding.
+Trampoline edge state moved off-disk into `libextavrcp_jni.so` `.bss` at `G_Y1_TRAMPOLINE_STATE_VADDR = 0xd2a4` (13 B). Layout matches the legacy on-disk schema: bytes 0..7 = last_seen track_id (T5 / T4 edge detect), byte 8 = unused (was last RegNotif transId; per-event TIDs now live in `g_avrcp_req_event_database`), byte 9 = last_play_status (T9), byte 10 = last_battery_status (T9), byte 11 = last_repeat_avrcp (T9 papp), byte 12 = last_shuffle_avrcp (T9 papp). Zero-init at process load (same scope as `g_avrcp_req_event_database`). The `y1-trampoline-state` on-disk file is still ensure-created by `TrackInfoWriter.prepareFilesLocked` for backwards-compat across staged flashes but is no longer read or written by any trampoline.
 
 ---
 

@@ -57,9 +57,12 @@ All AVRCP observation + state production lives in the music app
 (`com.innioasis.y1`) via the Patch B3..B6 smali injections in
 `src/patches/inject/com/koensayr/y1/*`:
 
-- `TrackInfoWriter` — writes `y1-track-info` / `y1-trampoline-state` /
-  `y1-papp-set` under `/data/data/com.innioasis.y1/files/` (the trampoline
-  chain in `libextavrcp_jni.so` reads from there).
+- `TrackInfoWriter` — writes the 2213-byte double-buffer `y1-track-info`
+  and the 2-byte `y1-papp-set` under `/data/data/com.innioasis.y1/files/`
+  (the trampoline chain in `libextavrcp_jni.so` mmaps the first and reads
+  the second on CT-initiated PApp Set). Also ensure-creates a now-unused
+  `y1-trampoline-state` file for backwards-compat; trampoline edge state
+  moved to `.bss`.
 - `PlaybackStateBridge` — hooks the music app's player engine
   (`Static.setPlayValue` + IjkMediaPlayer / `android.media.MediaPlayer`
   listener lambdas). State edges observed in-process, no logcat scraping,
