@@ -246,9 +246,6 @@
 # the state files world-rw. y1-track-info gets pre-sized to 2213 B so the
 # trampolines' first mmap covers a valid file. y1-papp-set is pre-created
 # so T_papp 0x14 can open without O_CREAT on CT-initiated PApp Set.
-# y1-trampoline-state is still ensure-created here for backwards-compat
-# across staged flashes but is no longer read or written — trampoline
-# edge state lives in libextavrcp_jni.so's .bss now.
 .method private prepareFilesLocked()V
     .locals 4
 
@@ -265,12 +262,6 @@
     const/4 v2, 0x0
 
     invoke-virtual {v0, v1, v2}, Ljava/io/File;->setExecutable(ZZ)Z
-
-    const-string v1, "y1-trampoline-state"
-
-    const/16 v2, 0x14
-
-    invoke-direct {p0, v1, v2}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->ensureFile(Ljava/lang/String;I)V
 
     const-string v1, "y1-papp-set"
 

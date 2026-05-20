@@ -241,11 +241,11 @@ Within a single BT-enable cycle, the flag prevents double-init. **F2 patches `Bl
 
 ## Music app component lifecycle
 
-The music app's `Y1Application.onCreate` registers four in-process components that together produce every byte of `y1-track-info`, `y1-trampoline-state`, and `y1-papp-set` under `/data/data/com.innioasis.y1/files/`:
+The music app's `Y1Application.onCreate` registers four in-process components that together produce every byte of `y1-track-info` and `y1-papp-set` under `/data/data/com.innioasis.y1/files/`:
 
 | Component | Purpose |
 |---|---|
-| `com.koensayr.y1.trackinfo.TrackInfoWriter` | Singleton state holder + double-buffer file writer. Owns the 2213-byte `y1-track-info` schema (1 B active_slot + 3 B RFA + 2 × 1104 B slots + 1 B RFA). `prepareFiles()` pre-sizes and chmods `y1-track-info` and `y1-papp-set` world-rw / world-readable so the BT process (different uid) can `mmap()` them. The `y1-trampoline-state` file is still ensure-created at boot for backwards-compat across staged flashes but is no longer read or written — trampoline edge state migrated to `.bss` at vaddr `0xd2a4`. |
+| `com.koensayr.y1.trackinfo.TrackInfoWriter` | Singleton state holder + double-buffer file writer. Owns the 2213-byte `y1-track-info` schema (1 B active_slot + 3 B RFA + 2 × 1104 B slots + 1 B RFA). `prepareFiles()` pre-sizes and chmods `y1-track-info` and `y1-papp-set` world-rw / world-readable so the BT process (different uid) can `mmap()` them. Trampoline edge state lives in `libextavrcp_jni.so` `.bss` at vaddr `0xd2a4` (zero syscalls, no on-disk artifact). |
 | `com.koensayr.y1.playback.PlaybackStateBridge` | Stateless dispatcher hooked into `Static.setPlayValue` and the `PlayerService` listener lambdas (`onPrepared`, `onCompletion`, `onError`). Maps player state to AVRCP play-status enum and calls into TrackInfoWriter on every edge. |
 | `com.koensayr.y1.battery.BatteryReceiver` | `Intent.ACTION_BATTERY_CHANGED` receiver. Bucket-maps level + plugged-state to the AVRCP §5.4.2 Tbl 5.35 enum (NORMAL / WARNING / CRITICAL / EXTERNAL / FULL_CHARGE) and writes byte 794. Fires `com.android.music.playstatechanged` on bucket transition so T9 emits BATT_STATUS_CHANGED CHANGED. |
 | `com.koensayr.y1.papp.PappSetFileObserver` | `FileObserver(y1-papp-set, CLOSE_WRITE)`. Reads the 2-byte payload (attr_id, value), maps AVRCP enum → Y1 enum, calls `SharedPreferencesUtils.setMusicRepeatMode / setMusicIsShuffle`. Lets a CT's PApp Set round-trip into the music app's settings. |
@@ -764,20 +764,14 @@ See [`INVESTIGATION.md`](INVESTIGATION.md) "Hardware test history per CT" for th
 
 ### Music-app ↔ trampoline file contract
 
-Three files, all in `/data/data/com.innioasis.y1/files/`:
+Two files, both in `/data/data/com.innioasis.y1/files/`:
 
 - **y1-track-info** (2213 B, mode 0644 so the BT process can open + mmap it). Written by `TrackInfoWriter` on every state change in place via `RandomAccessFile.seek+write` into the inactive slot, then atomic single-byte flip of the active_slot indicator at file[0]. Reader (`libextavrcp_jni.so` trampolines) lazy-mmaps the file once per process and dispatches by reading file[0] on each access — no syscall per emit, no `tmpfile + rename` race window. Schema: `[0]=active_slot, [1..3]=RFA, [4..1107]=slot[0], [1108..2211]=slot[1], [2212]=RFA`. Per-field byte offsets within each slot match the legacy `[0..1103]` layout in [`BT-COMPLIANCE.md`](BT-COMPLIANCE.md) §4.
-- **y1-trampoline-state** (24 B in-memory; on-disk may be smaller from historical short writes — short reads zero-fill. Mode 0666, world-rw, pre-created by `TrackInfoWriter.prepareFiles` at music-app startup, updated by the trampolines):
-  - 0..7  = last track_id we told the CT about (updated by T4 after emitting CHANGED, and by extended_T2 / T5 after emitting CHANGED)
-  - 8     = last RegisterNotification transId (T5 mirror, legacy — no longer read; per-event TIDs now live in `g_avrcp_req_event_database`)
-  - 9     = last_play_status (T9 edge-detect)
-  - 10    = last_battery_status (T9 edge-detect)
-  - 11    = last_repeat_avrcp (T9 papp edge-detect)
-  - 12    = last_shuffle_avrcp (T9 papp edge-detect)
-  - 13..23 = padding (formerly per-event subscription gate bytes; the trampoline no longer reads or writes these — subscription state moved into `g_avrcp_req_event_database` at vaddr `0xd2b5`, `.bss`, session-scope)
 - **y1-papp-set** (2 B, mode 0666). Written by T_papp 0x14 with `[attr_id, value]` on every PApp Set; consumed by `PappSetFileObserver` in the music app, which dispatches to `SharedPreferencesUtils.setMusicRepeatMode` / `setMusicIsShuffle`.
 
-`TrackInfoWriter.prepareFiles()` ensures the BT process can reach all three files: `setExecutable(true, false)` on the files dir adds world-x for traversal; each file is created with `setReadable(true, false)` and (for the two writable from the BT side) `setWritable(true, false)`.
+Trampoline edge state (last-emitted track_id, play_status, battery, repeat, shuffle) lives in `libextavrcp_jni.so` `.bss` at `G_Y1_TRAMPOLINE_STATE_VADDR = 0xd2a4` (13 B, session-scope, zero-init at process load). Per-event subscription gates + TIDs live in `g_avrcp_req_event_database` at `.bss` vaddr `0xd2b5` (15 B). No on-disk artifact.
+
+`TrackInfoWriter.prepareFiles()` ensures the BT process can reach both files: `setExecutable(true, false)` on the files dir adds world-x for traversal; each file is created with `setReadable(true, false)` and (for the writable one) `setWritable(true, false)`.
 
 ### Code-cave inventory
 
@@ -850,8 +844,8 @@ Every state read or write that crosses process boundaries. Consult this table be
 |---|---|---|---|---|---|
 | `sPlayServiceInterface` (byte field@1267) | `MtkBt.odex` (Java, in BT process) | `BTAvrcpMusicAdapter.startToBindPlayService` (gate read), other adapter methods | `BTAvrcpMusicAdapter.startToBindPlayService` (set true at bind start) | F2 patches `BluetoothAvrcpService.disable()` to set false | Critical. If false → AVRCP wire degrades to compile-time 1.0 dispatch + no Java callbacks. |
 | `mMusicService` (IBinder field) | `BTAvrcpMusicAdapter` (Java, in BT process) | All adapter methods that delegate to the bridge (transact codes 1 / 3 / 4 / 13-31) | `BTAvrcpMusicAdapter$4.onServiceConnected` after `bindService` succeeds | `onServiceDisconnected` (sets null), `disable` | Required even though the trampolines bypass the Java path for most queries — MtkBt's `mMusicService != null` checks gate the cardinality-NOP-driven Java callback path. |
-| `y1-track-info` (1104 B file) | Music app `TrackInfoWriter` | T4 (full file), T5 (16 + 800 B), T6 (offsets 776..795), T8 (792 / 794), T9 (792 / 794 / 780..787) — all in BT process | `TrackInfoWriter.flush()` on every state change (driven by `PlaybackStateBridge` edges, `BatteryReceiver`, `PappStateBroadcaster`) | Process shutdown / OS reboot | Mode `0644`, world-readable. Path: `/data/data/com.innioasis.y1/files/y1-track-info`. **Must be written before the corresponding broadcast fires.** |
-| `y1-trampoline-state` (16 B file) | Music app `TrackInfoWriter.prepareFiles` (initial create) + trampolines (mutate) | All trampolines that need edge-detection (T4 / T5 / T9) | T4 / extended_T2 / T5 (after CHANGED emit) and T9 (after edge fires) write back | — | Mode `0666`, world-rw. Both processes write it. Path: `/data/data/com.innioasis.y1/files/y1-trampoline-state`. |
+| `y1-track-info` (2213 B file) | Music app `TrackInfoWriter` | T4 / T5 / T6 / T8 / T9 / extended_T2 / T_papp — all in BT process, via lazy-mmap of file[0..2212] | `TrackInfoWriter.flush()` on every state change (driven by `PlaybackStateBridge` edges, `BatteryReceiver`, `PappStateBroadcaster`) | Process shutdown / OS reboot | Mode `0644`, world-readable. Path: `/data/data/com.innioasis.y1/files/y1-track-info`. Double-buffer (file[0]=active_slot + 2 × 1104 B slots); music app writes inactive slot then atomically flips file[0]. **Must be written before the corresponding broadcast fires.** |
+| Trampoline edge state (13 B) | `libextavrcp_jni.so` `.bss` at vaddr `0xd2a4` | T4 / extended_T2 / T5 / T9 edge detect | T4 / extended_T2 / T5 (after CHANGED emit) and T9 (after edge fires) | Zero-init at every process load | Session-scope only. PC-relative loads, no syscalls. |
 | `y1-papp-set` (2 B file) | Music app `TrackInfoWriter.prepareFiles` (initial create) + T_papp 0x14 (write on PApp Set) | Music app `PappSetFileObserver` | T_papp 0x14 writes `[attr_id, value]` on every CT-initiated PApp Set | — | Mode `0666`, world-rw. Path: `/data/data/com.innioasis.y1/files/y1-papp-set`. CT → Y1 side of the Repeat / Shuffle round-trip. |
 | `metachanged` broadcast | Music app `PlayerService` fires; MtkBt's `BluetoothAvrcpReceiver` consumes | `BluetoothAvrcpReceiver` (manifest-declared in MtkBt.apk) | Music app's track-load path sends `com.android.music.metachanged` on track change | n/a | Wakes the chain into `notificationTrackChangedNative` → T5 (proactive TRACK_CHANGED 3-tuple). MtkBt.odex cardinality NOP at file 0x3c530 makes the Java callback fire unconditionally. |
 | `playstatechanged` broadcast | Music app `PlayerService` + `PappStateBroadcaster` fire; MtkBt's `BluetoothAvrcpReceiver` consumes | Same as above | Fires on play/pause/stop edge, on battery bucket transition, on the 1 s position tick while playing, and on every `musicRepeatMode` / `musicIsShuffle` change | n/a | Wakes `notificationPlayStatusChangedNative` → T9. MtkBt.odex cardinality NOP at file 0x3c4fe makes it fire unconditionally on event 0x01. |
