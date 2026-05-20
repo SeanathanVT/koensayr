@@ -6894,3 +6894,70 @@ Conservative scope:
 ### Blob impact
 
 Pure code reorder, same byte count (3344 B post-reorder = 3344 B pre-reorder). 676 B free of 4020. No budget risk.
+
+---
+
+## Trace #83 — 2026-05-20 y1-trampoline-state → .bss (eliminate per-fire syscalls)
+
+### Motivation (from prior session's mmap-cleanup review)
+
+Post-mmap-rework, `y1-track-info` is served from page-cache RAM via the shared inode trick. The remaining on-disk surface inside the AVRCP hot path was `y1-trampoline-state` — a 24-byte file read + written by T4 / T5 / T9 on EVERY fire (PositionTicker 1 Hz → 1 T9 fire/sec, plus track edges → T5 + T9). Three syscalls per read (open + read + close), three per write. Same-process only (mtkbt's `libextavrcp_jni.so` is the only reader and writer), so no cross-process plumbing required.
+
+### Design
+
+13-byte `.bss` block at `G_Y1_TRAMPOLINE_STATE_VADDR = 0xd2a4` — the unallocated padding at the very start of `.bss` (between `__bss_start` / `_edata` and the first real stock symbol `g_avrcp_req_event_database` at `0xd2b5`). 17 B available; 13 B used. Same per-slot layout as the on-disk schema:
+
+```
+state[0..7]  last_seen track_id  (T4 / T5 edge detection)
+state[8]     (reserved — was last RegNotif transId; dropped, per-event TIDs
+              live in g_avrcp_req_event_database)
+state[9]     last_play_status    (T9 edge detection)
+state[10]    last_battery_status (T9)
+state[11]    last_repeat_avrcp   (T9 papp edge)
+state[12]    last_shuffle_avrcp  (T9 papp edge)
+```
+
+Two new shared subroutines mirror the `read_track_info` pattern:
+
+- `read_state_block(r0=dst, r1=nbytes, r2=state_offset)` — PC-rel literal → absolute vaddr → byte-copy nbytes from `state[state_offset]` to dst stack buf.
+- `write_state_block(r0=src, r1=nbytes, r2=state_offset)` — mirror, src/dst reversed.
+
+Per-site conversion: T4 / T5 / T8 / T9 / extended_T2's six `open + read + close` and four `open + write + close` chains all collapse to `bl read_state_block` / `bl write_state_block`.
+
+### Per-fire syscall savings
+
+| Trampoline | Old syscalls | New syscalls | Δ |
+|---|---|---|---|
+| T4 (read+write) | 6 | 0 | -6 |
+| T5 (read+write) | 6 | 0 | -6 |
+| T8 (read only)  | 3 | 0 | -3 |
+| T9 (read+write) | 6 | 0 | -6 |
+| extended_T2 (write only) | 3 | 0 | -3 |
+
+PositionTicker drives T9 at 1 Hz → **6 syscalls/sec saved during active playback**, plus 6 per T5 track edge and 3 per extended_T2 RegNotif arrival.
+
+### Blob impact
+
+| Stage | Blob size | Free (of 4020) |
+|---|---|---|
+| Pre-Tier-1 (3344 B post-mmap-rework + reorder) | 3344 | 676 |
+| Two new subroutines, no callsites converted | 3424 | 596 |
+| All 10 callsites converted | 3228 | 792 |
+| Dropped `path_state` data string | 3172 | 848 |
+
+**Net: -172 B trampoline blob shrink** despite adding two new subroutines. The per-site savings (replacing ~30 B inline `open + read + close` with ~10 B `bl read_state_block`) exceed the subroutine cost.
+
+### State persistence semantics change
+
+The on-disk file persisted across mtkbt restarts. The `.bss` version resets to zero on every `libextavrcp_jni.so` load (process scope). After mtkbt restart, the next T5/T9 fire sees `state[N] = 0` vs current file value → edge detected → one CHANGED per active subscription emitted. Subscription gates filter out unsubscribed events. Net effect: harmless extra CHANGED-per-event-per-restart, consistent with `g_avrcp_req_event_database`'s session-scope model.
+
+The on-disk `y1-trampoline-state` file is no longer read or written by any trampoline. `TrackInfoWriter.prepareFilesLocked` still ensure-creates it (backwards-compat across staged flashes); the file bytes are now ignored. Cleanup of the `ensureFile` call deferred — 20 B of disk waste, not load-bearing.
+
+### Remaining on-disk hot paths
+
+- `y1-papp-set` — cross-process (mtkbt writes via T_papp 0x14, music app reads via FileObserver). Low frequency (only on CT-initiated Repeat / Shuffle Set). Not optimized.
+- `MediaBridgeService.readTrackInfo` (Y1Bridge) — reads `y1-track-info` via FileInputStream for IBTAvrcpMusic Binder queries. Could mmap on the same inode; deferred to Tier 2.
+
+### `path_state` literal removed
+
+The "/data/data/com.innioasis.y1/files/y1-trampoline-state" string in the trampoline data section is no longer referenced. Removed. -56 B from the blob.

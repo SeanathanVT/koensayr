@@ -435,23 +435,14 @@ def _emit_t4(a: Asm) -> None:
 
     a.label("t4_skip_track_read")
 
-    # ---- open + syscall_read + close on y1-trampoline-state ----
-    a.adr_w(0, "path_state")
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("t4_skip_state_read")
-    a.mov_lo_lo(4, 0)
-
-    a.mov_lo_lo(0, 4)
-    a.add_sp_imm(1, T4_OFF_STATE)
-    a.movs_imm8(2, 16)
-    a.movs_imm8(7, NR_read)
-    a.svc(0)
-
-    a.mov_lo_lo(0, 4)
-    a.blx_imm(PLT_close)
+    # ---- copy trampoline state from .bss to sp+T4_OFF_STATE ----
+    # T4 only inspects state[0..7] (track_id) but copies the legacy 13-byte
+    # window for binary-compat with the prior stack layout; bytes 8..12
+    # are dead-or-T9-owned and end up zero-padded in the state buf anyway.
+    a.add_sp_imm(0, T4_OFF_STATE)
+    a.movs_imm8(1, Y1_TRAMPOLINE_STATE_SIZE)
+    a.movs_imm8(2, 0)                         # state_offset = 0
+    a.bl_w("read_state_block")
 
     a.label("t4_skip_state_read")
 
@@ -488,30 +479,13 @@ def _emit_t4(a: Asm) -> None:
     a.ldr_sp_imm(0, T4_OFF_FILE_TID + 4)
     a.str_sp_imm(0, T4_OFF_STATE   + 4)
 
-    # Write 16-byte state file. We use O_WRONLY|O_TRUNC (no O_CREAT) — file is
-    # pre-created by TrackInfoWriter.prepareFiles() in the music app. If it's
-    # somehow gone, we silently skip the write rather than create a
-    # wrongly-permissioned file.
-    a.adr_w(0, "path_state")
-    # No O_TRUNC: file is 20 B (T8 owns subscription bytes at offset 13..19);
-    # truncating would clobber them and the per-event subscription gates would
-    # all reset to "not subscribed" on every track edge, breaking AVRCP §6.7.1
-    # semantics. T4 writes the first 16 bytes (its read scope); bytes 16..19
-    # stay untouched on disk.
-    a.movw(1, O_WRONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("t4_no_change")                     # open failed → skip write
-    a.mov_lo_lo(4, 0)
-
-    a.mov_lo_lo(0, 4)
-    a.add_sp_imm(1, T4_OFF_STATE)
-    a.movs_imm8(2, 16)
-    a.blx_imm(PLT_write)
-
-    a.mov_lo_lo(0, 4)
-    a.blx_imm(PLT_close)
+    # ---- write updated state[0..7] (track_id) back to .bss ----
+    # T4 only touches the first 8 bytes (track_id) — narrow write keeps
+    # T9-owned bytes 9..12 unaffected.
+    a.add_sp_imm(0, T4_OFF_STATE)
+    a.movs_imm8(1, 8)
+    a.movs_imm8(2, 0)                         # state_offset = 0
+    a.bl_w("write_state_block")
 
     a.label("t4_no_change")
 
@@ -731,33 +705,15 @@ def _emit_extended_t2(a: Asm) -> None:
 
     a.label("ext2_after_track_read")
 
-    # ---- store caller's transId at sp+8 ----
-    a.ldrb_w(0, 13, T2_TRANSID_CALLER_OFF)
-    a.strb_w(0, 13, T2_OFF_TRANSID)
-
-    # open(path_state, O_WRONLY, 0) — no O_TRUNC, no O_CREAT. The music app's
-    # TrackInfoWriter.prepareFiles() pre-creates it. We open without truncating because we only
-    # write OUR 9 bytes (track_id 0..7 + transId at 8); T9's bytes 9..12 must
-    # stay intact. With O_TRUNC we'd zero them and cause spurious CHANGED
-    # frames on the next T9 fire.
-    a.adr_w(0, "path_state")
-    a.movw(1, O_WRONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("ext2_after_state_write")
-    a.mov_lo_lo(4, 0)
-
-    # write 9 B from sp+0..8 (track_id + transId). No lseek needed since
-    # the fd's offset starts at 0 after open; we write at the head of the
-    # file and stop after 9 bytes. T9's bytes 9..12 are untouched.
-    a.mov_lo_lo(0, 4)
-    a.add_sp_imm(1, T2_OFF_TID)               # source = sp+0
-    a.movs_imm8(2, 9)                         # 9 bytes (0..8 inclusive)
-    a.blx_imm(PLT_write)
-
-    a.mov_lo_lo(0, 4)
-    a.blx_imm(PLT_close)
+    # ---- store track_id (file[0..7]) back into .bss state[0..7] ----
+    # The transId-at-state[8] mirror is dead (per-event TIDs live in
+    # g_avrcp_req_event_database; no consumer reads state[8] anymore), so
+    # we narrow the write to just the 8-byte track_id. T9-owned bytes
+    # 9..12 stay untouched.
+    a.add_sp_imm(0, T2_OFF_TID)               # src = sp+0 (track_id)
+    a.movs_imm8(1, 8)
+    a.movs_imm8(2, 0)                         # state_offset = 0
+    a.bl_w("write_state_block")
 
     a.label("ext2_after_state_write")
 
@@ -848,22 +804,11 @@ def _emit_t5(a: Asm) -> None:
     a.str_sp_imm(0, T5_OFF_STATE + 16)
     a.str_sp_imm(0, T5_OFF_STATE + 20)
 
-    a.adr_w(0, "path_state")
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("t5_skip_state_read")
-    a.mov_lo_lo(5, 0)
-
-    a.mov_lo_lo(0, 5)
-    a.add_sp_imm(1, T5_OFF_STATE)             # r1 = state buf
-    a.movs_imm8(2, 21)                        # 21 B: 16 legacy + 5 sub_* bytes
-    a.movs_imm8(7, NR_read)
-    a.svc(0)
-
-    a.mov_lo_lo(0, 5)
-    a.blx_imm(PLT_close)
+    # ---- copy .bss trampoline state into sp+T5_OFF_STATE (13 bytes) ----
+    a.add_sp_imm(0, T5_OFF_STATE)
+    a.movs_imm8(1, Y1_TRAMPOLINE_STATE_SIZE)
+    a.movs_imm8(2, 0)                         # state_offset = 0
+    a.bl_w("read_state_block")
 
     a.label("t5_skip_state_read")
 
@@ -1003,27 +948,13 @@ def _emit_t5(a: Asm) -> None:
     a.ldr_sp_imm(0, T5_OFF_FILE_TID + 4)
     a.str_sp_imm(0, T5_OFF_STATE + 4)
 
-    # ---- write only T5's bytes (0..7 track_id + 8 transId = 9 B) ----
-    # No O_TRUNC: T9 owns bytes 9..12 (last_play / last_battery / last_repeat
-    # / last_shuffle). Truncating would clobber T9's edge-tracking state and
-    # cause spurious CHANGED emits on the next play_state edge. Without
-    # O_TRUNC, the existing 16 B file shape is preserved and we overwrite
-    # only the leading 9 bytes.
-    a.adr_w(0, "path_state")
-    a.movw(1, O_WRONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt_w("t5_no_change")                   # open failed → skip write, still return success
-    a.mov_lo_lo(5, 0)
-
-    a.mov_lo_lo(0, 5)
-    a.add_sp_imm(1, T5_OFF_STATE)             # r1 = state buf
-    a.movs_imm8(2, 9)                         # 9 bytes: track_id (8) + transId (1)
-    a.blx_imm(PLT_write)
-
-    a.mov_lo_lo(0, 5)
-    a.blx_imm(PLT_close)
+    # ---- write updated state[0..7] (track_id) back to .bss ----
+    # state[8] (legacy transId mirror) is dead; T9-owned bytes 9..12 stay
+    # untouched because we narrow the write to 8 bytes.
+    a.add_sp_imm(0, T5_OFF_STATE)
+    a.movs_imm8(1, 8)
+    a.movs_imm8(2, 0)                         # state_offset = 0
+    a.bl_w("write_state_block")
 
     a.label("t5_no_change")
     # ---- epilogue: return jboolean true ----
@@ -1762,6 +1693,33 @@ G_Y1_AVRCP_TRACK_IDENTIFIER_VADDR = 0xd2c4
 # valid across every flush from the writer side.
 G_Y1_TRACK_INFO_MMAP_BASE_VADDR = 0xd2cc
 
+# 13-byte trampoline-state block in .bss padding at the very start of .bss
+# (0xd2a4..0xd2b0). The bytes from `__bss_start` / `_edata` at 0xd2a4 up to
+# the first real stock symbol (g_avrcp_req_event_database at 0xd2b5) are
+# unallocated padding — 17 B of available space; we use the first 13. Layout
+# mirrors the legacy on-disk y1-trampoline-state schema so the T4 / T5 / T9
+# field-offset constants (T*_OFF_STATE + N) work unchanged once the bytes
+# are loaded into the trampoline's stack state_buf:
+#
+#   state[0..7]  last_seen track_id (T5 / T4 edge detection)
+#   state[8]     unused (was last RegNotif transId; dead since per-event TIDs
+#                moved to g_avrcp_req_event_database)
+#   state[9]     last_play_status        (T9 edge detection)
+#   state[10]    last_battery_status     (T9 edge detection)
+#   state[11]    last_repeat_avrcp       (T9 papp edge)
+#   state[12]    last_shuffle_avrcp      (T9 papp edge)
+#
+# Process-scope (zero-init at every libextavrcp_jni.so load), same semantic
+# as g_avrcp_req_event_database. After mtkbt restart, the next T5/T9 fire
+# sees state[N] = 0 vs current file value → edge detected → one CHANGED per
+# event emitted (gated by subscription database — harmless if CT hasn't
+# re-subscribed yet because the gate skips). The on-disk y1-trampoline-state
+# file is no longer read or written by the trampolines; the music app side
+# still ensureFile-creates it for backward-compat across staged flashes but
+# the bytes are now ignored.
+G_Y1_TRAMPOLINE_STATE_VADDR = 0xd2a4
+Y1_TRAMPOLINE_STATE_SIZE    = 13
+
 
 # y1-track-info schema. Music app's TrackInfoWriter ships file shape:
 #
@@ -2227,6 +2185,97 @@ def _emit_read_track_info_subroutine(a: Asm) -> None:
     a.raw(bytes([0xf8, 0xbd]))
 
 
+def _emit_read_state_block_subroutine(a: Asm) -> None:
+    """Copy nbytes from G_Y1_TRAMPOLINE_STATE_VADDR + state_offset to caller's
+    stack buffer.
+
+    Pre: r0 = dst, r1 = nbytes (1..13), r2 = state_offset (0..12).
+    Post: r0 = nbytes copied. r4..r11 preserved. Clobbers r1, r2, r3, lr.
+
+    Loads the state-block absolute vaddr via PC-relative literal + add r,pc,
+    then byte-copies the requested range into dst. Replaces the legacy
+    `open(path_state, O_RDONLY) + read + close` pattern in T4 / T5 / T8 / T9.
+    Per-call savings: 3 syscalls + the FD-management thumb-2 sequence
+    (~30 B per site) — net blob shrinks vs. the prior inline I/O.
+    """
+    a.label("read_state_block")
+    a.raw(bytes([0xf8, 0xb5]))                  # push {r3, r4-r7, lr}
+
+    a.mov_lo_lo(4, 0)                           # r4 = dst
+    a.mov_lo_lo(5, 1)                           # r5 = nbytes
+
+    a.ldr_lit_w(1, "read_state_block_lit")
+    a.label("read_state_block_add_pc")
+    a.add_reg(1, 15)                            # r1 = absolute &state[0]
+    a.adds_lo_lo(1, 1, 2)                       # r1 += state_offset
+
+    a.cmp_imm8(5, 0)
+    a.beq("read_state_block_done")
+    a.movs_imm8(3, 0)
+    a.label("read_state_block_loop")
+    a.ldrb_reg(0, 1, 3)                         # r0 = state[i]
+    # strb r0, [r4, r3] — 0x5400 | (3<<6) | (4<<3) | 0 = 0x54E0.
+    a.raw(bytes([0xe0, 0x54]))
+    a.raw(bytes([0x01, 0x33]))                  # adds r3, #1
+    a.cmp_w(3, 5)
+    a.bne("read_state_block_loop")
+
+    a.label("read_state_block_done")
+    a.mov_lo_lo(0, 5)                           # return nbytes
+    a.raw(bytes([0xf8, 0xbd]))                  # pop {r3, r4-r7, pc}
+
+    a.align(4)
+    a.label("read_state_block_lit")
+    def _emit_read_lit(_pc: int) -> bytes:
+        offset = G_Y1_TRAMPOLINE_STATE_VADDR - (a.labels["read_state_block_add_pc"] + 4)
+        return (offset & 0xFFFFFFFF).to_bytes(4, "little")
+    a._fixup(_emit_read_lit, 4)
+
+
+def _emit_write_state_block_subroutine(a: Asm) -> None:
+    """Copy nbytes from caller's src buffer to G_Y1_TRAMPOLINE_STATE_VADDR +
+    state_offset.
+
+    Pre: r0 = src, r1 = nbytes (1..13), r2 = state_offset (0..12).
+    Post: r0 = nbytes copied. r4..r11 preserved. Clobbers r1, r2, r3, lr.
+
+    Mirror of read_state_block (source / dest reversed). Replaces the legacy
+    `open(path_state, O_WRONLY) + write + close` pattern in T5 / T9.
+    """
+    a.label("write_state_block")
+    a.raw(bytes([0xf8, 0xb5]))                  # push {r3, r4-r7, lr}
+
+    a.mov_lo_lo(4, 0)                           # r4 = src
+    a.mov_lo_lo(5, 1)                           # r5 = nbytes
+
+    a.ldr_lit_w(1, "write_state_block_lit")
+    a.label("write_state_block_add_pc")
+    a.add_reg(1, 15)                            # r1 = absolute &state[0]
+    a.adds_lo_lo(1, 1, 2)                       # r1 += state_offset
+
+    a.cmp_imm8(5, 0)
+    a.beq("write_state_block_done")
+    a.movs_imm8(3, 0)
+    a.label("write_state_block_loop")
+    a.ldrb_reg(0, 4, 3)                         # r0 = src[i]
+    # strb r0, [r1, r3] — 0x5400 | (3<<6) | (1<<3) | 0 = 0x54C8.
+    a.raw(bytes([0xc8, 0x54]))
+    a.raw(bytes([0x01, 0x33]))                  # adds r3, #1
+    a.cmp_w(3, 5)
+    a.bne("write_state_block_loop")
+
+    a.label("write_state_block_done")
+    a.mov_lo_lo(0, 5)                           # return nbytes
+    a.raw(bytes([0xf8, 0xbd]))                  # pop {r3, r4-r7, pc}
+
+    a.align(4)
+    a.label("write_state_block_lit")
+    def _emit_write_lit(_pc: int) -> bytes:
+        offset = G_Y1_TRAMPOLINE_STATE_VADDR - (a.labels["write_state_block_add_pc"] + 4)
+        return (offset & 0xFFFFFFFF).to_bytes(4, "little")
+    a._fixup(_emit_write_lit, 4)
+
+
 def _emit_native_log_u32(a: Asm, fmt_label: str, value_reg: int) -> None:
     """Emit __android_log_print(INFO, "Y1T", fmt, value_reg) before a wire-side
     response blx. Used by build(debug=True) to record exactly what bytes the
@@ -2682,23 +2731,11 @@ def _emit_t9(a: Asm) -> None:
 
     a.label("t9_skip_track_read")
 
-    # ---- open + read y1-trampoline-state into state_buf ----
-    a.adr_w(0, "path_state")
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("t9_skip_state_read")
-    a.mov_lo_lo(5, 0)
-
-    a.mov_lo_lo(0, 5)
-    a.add_sp_imm(1, T9_OFF_STATE)             # r1 = state_buf
-    a.movs_imm8(2, 21)                        # 21 B: 16 legacy + 5 sub_* bytes
-    a.movs_imm8(7, NR_read)
-    a.svc(0)
-
-    a.mov_lo_lo(0, 5)
-    a.blx_imm(PLT_close)
+    # ---- copy .bss trampoline state into sp+T9_OFF_STATE (13 bytes) ----
+    a.add_sp_imm(0, T9_OFF_STATE)
+    a.movs_imm8(1, Y1_TRAMPOLINE_STATE_SIZE)
+    a.movs_imm8(2, 0)                         # state_offset = 0
+    a.bl_w("read_state_block")
 
     a.label("t9_skip_state_read")
 
@@ -2834,37 +2871,15 @@ def _emit_t9(a: Asm) -> None:
 
     a.label("t9_after_papp_check")
 
-    # ---- write only T9's bytes (state[9..12] = 4 B) if any edge fired ----
-    # No O_TRUNC and lseek to offset 9 so we leave T5's bytes 0..8
-    # (track_id + transId) intact. Eliminates the read-modify-write race
-    # that the previous full-16-B write had with concurrent T5 firings.
+    # ---- write T9's bytes (state[9..12] = 4 B) into .bss if any edge fired ----
+    # Narrow write keeps T5-owned bytes 0..7 (track_id) untouched.
     a.cmp_imm8(5, 0)
     a.beq("t9_after_state_write")
 
-    a.adr_w(0, "path_state")
-    a.movw(1, O_WRONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("t9_after_state_write")             # open failed → skip write, still proceed
-    a.mov_lo_lo(5, 0)                         # r5 = fd
-
-    # lseek(fd, 9, SEEK_SET) — position at start of T9's owned region.
-    a.mov_lo_lo(0, 5)
-    a.movs_imm8(1, 9)
-    a.movs_imm8(2, SEEK_SET)
-    a.movs_imm8(7, NR_lseek)
-    a.svc(0)
-
-    # write(fd, &state[9], 4) — 4 bytes: last_play / last_battery /
-    # last_repeat / last_shuffle.
-    a.mov_lo_lo(0, 5)
-    a.addw(1, 13, T9_STATE_LAST_PS_OFF)       # r1 = sp + state[9] offset
-    a.movs_imm8(2, 4)
-    a.blx_imm(PLT_write)
-
-    a.mov_lo_lo(0, 5)
-    a.blx_imm(PLT_close)
+    a.addw(0, 13, T9_STATE_LAST_PS_OFF)       # r0 = src = sp + state[9] offset
+    a.movs_imm8(1, 4)
+    a.movs_imm8(2, 9)                         # state_offset = 9
+    a.bl_w("write_state_block")
 
     a.label("t9_after_state_write")
 
@@ -3019,15 +3034,25 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     # the chosen slot into the caller's existing file_buf stack region).
     _emit_get_or_init_mmap_subroutine(a)
     _emit_read_track_info_subroutine(a)
+    # .bss-backed trampoline state (replaces y1-trampoline-state disk file).
+    # Same-process, zero-init at libextavrcp_jni.so load; eliminates the
+    # open + read + close (and open + write + close) syscall chains on
+    # every T5 / T9 fire. Cross-mtkbt-restart persistence dropped (was
+    # never load-bearing — first emit after restart sees state[N]=0 vs
+    # current file value, emits one CHANGED per event, subscription gates
+    # filter out events with no current subscriber).
+    _emit_read_state_block_subroutine(a)
+    _emit_write_state_block_subroutine(a)
 
     # Path strings, 4-byte-aligned for clean ADR offsets.
     a.align(4)
     a.label("path_track_info")
     a.asciiz("/data/data/com.innioasis.y1/files/y1-track-info")
     a.align(4)
-    a.label("path_state")
-    a.asciiz("/data/data/com.innioasis.y1/files/y1-trampoline-state")
-    a.align(4)
+    # path_state string dropped post-Tier-1 — trampoline state now lives in
+    # .bss at G_Y1_TRAMPOLINE_STATE_VADDR. The on-disk y1-trampoline-state
+    # file is still pre-created by the music app's prepareFilesLocked but is
+    # never read or written by the trampolines anymore.
     a.label("path_papp_set")
     a.asciiz("/data/data/com.innioasis.y1/files/y1-papp-set")
     a.align(4)
