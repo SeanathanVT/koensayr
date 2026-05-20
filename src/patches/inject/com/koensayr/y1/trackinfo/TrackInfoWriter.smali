@@ -75,6 +75,20 @@
 # after, so they're not affected.
 .field private mLastFreshTrackChangeAt:J
 
+# Rate-limit gate state for wakePlayStateChanged. AVRCP 1.3 §5.4.2 Tbl 5.33
+# leaves PLAYBACK_POS_CHANGED cadence to the TG; nominal 1Hz is the floor
+# for any spec-conforming CT. Cascading callbacks during a single track-edge
+# (onPlayValue + onPrepared + onPlayerPreparedTail + PositionTicker) used
+# to fire 3+ wakes in <200ms, producing back-to-back position CHANGED
+# emits that saturate strict §6.7.1 CTs' AVCTP buffer (observed on Bolt
+# 2112 — 21 of 75 ev=05 RegNotifs arrived within <500ms of the previous
+# one). wakePlayStateChanged now coalesces same-play_status wakes within
+# 800ms of the previous broadcast — real play-state edges (mPlayStatus
+# changed) always bypass.
+.field private mLastWakePlayStateAt:J
+
+.field private mLastWakePlayStatus:B
+
 # MediaMetadataRetriever-derived duration cache. Y1 music app stores no
 # DB-cached duration; PlayerService.getDuration() delegates to
 # IjkMediaPlayer/MediaPlayer.getDuration() which throws before
@@ -1707,9 +1721,46 @@
 # Call sites: PlaybackStateBridge.onPlayValue (state-edge wake), and
 # PlaybackStateBridge.onPrepared (new-track wake — position resets to 0).
 .method public wakePlayStateChanged()V
-    .locals 5
+    .locals 7
 
     :try_start_0
+    # Rate-limit gate. Suppress broadcast when mPlayStatus is unchanged AND
+    # the previous broadcast fired <800ms ago. AVRCP 1.3 §5.4.2 Tbl 5.33
+    # nominal 1Hz position cadence is the floor; real play-state edges
+    # (mPlayStatus differs from mLastWakePlayStatus) always bypass the
+    # gate. File state (y1-track-info) was already flushed by the caller's
+    # setPlayStatus / flush / onTrackEdge / markCompletion path, so T6
+    # GetPlayStatus polling remains current even when the broadcast
+    # itself is suppressed.
+    invoke-static {}, Landroid/os/SystemClock;->elapsedRealtime()J
+
+    move-result-wide v5
+
+    iget-wide v2, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mLastWakePlayStateAt:J
+
+    sub-long v0, v5, v2
+
+    const-wide/16 v2, 0x320
+
+    cmp-long v4, v0, v2
+
+    if-gez v4, :rate_limit_proceed
+
+    iget-byte v0, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mPlayStatus:B
+
+    iget-byte v1, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mLastWakePlayStatus:B
+
+    if-ne v0, v1, :rate_limit_proceed
+
+    return-void
+
+    :rate_limit_proceed
+    iput-wide v5, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mLastWakePlayStateAt:J
+
+    iget-byte v0, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mPlayStatus:B
+
+    iput-byte v0, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mLastWakePlayStatus:B
+
     iget-object v0, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mContext:Landroid/content/Context;
 
     if-eqz v0, :cond_no_ctx
