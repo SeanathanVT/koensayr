@@ -245,7 +245,7 @@ The music app's `Y1Application.onCreate` registers four in-process components th
 
 | Component | Purpose |
 |---|---|
-| `com.koensayr.y1.trackinfo.TrackInfoWriter` | Singleton state holder + atomic file writer. Owns the 1104-byte `y1-track-info` schema and the 16-byte `y1-trampoline-state` initial create. `prepareFiles()` chmods both files world-rw / world-readable so the BT process (different uid) can `open()` them. |
+| `com.koensayr.y1.trackinfo.TrackInfoWriter` | Singleton state holder + double-buffer file writer. Owns the 2213-byte `y1-track-info` schema (1 B active_slot + 3 B RFA + 2 × 1104 B slots + 1 B RFA) and the 16-byte `y1-trampoline-state` initial create. `prepareFiles()` pre-sizes and chmods all files world-rw / world-readable so the BT process (different uid) can `mmap()` them. |
 | `com.koensayr.y1.playback.PlaybackStateBridge` | Stateless dispatcher hooked into `Static.setPlayValue` and the `PlayerService` listener lambdas (`onPrepared`, `onCompletion`, `onError`). Maps player state to AVRCP play-status enum and calls into TrackInfoWriter on every edge. |
 | `com.koensayr.y1.battery.BatteryReceiver` | `Intent.ACTION_BATTERY_CHANGED` receiver. Bucket-maps level + plugged-state to the AVRCP §5.4.2 Tbl 5.35 enum (NORMAL / WARNING / CRITICAL / EXTERNAL / FULL_CHARGE) and writes byte 794. Fires `com.android.music.playstatechanged` on bucket transition so T9 emits BATT_STATUS_CHANGED CHANGED. |
 | `com.koensayr.y1.papp.PappSetFileObserver` | `FileObserver(y1-papp-set, CLOSE_WRITE)`. Reads the 2-byte payload (attr_id, value), maps AVRCP enum → Y1 enum, calls `SharedPreferencesUtils.setMusicRepeatMode / setMusicIsShuffle`. Lets a CT's PApp Set round-trip into the music app's settings. |
@@ -258,7 +258,7 @@ In `smali_classes2` (secondary DEX):
 | `com.koensayr.y1.avrcp.AvrcpBridgeService` | Service shell. Not declared in the music app manifest, so unreferenced at runtime. |
 | `com.koensayr.y1.avrcp.AvrcpBinder` | `Binder` implementing the `IBTAvrcpMusic` + `IMediaPlaybackService` transact protocols in smali. Not instantiated. Would only become live if MtkBt's `bindService` ever resolved into the music-app process directly (requires either an MtkBt.odex component-bind patch or a forwarder APK — see [`INVESTIGATION.md`](INVESTIGATION.md)). |
 
-**State-write ordering is load-bearing**: PlaybackStateBridge calls `TrackInfoWriter.flush()` (which writes `y1-track-info` atomically via tmp+rename) BEFORE the music app's `metachanged` / `playstatechanged` broadcast fires. The broadcast wakes T5 / T9 via the cardinality-NOP-patched Java path; if the file write hasn't happened yet, T5 / T9 read stale data. Don't reorder.
+**State-write ordering is load-bearing**: PlaybackStateBridge calls `TrackInfoWriter.flush()` (which writes the inactive slot of `y1-track-info` via `RandomAccessFile.seek+write`, then atomically flips the single-byte active_slot at file[0]) BEFORE the music app's `metachanged` / `playstatechanged` broadcast fires. The broadcast wakes T5 / T9 via the cardinality-NOP-patched Java path; if the slot flip hasn't happened yet, T5 / T9 read the previous (stale) slot. Don't reorder.
 
 ### Y1Bridge (the slim Binder host)
 
@@ -267,7 +267,7 @@ Y1Bridge.apk stays installed for one reason: MtkBt's `bindService(Intent("com.an
 The bridge presents the Binder and serves synchronous state queries:
 
 - `MediaBridgeService.onCreate` is empty.
-- `MediaBridgeService.onBind` returns an `AvrcpBinder` whose `onTransact` implements the `IBTAvrcpMusic` codes `BTAvrcpMusicAdapter` calls. Synchronous state queries (`getPlayStatus` / `position` / `duration` / `getAudioId` / `getTrackName` / `getAlbumName` / `getArtistName` / `getRepeatMode` / `getShuffleMode`) are answered live by reading `/data/data/com.innioasis.y1/files/y1-track-info` (the same 1104-byte file `TrackInfoWriter` maintains; world-readable so the bridge's `uid` can `open()` it). Registration / setter / passthrough codes ack with the success replies that keep `BTAvrcpMusicAdapter.mRegBit` armed and the Java mirror in sync with on-disk state.
+- `MediaBridgeService.onBind` returns an `AvrcpBinder` whose `onTransact` implements the `IBTAvrcpMusic` codes `BTAvrcpMusicAdapter` calls. Synchronous state queries (`getPlayStatus` / `position` / `duration` / `getAudioId` / `getTrackName` / `getAlbumName` / `getArtistName` / `getRepeatMode` / `getShuffleMode`) are answered live by reading `/data/data/com.innioasis.y1/files/y1-track-info` (the same 2213-byte double-buffer file `TrackInfoWriter` maintains; world-readable so the bridge's `uid` can `open()` it). Registration / setter / passthrough codes ack with the success replies that keep `BTAvrcpMusicAdapter.mRegBit` armed and the Java mirror in sync with on-disk state.
 - `BootReceiver` only handles `BOOT_COMPLETED` → `startService(MediaBridgeService)` so the Service is alive when MtkBt first binds.
 
 All AVRCP observation, file writes, broadcast emission, and proactive-notification wake live in the music app — the bridge has no `LogcatMonitor`, no `BatteryReceiver`, no `RemoteControlClient` setup, no file writer, no callback dispatcher. Source: ~300 lines across three files in `src/Y1Bridge/`.
@@ -766,7 +766,7 @@ See [`INVESTIGATION.md`](INVESTIGATION.md) "Hardware test history per CT" for th
 
 Three files, all in `/data/data/com.innioasis.y1/files/`:
 
-- **y1-track-info** (1104 B, mode 0644 so the BT process can open it). Written by `TrackInfoWriter` on every state change atomically via tmp+rename. Full byte-level layout in [`BT-COMPLIANCE.md`](BT-COMPLIANCE.md) §4.
+- **y1-track-info** (2213 B, mode 0644 so the BT process can open + mmap it). Written by `TrackInfoWriter` on every state change in place via `RandomAccessFile.seek+write` into the inactive slot, then atomic single-byte flip of the active_slot indicator at file[0]. Reader (`libextavrcp_jni.so` trampolines) lazy-mmaps the file once per process and dispatches by reading file[0] on each access — no syscall per emit, no `tmpfile + rename` race window. Schema: `[0]=active_slot, [1..3]=RFA, [4..1107]=slot[0], [1108..2211]=slot[1], [2212]=RFA`. Per-field byte offsets within each slot match the legacy `[0..1103]` layout in [`BT-COMPLIANCE.md`](BT-COMPLIANCE.md) §4.
 - **y1-trampoline-state** (24 B in-memory; on-disk may be smaller from historical short writes — short reads zero-fill. Mode 0666, world-rw, pre-created by `TrackInfoWriter.prepareFiles` at music-app startup, updated by the trampolines):
   - 0..7  = last track_id we told the CT about (updated by T4 after emitting CHANGED, and by extended_T2 / T5 after emitting CHANGED)
   - 8     = last RegisterNotification transId (T5 mirror, legacy — no longer read; per-event TIDs now live in `g_avrcp_req_event_database`)

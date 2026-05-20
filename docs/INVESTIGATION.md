@@ -6795,3 +6795,37 @@ Reverting **does not** fix Bolt 1242 (E1's behavior was never triggered there �
 ### Open decision: capture Bolt with pre-pair-initiated `dual-capture.sh`
 
 To narrow whether Bolt 1242's no-subscribe behavior is repeatable or session-state-dependent, capture the next Bolt session with `dual-capture.sh` started BEFORE pairing (or at least before AVRCP channel open). The pre-pair window will contain `connect_ind`/`CONNECT_CNF` and any GetCapabilities + RegNotifs in the clear, letting us see whether Bolt is doing the handshake at all.
+
+---
+
+## Trace #81 — 2026-05-20 mmap-backed y1-track-info shipped (Trace #77 implementation)
+
+User direction (post-Trace #80 audit): "Can we implement [mmap] anyway, and then revisit this problem? The on-disk approach always seemed a bit janky to me."
+
+### Shipped
+
+**Music app side** (`TrackInfoWriter.smali`):
+- Schema bumped 1104 B → 2213 B: `file[0]=active_slot, file[1..3]=RFA, file[4..1107]=slot[0], file[1108..2211]=slot[1], file[2212]=RFA`.
+- `prepareFilesLocked()` calls `ensureFile("y1-track-info", 2213)` so the file exists at full size before any trampoline tries to mmap it.
+- `flushLocked()` rewritten: open as `RandomAccessFile("rw")`, `setLength(2213)` defensively, read active_slot byte, compute `inactive = 1 - (active & 1)`, seek to `4 + inactive*1104`, write the 1104-byte image, atomic single-byte `write(int)` at file[0] to flip the active flag. Reader (mtkbt-side mmap) sees a consistent slot at all times because the slot the reader's `active_slot` byte points at is never the one in flight.
+- The tmp + rename atomic-write path is gone. The race window Trace #77 motivation flagged (tmp + rename creates a fresh inode, orphaning a mapped reader's page) is structurally eliminated.
+
+**Trampoline side** (`_trampolines.py`):
+- New `.bss` cache slot `g_y1_track_info_mmap_base` at vaddr `0xd2cc` (4 bytes, between `g_y1_avrcp_track_identifier` and stock `g_avrcp_auto_browse_connect`).
+- New `get_or_init_mmap` subroutine: lazy-init on first call, opens `y1-track-info`, `mmap2(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0)`, closes fd, caches ptr. No sticky failure flag — every miss retries (handles the case where the music app hasn't created the file yet at first trampoline call).
+- New `read_track_info(r0=dst, r1=nbytes)` subroutine: bl get_or_init_mmap → if non-NULL, dispatch active_slot and byte-copy `nbytes` from `mmap_base + 4 + active*1104` into dst. On NULL, returns 0 and leaves dst untouched (caller's preceding `memset` already zeroed it).
+- T4 / T5 / T6 / T8 / T9 / extended_T2's 8-byte track_id read all converted from inline `open + read + close` to a single `bl read_track_info`. The old per-trampoline `t*_skip_track_read` labels remain (no-op fall-through) for downstream compatibility.
+
+**Patcher MD5s** (`patch_libextavrcp_jni.py`):
+- `OUTPUT_MD5` and `OUTPUT_DEBUG_MD5` set to `None` for this commit. Patcher prints the computed MD5 on first flash without erroring. Update them once a clean flash + capture cycle confirms the new bytes are correct.
+
+**Trampoline blob size**: 3540 B with new subroutines, before per-site conversion. After all 6 conversions: 3388 B (-8 B vs pre-mmap baseline; net win because the shared subroutine pays for itself across the call sites). Budget 4020 B, free 632 B.
+
+### Known limitations (not blockers; tracked for follow-up)
+
+- **T_papp gc paths (PDU 0x13 GetCurrentPlayerApplicationSettingValue)** still use the legacy `open + lseek(795) + read` pattern. Under the new schema, file offset 795 lands inside slot[0]'s Artist field, not the repeat/shuffle bytes. T_papp's static fallback handles invalid AVRCP enum values gracefully; T9's PApp CHANGED emit reads the file via the new `read_track_info` subroutine, so on-edge updates are still correct. Fix needs a `slot_offset` parameter on `read_track_info`. Deferred.
+- **Upgrade from an older firmware** that wrote a 1104-byte file: `setLength(2213)` extends the file on the first new-schema flush, but `file[0]` momentarily holds whatever the OLD schema's audio_id LSB was — could be any byte. Trampolines reading during that one-flush window dispatch to whichever slot the byte's low bit points at, then read mostly-zero (new tail) or partial-old data. Stabilises after the first flush. Single-flush transient; acceptable.
+
+### Open question (preserved from Trace #80)
+
+The Bolt 1336 "metadata froze after 2-3 s of playback" symptom remains unexplained. Wire data verified Pixel-equivalent; mmap doesn't change a byte going out on the wire, only the latency profile. Hypothesis pending wire-byte capture: Y1's 644-byte GetEA RSP frame structure may differ subtly from Pixel's 70-byte response in a way Bolt's parser dislikes. Next investigation step: add a trampoline-side `_emit_native_log_u32` byte-dump of the outbound GetEA RSP, compare against Pixel's btsnoop frame-for-frame.

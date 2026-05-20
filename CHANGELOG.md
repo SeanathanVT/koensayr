@@ -10,6 +10,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 - Discrete PAUSE on head units with separate Play and Pause buttons now pauses idempotently instead of toggling.
 - Spurious paused-state blips no longer interrupt head-unit playback indicators during track changes.
 
+### Changed
+- Track-info exchange between the music app and the Bluetooth stack now uses shared memory instead of an atomic write + rename to disk on every state change. The data file (`/data/data/com.innioasis.y1/files/y1-track-info`) ships a double-buffered schema and the Bluetooth-side reader memory-maps it once. End-user impact: lower-latency metadata responses (single-digit ms vs ~25 ms) under sustained head-unit polling, no torn reads while a track edge is mid-flush.
+
 ### Added
 - `apply.bash --debug` captures per-emit wire shape for diagnosing head-unit-specific AVRCP issues. New `tools/avrcp-wire-trace.py` parses the logs for offline analysis; `tools/btlog-parse.py --avrcp` covers the matching `mtkbt` view.
 
