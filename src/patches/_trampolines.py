@@ -2182,6 +2182,13 @@ def _emit_read_track_info_subroutine(a: Asm) -> None:
     # Byte-copy loop: r3=i, r5=count, r1=src, r4=dst. Unrolled would be
     # faster but byte loop fits naturally and the bytes-per-call is small
     # enough that the win isn't load-bearing.
+    #
+    # Defensive: if nbytes==0, skip the loop. The cmp/bne tail-check would
+    # otherwise spin forever (r3 increments past r5 since r3 starts == r5
+    # and adds first). Cheap (+4 B) and future-proofs against a caller
+    # ever passing 0.
+    a.cmp_imm8(5, 0)
+    a.beq("read_track_info_done")
     a.movs_imm8(3, 0)
     a.label("read_track_info_loop")
     a.ldrb_reg(0, 1, 3)                         # r0 = src[i]
@@ -2193,7 +2200,8 @@ def _emit_read_track_info_subroutine(a: Asm) -> None:
     a.cmp_w(3, 5)
     a.bne("read_track_info_loop")
 
-    a.mov_lo_lo(0, 5)                           # return nbytes
+    a.label("read_track_info_done")
+    a.mov_lo_lo(0, 5)                           # return nbytes (0 if guard taken)
     a.raw(bytes([0xf8, 0xbd]))                  # pop {r3, r4-r7, pc}
 
     a.label("read_track_info_fail")
