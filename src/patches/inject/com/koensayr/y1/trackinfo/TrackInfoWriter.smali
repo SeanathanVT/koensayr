@@ -1837,7 +1837,11 @@
 
 # Force-emit a PlaybackStatusChanged edge pair (PAUSED → PLAYING) on the
 # AVRCP wire. Called at track-edge settle from PlaybackStateBridge.
-# onPlayerPreparedTail.
+# onPlayerPreparedTail. The actual two-phase work is delegated to
+# PscPulse.fire() which handles the 50 ms inter-phase delay needed for
+# mtkbt's broadcast dispatch + JNI invocation to durably consume phase
+# 1's file write before phase 2 overwrites it. This method just owns the
+# "only pulse while PLAYING" gate.
 #
 # Empirically (Bolt 2221 capture, 2026-05-19), at least one head-unit CT
 # gates its metadata-pane refresh on PlaybackStatus CHANGED edges, NOT on
@@ -1848,21 +1852,14 @@
 # music app's setPlayValue cascade). Pixel-as-TG (observed in
 # btsnoop_hci 2026-05-18) emits PSC=Paused CHANGED mid-transition then
 # PSC=Playing INTERIM via the CT's re-register burst, giving the same
-# CT two PSC edges per track edge.
-#
-# This method synthesises the same wire shape:
-#   write file[792] = PAUSED (2) + wake → T9 emits PSC=PAUSED CHANGED
-#   write file[792] = PLAYING (1) + wake → T9 emits PSC=PLAYING CHANGED
-#                                          + the now-fresh POSITION CHANGED
-# The rate-limit gate inside wakePlayStateChanged bypasses on every real
-# play-status flip (mPlayStatus differs from mLastWakePlayStatus), so
-# both broadcasts fire.
+# CT two PSC edges per track edge. See PscPulse.fire() docstring + Trace
+# #75 / #76 in docs/INVESTIGATION.md.
 #
 # Only fires when currently PLAYING — track edges that land while paused
 # or stopped get their PSC refresh from the actual play-state edge that
 # follows.
 .method public declared-synchronized pulsePlayStatusForCT()V
-    .locals 3
+    .locals 2
 
     monitor-enter p0
 
@@ -1873,15 +1870,7 @@
 
     if-ne v0, v1, :pulse_skip
 
-    const/4 v2, 0x2
-
-    invoke-virtual {p0, v2}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->setPlayStatus(B)V
-
-    invoke-virtual {p0}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->wakePlayStateChanged()V
-
-    invoke-virtual {p0, v1}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->setPlayStatus(B)V
-
-    invoke-virtual {p0}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->wakePlayStateChanged()V
+    invoke-static {}, Lcom/koensayr/y1/playback/PscPulse;->fire()V
 
     :pulse_skip
     monitor-exit p0

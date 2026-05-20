@@ -1713,6 +1713,8 @@ PATCH_B5_INJECT_FILES = [
         "smali/com/koensayr/y1/playback/PlaybackStateBridge.smali"),
     ("com/koensayr/y1/playback/PositionTicker.smali",
         "smali/com/koensayr/y1/playback/PositionTicker.smali"),
+    ("com/koensayr/y1/playback/PscPulse.smali",
+        "smali/com/koensayr/y1/playback/PscPulse.smali"),
     ("com/koensayr/y1/battery/BatteryReceiver.smali",
         "smali/com/koensayr/y1/battery/BatteryReceiver.smali"),
     ("com/koensayr/y1/papp/PappSetFileObserver.smali",
@@ -1965,6 +1967,10 @@ PATCH_B5_DEBUG_ENTRY_TRACES = {
         (r'start\(\)V',                         "PositionTicker.start"),
         (r'stop\(\)V',                          "PositionTicker.stop"),
         (r'run\(\)V',                           "PositionTicker.run (1s tick)"),
+    ],
+    "com/koensayr/y1/playback/PscPulse.smali": [
+        (r'fire\(\)V',                          "PscPulse.fire (phase 1)"),
+        (r'run\(\)V',                           "PscPulse.run (phase 2 +50ms)"),
     ],
     "com/koensayr/y1/battery/BatteryReceiver.smali": [
         (r'register\(Landroid/content/Context;\)V',
@@ -2938,6 +2944,7 @@ PATCHED_SMALI_FILES = [
     "smali/com/koensayr/y1/trackinfo/TrackInfoWriter.smali",
     "smali/com/koensayr/y1/playback/PlaybackStateBridge.smali",
     "smali/com/koensayr/y1/playback/PositionTicker.smali",
+    "smali/com/koensayr/y1/playback/PscPulse.smali",
     "smali/com/koensayr/y1/battery/BatteryReceiver.smali",
     "smali/com/koensayr/y1/papp/PappSetFileObserver.smali",
     "smali/com/koensayr/y1/ui/NowPlayingRefresher.smali",

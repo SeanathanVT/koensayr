@@ -6102,3 +6102,88 @@ Bolt sees two PSC edges per track edge → refreshes metadata pane immediately, 
 
 - The simpler fix candidate ("remove `markTrackChange` suppression entirely") was considered and rejected. `markTrackChange` only affects `restartPlay()`'s internal pause→play handshake — natural track ends (the more common case) never go through that path. So removing `markTrackChange` would only help the manual-NEXT case, not the more important auto-advance case. The explicit pulse handles both.
 - Could also have implemented as a trampoline-side change in T5 (emit PSC CHANGED unconditionally after TC), but T5's edge detection is intrinsic to its design — bypassing it cleanly requires bypassing the file→state comparison entirely, which is more invasive than the music-app-side pulse.
+
+## Trace #76 (2026-05-20) — Bolt 0625: PSC pulse race condition; 50 ms Handler.postDelayed inserted between phases
+
+### What Bolt 0625 captured
+
+First flash with the in-Java PSC pulse from Trace #75 (TrackInfoWriter.pulsePlayStatusForCT calls setPlayStatus(2) + wakePlayStateChanged + setPlayStatus(1) + wakePlayStateChanged inline). Tag distribution:
+
+| metric | Bolt 2221 (pre-pulse) | Bolt 0625 (with inline pulse) |
+|---|---|---|
+| M5dbg / M5wire | 1176 / 588 | 1068 / 534 |
+| T5tc | 10 | 21 |
+| T9ps | 63 | 69 |
+| T2reg ev=01 | 42 | 10 |
+| Track edges | ~10 | 21 |
+
+T5tc went up 2× because user did a session of 21 rapid track skips (06:23:00 - 06:24:34). T9ps only went up modestly (69 vs 63) — meaning the pulse fired its two PSC CHANGEDs successfully on SOME track edges but not all.
+
+### Working pulse (06:23:50 edge)
+
+```
+06:23:50.378  setPlayStatus from=1 to=2        ← pulse phase 1 SET
+06:23:50.379  flushLocked ps=2                  ← file[792]=2 durable
+06:23:50.380  wakePlayStateChanged              ← phase 1 wake
+06:23:50.384  setPlayStatus from=2 to=1        ← pulse phase 2 SET
+06:23:50.385  flushLocked entry (ps=1 in progress)
+06:23:50.385  T9ps (PSC=PAUSED CHANGED)         ← T9 fired for phase 1 broadcast, read file[792]=2 (still!)
+06:23:50.387  ps=1 written                     ← file[792]=1 now durable
+06:23:50.389  wakePlayStateChanged              ← phase 2 wake
+06:23:50.400  T9ps (PSC=PLAYING CHANGED)        ← T9 fired for phase 2, read file[792]=1, state[9]=2 → edge
+```
+
+T9 fired during the tiny window after `setPlayStatus(1)` entry but BEFORE `flushLocked` wrote `ps=1`. The race resolved in our favor by luck — mtkbt happened to schedule T9 ~5 ms after phase 1's broadcast, before phase 2's file write.
+
+### Failing pulse (06:23:54 edge)
+
+```
+06:23:54.908  setPlayStatus from=1 to=2        ← pulse phase 1 SET
+06:23:54.910  flushLocked ps=2                  ← file[792]=2 durable
+06:23:54.911  wakePlayStateChanged              ← phase 1 wake
+06:23:54.916  setPlayStatus from=2 to=1        ← pulse phase 2 SET
+06:23:54.917  flushLocked ps=1 written         ← file[792]=1 durable (only 7 ms after phase 1's write)
+06:23:54.917  mtkbt onReceive playstatechanged ← processes phase 1's broadcast
+06:23:54.918  wakePlayStateChanged              ← phase 2 wake
+                                                 (T9 fires for phase 1's broadcast NOW — but
+                                                  file[792]=1 already, state[9]=1, no edge,
+                                                  no emit)
+06:23:54.930  mtkbt onReceive playstatechanged ← processes phase 2's broadcast
+                                                 (T9 fires — file[792]=1, state[9]=1, no edge,
+                                                  no emit)
+NO T9ps emitted on this edge.
+```
+
+mtkbt's broadcast-to-native scheduling jitter on rapid-skip cycles was enough to push T9's phase-1 invocation past phase 2's file write. Both T9 invocations read `file[792]=1` and saw no edge.
+
+### Root cause
+
+`T9` reads `y1-track-info` from disk at *run time*, not at *broadcast-queued time*. The musicapp-side pulse pattern (set + wake + set + wake) assumes T9 will fire for each broadcast in order, reading the file state at each broadcast's queued time. In reality T9's invocation latency varies with mtkbt load — on a busy main thread (rapid track skips), the gap between broadcast queueing and T9 dispatch can exceed the pulse's inter-phase write gap, causing T9 to read the same final file state for both broadcasts.
+
+This is a fundamental race in any "set file + wake" design where the consumer reads at run time. AOSP's MediaSession framework sidesteps it by passing the new state IN the broadcast extras — but our trampolines read the file directly, not Java extras.
+
+### Fix
+
+Add an explicit 50 ms gap between phases via `Handler.postDelayed` on the main Looper. New class `com.koensayr.y1.playback.PscPulse`:
+
+- `static fire()`: phase 1 — `setPlayStatus(PAUSED)` + `wakePlayStateChanged()`. Then `Handler.postDelayed(this, 50)`.
+- `Runnable.run()`: phase 2 — `setPlayStatus(PLAYING)` + `wakePlayStateChanged()`.
+
+`TrackInfoWriter.pulsePlayStatusForCT` now just owns the "only pulse while PLAYING" gate and delegates to `PscPulse.fire()`. The 50 ms gap is enough headroom for mtkbt's broadcast dispatch + JNI invocation + T9 syscall chain to complete phase 1 durably before phase 2's file write.
+
+50 ms was chosen because:
+- The working 06:23:50 case had T9 fire ~5 ms after phase 1's wake — i.e., mtkbt scheduling latency was 5 ms there. 50 ms = 10× headroom.
+- Pixel-as-TG emits its PSC=Paused → PSC=Playing transition over ~70-100 ms (from btsnoop_hci 2026-05-18). 50 ms is within that range.
+- Bolt is unlikely to react to the brief PAUSED state (the gap is shorter than any reasonable CT UI debounce).
+
+### Why not use broadcast extras
+
+`com.android.music.playstatechanged` Intent extras carry `playing:Z` but that's a boolean — doesn't encode the 3-state AVRCP play_status (STOPPED/PLAYING/PAUSED). The trampolines could be modified to look at the broadcast extras instead of the file, but that's invasive: T9 lives in mtkbt's address space, the broadcast extras are in Java-side `Intent`, and there's no clean way to plumb them through Android's broadcast→native callback path. Adding a side-channel file `/data/data/com.innioasis.y1/files/y1-pulse-state` that T9 reads via a separate fd would work but adds a third file and an extra read per emit — not worth it for one fix.
+
+The 50 ms Handler delay is the simplest correct solution.
+
+### Implementation
+
+- New file: `src/patches/inject/com/koensayr/y1/playback/PscPulse.smali`
+- `TrackInfoWriter.pulsePlayStatusForCT` reduced to: check `mPlayStatus == PLAYING`, call `PscPulse.fire()`.
+- `patch_y1_apk.py`: PscPulse registered in `PATCH_B5_INJECT_FILES` and the rebuilt-DEX manifest. Debug-mode marker logs for `PscPulse.fire (phase 1)` and `PscPulse.run (phase 2 +50ms)`.
