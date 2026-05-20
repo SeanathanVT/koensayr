@@ -5723,3 +5723,280 @@ The trampoline now emits, at every rsp call site:
 For Bolt 1222's failing case: ev=09 RegNotif arrives with TID=N → `saveRegEventSeqId(9, N)` → `database[9] = N`. T8 INTERIM ack runs → `restore_conn_tid(conn, 9)` writes `conn[+0x11] = N`. Outbound INTERIM ships with TID=N. CT acknowledges. Track edge fires `T5ncc` (gated on state[20]) → `restore_conn_tid(conn, 9)` reads `database[9] = N` again, writes `conn[+0x11] = N`. Outbound CHANGED ships with TID=N. Bolt accepts. Pane updates without lag.
 
 If Bolt logs still show `c39=0` for `T5ncc`-adjacent frames after this fix, either (a) `database[9]` is not being populated (unlikely — stock JNI is invariably calling `saveRegEventSeqId` from the dispatcher), or (b) Bolt is not actually re-subscribing to ev=09 in this session (would show as no `T8reg ev=09` — but T8reg log was dropped, so verify via M5wire frame counts before/after track edge), or (c) the cave isn't preserving the c39 write (D2 `M5dbg p8/pd/ba9=` logs would surface it).
+
+## Trace #72 (2026-05-19) — Bolt 1951: zero subscribes; T2reg debug marker added
+
+### What happened
+
+Bolt 1951 capture showed `0 T5tc / 0 T9ps / 0 T9papp` despite `537 Y1T tags` total (all M5dbg / M5wire — mtkbt-side wire-frame logs). 18 inbound frames over the entire session (p8=ea); only 4 of them were AV/C CMDs — two PASSTHROUGH `0x4B NEXT` PRESS+RELEASE pairs and two `0x46 PAUSE` PRESS+RELEASE pairs. **Bolt sent zero `RegisterNotification` PDUs in this session.** All 5 prior Bolt captures (1448, 1540, 1647, 1830, 1904) had between 11 and 339 outbound wire frames; this one had 6.
+
+User context: Bolt had bluetooth-crashed on Y1 in the prior session (1904, triggered by the r2-clobber bug in `incr_and_get_track_identifier` — fixed in commit df1894a). The 1951 session was post-fix. Possibility: Bolt's CT-side AVRCP impl cached "Y1's AVRCP is broken, don't subscribe" after the crash. User did forget+repair Bolt before subsequent sessions.
+
+### Visibility gap exposed
+
+The Y1T tag set in `patch_libextavrcp_jni.py` covered only outbound CHANGED-emit confirmation (`T5tc`/`T9ps`/`T9papp`). Absence of `T5tc` could mean any of:
+1. CT didn't send `RegisterNotification(ev=02)` this session
+2. CT sent it but extended_T2 didn't get entered (R1 redirect or PDU dispatch broken)
+3. extended_T2 entered but `save_event_seq_id` didn't write the database
+4. Database was re-cleared mid-session by a subsequent `GetCapabilities`
+
+No way to distinguish these from log content alone.
+
+### Fix (commit 52a8a80, 2026-05-19)
+
+Added `T2reg ev=%02x` native log at `_emit_extended_t2`'s PDU=0x31 arm (right after the PDU check, before `save_event_seq_id`). Drops the `M5dbg ba9` log from `patch_mtkbt.py`'s D2 cave to stay within the 4020-byte LOAD #1 budget (ba9 was a historical reference for the M7-era TID-sync hypothesis; not load-bearing post-M7-removal — the M5 discriminator already uses `packet[+0xd]`).
+
+Diagnosis matrix going forward:
+
+| `T2reg ev=N` present | Outbound marker present | Diagnosis |
+|---|---|---|
+| no  | no  | CT didn't subscribe to ev=N this session |
+| yes | no  | CT subscribed; our CHANGED gate or emit path broke |
+| no  | yes | shouldn't happen — investigate ghost-arm |
+| yes | yes | healthy path |
+
+Release MD5 unchanged (no code path differences). Debug MD5: `9c559e7039... → a7fe9353b9...` (jni) / `0246e82640... → ab5cf72d48...` (mtkbt).
+
+### Cross-CT comparison
+
+| CT | M5dbg frames | Inbound CMDs (p8=ea) | T5tc | T9ps | T9papp |
+|---|---|---|---|---|---|
+| Bolt 1951 | 18 | 4 | **0** | **0** | **0** |
+| TV 1956 | 741 | 16 | 3 | 6 | 0 |
+| Sonos 1954 | 177 | 16 | 6 | 2 | 0 |
+
+TV + Sonos both subscribed and got CHANGEDs cleanly with the same patcher build. The Y1 pipeline itself is healthy; the Bolt 1951 case is Bolt-side state.
+
+---
+
+## Trace #73 (2026-05-19) — Bolt 2112: subscribes aggressively (post-repair); "hit or miss" diagnosed as multi-wake burst saturation + GEA refetch gaps
+
+### Session shape
+
+Bolt 2112 capture (after user forgot+repaired Bolt): completely different profile.
+
+| Metric | Bolt 1951 | Bolt 2112 |
+|---|---|---|
+| Outbound wire frames (M5wire) | 6 | 397 |
+| Inbound CMDs (p8=ea) | 4 | 19 |
+| T2reg total | 0 | **93** |
+| T5tc | 0 | 5 |
+| T9ps | 0 | 22 |
+| T9papp | 0 | 0 |
+
+Bolt subscribed to **all 8 advertised events**: ev=01 (×12 RegNotifs over session), ev=02 (×1, session-long subscription — no re-register), ev=05 (×75, strict §6.7.1 re-register after every CHANGED), ev=08 (×1), ev=09/0a/0b/0c (×1 each in initial burst).
+
+User report: "Bolt was hit or miss. Still weirdness."
+
+### Wire-level evidence of the "miss"
+
+GetElementAttributes refetch pattern overlaid with T5tc emits:
+
+| Track edge | T5tc emit | Bolt's GEA refetch | Delay |
+|---|---|---|---|
+| Track 1 | 21:09:25.691 | 21:09:29.826 (strlen=11) | 4.1 s |
+| Track 2 | 21:09:38.049 | 21:09:45.763 (strlen=9) | 7.7 s |
+| Track 3 | 21:09:52.849 | **none** | — |
+| Track 4 | 21:10:06.996 | **none** | — |
+| Track 5 | 21:11:00.821 | 21:11:00.179 (strlen=14) | ~0 |
+
+Tracks 3 and 4 got `TRACK_CHANGED CHANGED` on the wire (T5tc fired) but **Bolt never refetched metadata for them**. The metadata pane stays on Track 2's data through Tracks 3 and 4. That's the "freeze."
+
+### Smoking gun #1: multi-wake bursts on track edges
+
+Around each track edge, the music app's `PlaybackStateBridge` cascade fires `wakePlayStateChanged` 3+ times in <200 ms:
+
+```
+21:09:38.049  T5tc       (TRACK_CHANGED CHANGED — track edge)
+21:09:38.060  T2reg ev=05   (Bolt re-subscribes to POSITION)
+21:09:38.064  wakePlayStateChanged   (Java-side wake #1)
+21:09:38.087  T2reg ev=05   (Bolt re-subscribes AGAIN)
+21:09:38.149  wakePlayStateChanged   (wake #2)
+21:09:38.168  T2reg ev=05
+21:09:38.243  wakePlayStateChanged   (wake #3)
+21:09:38.260  T2reg ev=05
+```
+
+Three `wakePlayStateChanged` calls in 200 ms → T9 fires 3 PLAYBACK_POS_CHANGED back-to-back. Bolt processes each, re-subscribes, gets the next CHANGED, and so on — but the rapid cluster saturates its AVCTP buffer. **Inter-arrival distribution of Bolt's 75 ev=05 RegNotifs: 21 of 75 (28%) arrived within <500 ms of the previous one.** Clean 1 Hz cadence on the remaining ~32 RegNotifs.
+
+The cascade source: `onCompletion → onPrepared → onPlayerPreparedTail → setPlayValue` each fires its own `wakePlayStateChanged` independently. Stock AOSP `MediaSession` coalesces internally; our injected `PlaybackStateBridge` doesn't.
+
+184 `playstatechanged` broadcasts over a 64 s session ≈ **2.9 Hz** vs. AVRCP 1.3 §5.4.2 Tbl 5.33 nominal 1 Hz.
+
+### Smoking gun #2: empty initial GetElementAttributes
+
+The very first GEA (21:09:24.369) returned **all 7 attributes with `strlen:0`** — empty Title/Artist/Album/Genre/TrackNumber/TotalTracks/PlayingTime. Bolt connected and probed before the music app's `TrackInfoWriter` had populated `y1-track-info` (no track loaded yet — user hadn't pressed PLAY). Bolt retried 30 ms later (21:09:24.399, still empty) then gave up for ~5 s. Eventually the real metadata landed at 21:09:25.849 and Bolt's next GEA at 21:09:29.826 carried real data.
+
+Not user-visible in this capture (Bolt did eventually refetch), but it's a startup race worth tracking — a CT that keys metadata-pane render on the *first* GEA only would render empty until next track-change.
+
+### Fix #1 — wakePlayStateChanged rate-limit (commit 105eef5, 2026-05-19)
+
+Added an 800 ms gate inside `TrackInfoWriter.wakePlayStateChanged` (`src/patches/inject/com/koensayr/y1/trackinfo/TrackInfoWriter.smali`):
+
+```
+:try_start_0
+# Suppress broadcast when mPlayStatus unchanged AND <800ms since last call.
+# Real play-state edges (mPlayStatus differs from mLastWakePlayStatus)
+# bypass unconditionally.
+invoke-static {}, Landroid/os/SystemClock;->elapsedRealtime()J
+move-result-wide v5
+iget-wide v2, p0, mLastWakePlayStateAt:J
+sub-long v0, v5, v2
+const-wide/16 v2, 0x320  # 800 ms
+cmp-long v4, v0, v2
+if-gez v4, :rate_limit_proceed
+iget-byte v0, p0, mPlayStatus:B
+iget-byte v1, p0, mLastWakePlayStatus:B
+if-ne v0, v1, :rate_limit_proceed
+return-void
+
+:rate_limit_proceed
+iput-wide v5, p0, mLastWakePlayStateAt:J
+iget-byte v0, p0, mPlayStatus:B
+iput-byte v0, p0, mLastWakePlayStatus:B
+# ... existing broadcast code
+```
+
+Two new fields: `mLastWakePlayStateAt:J`, `mLastWakePlayStatus:B`. Gate applies ONLY when `mPlayStatus` is unchanged — real play-state edges (PAUSE → PLAY, PLAY → PAUSE) always bypass, so user-driven hammering at 21:10:31-42 (5 toggles in 12 s, all >1 s gaps) is unaffected.
+
+`y1-track-info` file gets flushed at the call site BEFORE `wakePlayStateChanged` runs (`setPlayStatus / flush / onTrackEdge / markCompletion` paths). T6 GetPlayStatus polling stays current regardless of broadcast suppression. Position CHANGED cadence drops from ~2.9 Hz to nominal 1 Hz.
+
+Interaction with `markTrackChange(1s)` PAUSED-blip suppression in `PlaybackStateBridge.onPlayValue`: the two gates compose cleanly. `markTrackChange` skips both `setPlayStatus(2)` AND `wakePlayStateChanged()` for `newValue=3 (PAUSED)` inside its 1 s window. The new 800 ms cap is a layer below — both bias toward fewer spurious emits.
+
+Build error follow-up (commit 2484896): the `--debug` value-patch anchor for `wakePlayStateChanged` in `patch_y1_apk.py` was matching `.locals 5` + the original first statement. The rate-limit bumped `.locals` to 7 and pushed the gate ahead of the `mContext` load. Re-anchored on `.locals 7` + the rate-limit gate's opening comment line; debug log (`_dbgLogTrampolineState "wPSC.pre"`) now injects right after `:try_start_0` and BEFORE the gate, so the diagnostic fires on every call including the suppressed ones. Verified by building 3.0.2 and 3.0.7 APKs with `KOENSAYR_DEBUG=1`.
+
+---
+
+## Trace #74 (2026-05-20) — Pixel↔Bolt full btsnoop parse: behavior deltas + fix candidate ranking
+
+### Source
+
+`/work/logs/pixel4-bugreport-20260518-1959/FS/data/misc/bluetooth/logs/btsnoop_hci.log` — Pixel 4 bonded with `cc:88:26:6f:e0:af` ("myChevrolet" per Pixel's MR2ServiceImpl log). Live BT capture window covers an active Pixel↔Bolt AVRCP session over ACL handle `0x0003`. **375 AVRCP frames** + 107 plain L2CAP + 52 SDP + 50 RFCOMM/HFP + 28 AVDTP. The `.last` file (older rotation) doesn't contain Bolt — only Sonos — and was the wrong file in earlier analysis.
+
+### SDP record diff (Pixel TG vs Y1 TG post-V1..V8/S1)
+
+| Attribute | Pixel | Y1 (pre P_PN0/P_PN1) | Y1 (post) |
+|---|---|---|---|
+| 0x0001 ServiceClassIDList | UUID 0x110c | UUID 0x110c | UUID 0x110c |
+| 0x0004 ProtocolDescList | L2CAP(0x0017) + AVCTP(0x0102) | same | same |
+| 0x0005 BrowseGroupList | {PublicBrowseRoot 0x1002} | {PublicBrowseRoot 0x1002} | **ABSENT** (P_PN1 reuses slot) |
+| 0x0009 BluetoothProfileDescList | AVRCP(0x0103) | AVRCP(0x0103) | AVRCP(0x0103) |
+| 0x0100 ServiceName | "AV Remote Control Target " | "Advanced Audio" (V7) | "Advanced Audio" (V7) |
+| 0x0102 ProviderName | " " (single space) | **ABSENT** | **" "** (P_PN0+P_PN1, 2026-05-20) |
+| 0x0311 SupportedFeatures | 0x0001 | 0x0001 (V8) | 0x0001 (V8) |
+
+ServiceName text difference is cosmetic. Post P_PN0+P_PN1 (commit f19ad7c), the only remaining delta is `0x0005 BrowseGroupList` (we drop, Pixel keeps). Bolt discovers services via UUID search against `0x0001 ServiceClassIDList` which the TG record still ships — empirically Bolt connects fine without `0x0005`.
+
+### GetCapabilities (Events Supported)
+
+Both advertise the **identical 8-event set**: `{0x01, 0x02, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x0c}`. Verified via tshark PDML dump of Pixel's `Sent Stable - GetCapabilities` frame.
+
+### Bolt's RegisterNotification parameters
+
+`PlaybackPositionChanged (0x05)` RegNotif from Bolt carries `Interval: 1` (1 second). Per AVRCP 1.3 §5.4.2 Tbl 5.33, this is the playback_interval the CT requests CHANGED notifications at. Pixel honors it — emits CHANGED at clean 1 Hz. Y1's T9 ignores the inbound parameter and emits on every wake (now rate-limited to ≥800 ms).
+
+### Track-edge choreography — Pixel vs Y1
+
+Pixel's complete sequence on a single track change (e.g., the cycle at 78.013-78.749):
+
+```
+T+0      Sent CHANGED NowPlayingContentChanged
+T+0      Sent CHANGED TrackChanged - Identifier=0x00 (SELECTED)   ← PHASE 1
+T+40     Rcvd GetElementAttributes
+T+41     Sent GEA Stable Title="Not Provided"  (metadata not ready yet)
+T+65     Rcvd Notify NowPlayingContentChanged  (Bolt re-registers)
+T+67     Sent INTERIM NCC
+T+90     Rcvd GEA
+T+91     Sent GEA "Not Provided"
+T+118    Rcvd Notify TrackChanged
+T+120    Sent INTERIM TC Identifier=0x00
+T+478    Sent CHANGED NowPlayingContentChanged  (proactive — second NCC!)
+T+478    Sent CHANGED PlaybackStatusChanged - PlayStatus=Paused  (PAUSED blip!)
+T+484    Sent CHANGED TrackChanged - Identifier=0x01   ← PHASE 2 (bumped)
+T+506    Rcvd GEA
+T+508    Sent GEA "ANTHEM PART 3"  (real metadata)
+T+530    Rcvd Notify NCC
+T+535    Sent INTERIM NCC
+T+554    Rcvd Notify PSC
+T+556    Sent INTERIM PSC PlayStatus=Playing  (transitions back to Playing)
+T+570    Rcvd GEA
+T+572    Sent GEA "ANTHEM PART 3"
+T+619    Rcvd Notify TC
+T+623    Sent INTERIM TC Identifier=0x01
+T+665    Rcvd GEA
+T+667    Sent GEA "ANTHEM PART 3"
+T+736    Sent CHANGED PlaybackPositionChanged SongPosition=37ms
+T+753    Rcvd Notify PPC
+T+755    Sent INTERIM PPC SongPosition=56ms
+T+1757   Sent CHANGED PPC SongPosition=1025ms  (clean 1 Hz cadence)
+```
+
+Y1's current sequence on a track edge (T5 trampoline, single emission):
+
+```
+T+0      Sent CHANGED NowPlayingContentChanged
+T+0      Sent CHANGED PlaybackPositionChanged
+T+0      Sent CHANGED TrackChanged - Identifier=monotonic-counter (bumped once)
+T+0      Sent CHANGED [REACHED_END / REACHED_START — usually gated out]
+```
+
+### Behavioral deltas (Pixel does, Y1 doesn't)
+
+1. **TWO-PHASE TrackChanged**: Phase 1 with previous Identifier (or `0x00` SELECTED) at early track-switch trigger; Phase 2 with new Identifier after metadata flushes. **480 ms apart in Pixel.** Bolt likely uses Phase 2 as the refetch trigger.
+
+2. **NowPlayingContentChanged TWICE per track edge**: once on early switch, once after metadata settle. Y1 emits NCC once.
+
+3. **PAUSED CHANGED emitted during track change**: Pixel ships `PlaybackStatusChanged PlayStatus=Paused` mid-transition (T+478) without suppression. Y1 actively suppresses this via `PlaybackStateBridge.onPlayValue`'s `markTrackChange(1s)` deadline gate.
+
+4. **PlaybackPositionChanged emitted FIRST on track edge** (T+0 in the next cycle at 100.599, vs TC at 100.604 — PPC leads by ~5 ms). Y1 emits TC first then PPC.
+
+5. **GetElementAttributes response shape**: Pixel emits NumberOfAttributes equal to the number it *has data for* (e.g. 4 of 7 requested) with literal `"Not Provided"` for unknown Title, `"1"`/`"0"` ASCII for unknown numeric. Y1 always emits NumberOfAttributes = requested with `strlen=0` for unknown (per §5.3.4 strict reading).
+
+6. **GEA response latency**: Pixel 1-3 ms, Y1 ~21-30 ms. Y1's overhead comes from T4's `open()`+`read()` of `y1-track-info` from `/data` per GEA + 7 separate `send_get_element_attributes_rsp` builder calls. Bolt fires GEAs in tight bursts of 3 within ~80 ms — Y1 might not finish the first response before the third request lands.
+
+7. **TrackChanged INTERIM ships stale "previous" Identifier**: Pixel's INTERIM responses ship `0x...01` consistently even after CHANGED with `0x...02`. Pixel's INTERIM doesn't reflect current state — quirky but Bolt accepts.
+
+8. **Pixel REJECTS SetPlayerApplicationSettingValue with `Invalid Parameter`**: 5 inbound from Bolt got rejected by Pixel. Y1 ACCEPTS PApp Sets (T_papp 0x14 → PappSetFileObserver → SharedPreferencesUtils). Y1 *exceeds* Pixel here; not a bug.
+
+9. **Empty initial GEA is normal**: Pixel's first 5 GEAs to Bolt also returned "Not Provided" (no metadata yet). Bolt handles empty-start gracefully. Rules out the "empty first GEA causes freeze" hypothesis.
+
+10. **Pixel's Identifier semantic is the actual NowPlayingList row UID** (Pixel cycles 0x00 / 0x01 / 0x02 across the 3-track playlist Bolt was traversing). Y1's monotonic counter is a different semantic but functionally equivalent for Bolt (which uses "Identifier differs from last" as the refetch trigger).
+
+### Fix candidate ranking (after rate-limit + ProviderName)
+
+| # | Fix | Effort | Expected impact | Status |
+|---|---|---|---|---|
+| 1 | T4 in-memory cache — read `y1-track-info` on metachanged broadcast into JNI `.bss`, T4 serves from memory | Medium | High — closes the 10-30× latency gap, likely fixes Bolt GEA burst response | Deferred |
+| 2 | Two-phase TRACK_CHANGED emit — Phase 1 Identifier=0 SELECTED on track-switch start, Phase 2 with monotonic counter after metadata flush | Low-Med | High — matches Pixel's exact wire signal Bolt is built against | Bundled with #3,#4 |
+| 3 | Double NCC emit per track edge — emit at early switch + at metadata-settled point | Low | Medium | Bundled with #2,#4 |
+| 4 | Reorder: PPC=0 → TC on track edge instead of TC → PPC | Low | Low-Medium (UX cleanup) | Bundled with #2,#3 |
+| 5 | Honor inbound `playback_interval` — plumb the byte from RegNotif into the database, T9 emits only when interval elapsed | Medium | Low (rate-limit already covers position cadence) | Skip for now |
+| 6 | Revisit markTrackChange suppression — Pixel doesn't suppress, ship the PAUSED CHANGED through | Low | Unknown (other CTs may have relied on suppression — needs A/B test) | Defer |
+
+### Implementation plan for the #2+#3+#4 bundle
+
+Bundle them as a single coherent change ("match Pixel's track-edge choreography on the wire"). One cohesive edit in `_trampolines.py`:
+
+a. **Add two T5 entry points**:
+   - `t5_phase1_no_bump`: emits NCC + PPC=0 + TC (no Identifier bump) — called from `PlaybackStateBridge.onEarlyTrackChange` via a new `wakeTrackChangedPhase1` method on `TrackInfoWriter`.
+   - `t5_phase2_bump` (= existing `T5`): emits NCC + PPC + REACHED_END + TC (bumps Identifier) + REACHED_START — called from existing `wakeTrackChanged` paths after `onPlayerPreparedTail`'s flush.
+
+b. **Reorder T5 emit sequence**: move PPC ahead of TC in both phases. Currently NCC → PPC → REACHED_END → TC → REACHED_START. New order: NCC → PPC → REACHED_END → TC → REACHED_START stays for Phase 2, but Phase 1 keeps it simpler: NCC → PPC=0 → TC (no REACHED_END / REACHED_START in Phase 1).
+
+c. **Phase 1 trigger**: music-app-side hook in `PlaybackStateBridge.onEarlyTrackChange` adds a `wakeTrackChangedPhase1` call. The existing `onEarlyTrackChange` already fires on `toRestart()`'s `setDataSource(newPath)` site — 100-500 ms earlier than `onPrepared`. Phase 2 fires from `onPlayerPreparedTail` (after `playerIsPrepared = true` flips and duration is captured).
+
+d. **Identifier semantics for Phase 1**: ship the *current* Identifier (no bump). Phase 2 bumps. So Bolt sees TC CHANGED with Identifier=N (Phase 1) then TC CHANGED with Identifier=N+1 (Phase 2). Phase 1 signals "transition starting"; Phase 2 signals "settled, refetch metadata."
+
+### Why skip #5 and defer #6
+
+**#5 (playback_interval)**: adds new state plumbing (extended_T2 extracts the interval byte from inbound RegNotif payload, save to new `.bss` slot, T9 gates position emit on elapsed-since-last vs interval). It's a clean spec-compliance improvement but the 800 ms rate-limit already delivers the same effective wire cadence for Bolt's `Interval: 1` request. Adding #5 now costs more code than it returns. Save it for when we see a CT requesting a different interval (5 s, 30 s, etc).
+
+**#6 (remove markTrackChange suppression)**: the suppression was added 2026-05-15 for a specific CT-side observation — "spurious paused-state blips interrupt head-unit playback indicators during track changes." It's in the released CHANGELOG. Removing it because Pixel doesn't suppress is a reference-mimicry reflex — Pixel's CT-compat profile differs (Pixel ships AOSP MediaSession with built-in coalescing; our PlaybackStateBridge cascades independent wakes through onCompletion/onPrepared/onPlayerPreparedTail/setPlayValue). Pixel's PAUSED blip works because the rest of Pixel's frame sequencing is clean. Our blip used to land during burst storms that already had Bolt under AVCTP pressure. The rate-limit fix likely makes #6 safe again, but validating that needs an A/B test, not a speculative removal. Wait until next Bolt capture confirms the rate-limit fixed Tracks 3/4 freeze first.
+
+### Risk side of bundling
+
+If the next Bolt capture still freezes, bisection space is: {rate-limit (105eef5), ProviderName (f19ad7c), two-phase track-edge (this bundle)}. Three changes is manageable. Adding #5/#6 would push to five — bisection gets painful fast.
+
+### Decision
+
+Bundle #2+#3+#4 in a single subsequent commit (post user-test of the rate-limit + ProviderName changes). Defer #5 indefinitely (low value-per-LOC vs other fixes). Defer #6 until rate-limit fix is validated.
