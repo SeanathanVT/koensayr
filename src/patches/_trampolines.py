@@ -699,6 +699,12 @@ def _emit_extended_t2(a: Asm) -> None:
     # Done once here, covering every RegNotif event_id: extended_T2's
     # TRACK_CHANGED arm + T8's 11 other arms all reach this point.
     a.ldrb_w(0, 13, T2_EVENT_ID_OFF_ENTRY)    # r0 = event_id (preserved by save)
+    if DEBUG_NATIVE_LOG:
+        # Confirm extended_T2 actually reached for each inbound RegNotif.
+        # Log emitted BEFORE save_event_seq_id so the "T2reg ev=N" line
+        # is the strongest possible signal: even if save fails, this line
+        # confirms the CT sent RegisterNotification(ev=N) to us.
+        _emit_native_log_u32(a, "log_fmt_t2reg", 0)
     a.ldrb_w(1, 13, 0x171)                    # r1 = inbound seq_id
     a.bl_w("save_event_seq_id")               # database[event_id] = seq_id
     a.cmp_imm8(0, 0x02)                       # TRACK_CHANGED?
@@ -2950,6 +2956,14 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         a.align(4)
         a.label("log_fmt_t9papp")
         a.asciiz("T9papp")
+        a.align(4)
+        # Inbound RegisterNotification entry marker — confirms extended_T2
+        # was reached on a PDU=0x31 CMD. value = event_id. Pair with the
+        # outbound T5tc / T9ps / T9papp emits to disambiguate "CT didn't
+        # subscribe to ev=N" (no T2reg ev=N) from "CT subscribed but our
+        # CHANGED gate skipped" (T2reg ev=N present, no matching T5tc/T9ps).
+        a.label("log_fmt_t2reg")
+        a.asciiz("T2reg ev=%02x")
         a.align(4)
 
     # PApp UTF-8 attribute / value text strings (charset 0x006A).

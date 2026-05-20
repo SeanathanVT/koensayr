@@ -687,11 +687,12 @@ Tail with `adb logcat -s Y1Patch:*` to observe the metadata pipeline live; pipe 
 
 | Tag (format string) | Site | Value |
 |---|---|---|
+| `T2reg ev=%02x` | `extended_T2` immediately after the PDU=0x31 check, before `save_event_seq_id` | confirms an inbound `RegisterNotification(ev=N)` CMD reached the JNI trampoline. Pairs with the outbound emit markers below to disambiguate "CT didn't subscribe to ev=N" (no `T2reg ev=N`) from "CT subscribed but our CHANGED gate skipped" (`T2reg ev=N` present, no matching `T5tc`/`T9ps`/`T9papp`). |
 | `T5tc` | `t5_track_changed` before `track_changed_rsp` | no-arg marker confirming TRACK_CHANGED CHANGED actually emitted. Absence after a track edge means `database[2]` was `0` (no inbound `RegisterNotification(ev=02)` reached extended_T2 in this session, or the database was cleared by a subsequent GetCapabilities). |
 | `T9ps` | `t9_play_status_changed` before `reg_notievent_playback_rsp` | no-arg marker confirming PLAYBACK_STATUS_CHANGED CHANGED actually emitted. Absence after a play/pause edge means `database[1]` was `0`. |
 | `T9papp` | `t9_papp_changed` before `reg_notievent_player_appsettings_changed_rsp` | no-arg marker confirming PLAYER_APPLICATION_SETTING_CHANGED CHANGED actually emitted. Absence after a repeat/shuffle edge means `database[8]` was `0`. |
 | `M5wire c39=%02x` | `patch_mtkbt.py` D1 cave at `0xf36a0`, hooked from `fcn.0xae418:0xae448` | byte at `chan+0x39` immediately before mtkbt's AVCTP wire-frame builder encodes it as the outbound TL nibble. Fires once per outbound AVCTP frame (every RegNotif response). |
-| `M5dbg p8=%02x` / `M5dbg pd=%02x` / `M5dbg ba9=%02x` | `patch_mtkbt.py` D2 cave at `0xf3700`, hooked from M5 cave tail at `0xf3694` | three values captured at M5 cave exit: `packet[+8]` (empirically `0xb8` outbound, `0xea` inbound), `packet[+0xd]` (the current discriminator — `0` outbound, inbound TID otherwise), and `chan+0xba9` (`fcn.0x11374:0x11436` writes the latest inbound CMD's TID here — a historical reference; not load-bearing post-fix). Pair with `M5wire c39` to verify the wire emits the per-event TID. |
+| `M5dbg p8=%02x` / `M5dbg pd=%02x` | `patch_mtkbt.py` D2 cave at `0xf3700`, hooked from M5 cave tail at `0xf3694` | two values captured at M5 cave exit: `packet[+8]` (empirically `0xb8` outbound, `0xea` inbound) and `packet[+0xd]` (the current discriminator — `0` outbound, inbound TID otherwise). Pair with `M5wire c39` to verify the wire emits the per-event TID. |
 
 Tail with `adb logcat -s Y1T:*` and pipe through `tools/avrcp-wire-trace.py` for the GEA wire-size analysis. Pair with `tools/btlog-parse.py --avrcp` on the simultaneously-captured `btlog.bin` for mtkbt internal log surfaces (`avctpCB`, `[AVCTP]`, `avrcp:` lines).
 

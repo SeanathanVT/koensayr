@@ -38,7 +38,7 @@ STOCK_MD5         = "3af1d4ad8f955038186696950430ffda"
 OUTPUT_MD5        = "e466763d12cd516103de05ce4af174b9"
 
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "0246e82640743f35211cddd84c9ad26f"
+OUTPUT_DEBUG_MD5  = "ab5cf72d485fc46a277839ef3f4f5e14"
 
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
@@ -540,31 +540,25 @@ def build_debug_cave_blob(cave_vaddr: int) -> bytes:
 
 
 def build_debug_cave2_blob(cave_vaddr: int) -> bytes:
-    """Assemble the D2 M5+M7 exit-time multi-value log cave.
+    """Assemble the D2 M5 exit-time log cave.
 
-    Hooked from the b.w 0x6d18c at the end of the M5+M7 cave at 0xf3694.
-    Replaces that b.w with `b.w cave_vaddr`. The cave logs three values
+    Hooked from the b.w 0x6d18c at the end of the M5 cave at 0xf3694.
+    Replaces that b.w with `b.w cave_vaddr`. The cave logs two values
     that disambiguate why a given wire frame ends up with `c39=NN`:
 
       - `packet[+8]`  — M5's outbound-discriminator byte. M5's cave at
                        0xf3680 takes the skip-strb path when this is 1.
-                       For msg=544 RegNotif responses, empirical c39=0
-                       suggests this byte is not 1 (allocator doesn't
-                       mark the packet as outbound for that msg path).
-      - `packet[+0xd]` — the original strb source. Inbound CMD path:
-                       this is the inbound TID (per Path B's stash
-                       struct semantics). Outbound: this should be 0
-                       (allocator-zeroed) unless someone wrote it.
-      - `chan+0xba9` — M7's source. Set by `fcn.0x11374:0x11436` on
-                       msg=520 cmd_frame_ind_rsp; M7 syncs `chan+0x39`
-                       from here unconditionally. If `c39=0` despite
-                       M7 running, this slot was 0 at sync time.
+                       Empirically observed as 0xb8 (outbound) or 0xea
+                       (inbound) — never 1, so M5's `cmp r2, 1` always
+                       falls through to the strb path.
+      - `packet[+0xd]` — the new discriminator. M5's cave checks
+                       `cmp r0, 0` against this byte: == 0 ↔ outbound
+                       (allocator-zeroed), nonzero ↔ inbound-marked
+                       TID echo carrying the CT-supplied seq_id.
 
-    Three separate log calls (one per value, simpler than packing into
-    a 3-arg printf — __android_log_print's variadic argument layout
-    requires stack pushes for args beyond r3). r5 (packet ptr) and r4
-    (chan+0x10) are callee-saved per AAPCS and preserved across each
-    `blx` to __android_log_print.
+    Two separate log calls (one per value, simpler than packing into
+    a 2-arg printf). r5 (packet ptr) is callee-saved per AAPCS and
+    preserved across each `blx` to __android_log_print.
 
     Stack discipline: push {r0-r4, lr} = 6 words = 24 B → keeps sp
     8-aligned at each blx call (AAPCS requirement). r4 is included in
@@ -589,15 +583,6 @@ def build_debug_cave2_blob(cave_vaddr: int) -> bytes:
     a.adr_w(2, "log_fmt_pd")
     a.blx_imm(PLT_android_log_print)
 
-    # ---- log 3: chan+0xba9 (M7's source — should hold inbound TID) ----
-    # Path B's r4 = chan+0x10, so chan+0xba9 is at [r4, 0xb99]. Thumb-2
-    # ldrb.w T2 form supports 12-bit unsigned imm (0..0xfff) — 0xb99 fits.
-    a.ldrb_w(3, 4, 0xb99)                           # r3 = chan+0xba9
-    a.movs_imm8(0, 4)
-    a.adr_w(1, "log_tag")
-    a.adr_w(2, "log_fmt_ba9")
-    a.blx_imm(PLT_android_log_print)
-
     a.raw(bytes([0xbd, 0xe8, 0x1f, 0x40]))         # pop.w {r0-r4, lr}
     a.labels["ret"] = 0x6d18c                       # original M5+M7 return target
     a.b_w("ret")
@@ -609,8 +594,6 @@ def build_debug_cave2_blob(cave_vaddr: int) -> bytes:
     a.asciiz("M5dbg p8=%02x")
     a.label("log_fmt_pd")
     a.asciiz("M5dbg pd=%02x")
-    a.label("log_fmt_ba9")
-    a.asciiz("M5dbg ba9=%02x")
     return a.resolve()
 
 
