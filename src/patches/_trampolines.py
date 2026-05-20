@@ -423,23 +423,14 @@ def _emit_t4(a: Asm) -> None:
     a.movw(2, T4_FILE_SIZE)                   # r2 = 1104
     a.blx_imm(PLT_memset)
 
-    # ---- open + syscall_read + close on y1-track-info ----
-    a.adr_w(0, "path_track_info")             # r0 = path
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)                       # r0 = fd or -errno
-    a.cmp_imm8(0, 0)
-    a.blt("t4_skip_track_read")
-    a.mov_lo_lo(4, 0)                         # r4 = fd
-
-    a.mov_lo_lo(0, 4)                         # syscall args: r0=fd
-    a.add_sp_imm(1, T4_OFF_FILE)              # r1 = file_buf
-    a.movw(2, T4_FILE_SIZE)                   # r2 = count
-    a.movs_imm8(7, NR_read)                   # r7 = SYS_read
-    a.svc(0)
-
-    a.mov_lo_lo(0, 4)
-    a.blx_imm(PLT_close)
+    # ---- copy active slot from y1-track-info into file_buf ----
+    # read_track_info handles mmap-cache + active-slot dispatch + byte-copy.
+    # On failure (file missing, mmap rejects), returns 0 and leaves file_buf
+    # zeroed from the memset above — downstream code sees "no track, no edge"
+    # and skips emits naturally. No explicit branch needed.
+    a.add_sp_imm(0, T4_OFF_FILE)              # r0 = dst = sp+T4_OFF_FILE
+    a.movw(1, T4_FILE_SIZE)                   # r1 = nbytes = 1104
+    a.bl_w("read_track_info")
 
     a.label("t4_skip_track_read")
 
@@ -731,23 +722,10 @@ def _emit_extended_t2(a: Asm) -> None:
     a.str_sp_imm(0, T2_OFF_TID + 0)
     a.str_sp_imm(0, T2_OFF_TID + 4)
 
-    # Open + read 8 B from y1-track-info into sp+0..7.
-    a.adr_w(0, "path_track_info")
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("ext2_after_track_read")
-    a.mov_lo_lo(4, 0)
-
-    a.mov_lo_lo(0, 4)
-    a.add_sp_imm(1, T2_OFF_TID)               # r1 = sp+0 (track_id slot)
-    a.movs_imm8(2, 8)
-    a.movs_imm8(7, NR_read)
-    a.svc(0)
-
-    a.mov_lo_lo(0, 4)
-    a.blx_imm(PLT_close)
+    # ---- copy first 8 B of active slot (track_id) into sp+T2_OFF_TID ----
+    a.add_sp_imm(0, T2_OFF_TID)
+    a.movs_imm8(1, 8)
+    a.bl_w("read_track_info")
 
     a.label("ext2_after_track_read")
 
@@ -847,23 +825,10 @@ def _emit_t5(a: Asm) -> None:
     a.movw(2, 800)
     a.blx_imm(PLT_memset)
 
-    # ---- open + read 800 B of y1-track-info into file_buf ----
-    a.adr_w(0, "path_track_info")
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("t5_skip_track_read")
-    a.mov_lo_lo(5, 0)                         # r5 = fd
-
-    a.mov_lo_lo(0, 5)
-    a.add_sp_imm(1, T5_OFF_FILE)              # r1 = file_buf
-    a.movw(2, 800)
-    a.movs_imm8(7, NR_read)
-    a.svc(0)
-
-    a.mov_lo_lo(0, 5)
-    a.blx_imm(PLT_close)
+    # ---- copy active slot of y1-track-info into file_buf ----
+    a.add_sp_imm(0, T5_OFF_FILE)
+    a.movw(1, 800)
+    a.bl_w("read_track_info")
 
     a.label("t5_skip_track_read")
 
@@ -1121,23 +1086,10 @@ def _emit_t6(a: Asm) -> None:
     a.movw(2, 800)
     a.blx_imm(PLT_memset)
 
-    # ---- open + read y1-track-info ----
-    a.adr_w(0, "path_track_info")
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("t6_skip_track_read")
-    a.mov_lo_lo(4, 0)                         # r4 = fd
-
-    a.mov_lo_lo(0, 4)
-    a.add_sp_imm(1, T6_OFF_FILE)              # r1 = file_buf
-    a.movw(2, 800)                            # count = 800
-    a.movs_imm8(7, NR_read)
-    a.svc(0)
-
-    a.mov_lo_lo(0, 4)
-    a.blx_imm(PLT_close)
+    # ---- copy active slot of y1-track-info into file_buf ----
+    a.add_sp_imm(0, T6_OFF_FILE)
+    a.movw(1, 800)
+    a.bl_w("read_track_info")
 
     a.label("t6_skip_track_read")
 
@@ -1448,7 +1400,18 @@ def _emit_t_papp(a: Asm) -> None:
     a.beq_w("papp_gc_n1")
 
     # ---- n != 1: existing two-attr path ----
-    # Open y1-track-info
+    # TODO(mmap-followup): T_papp's gc paths still hit y1-track-info via
+    # the old open + lseek(795) + read pattern. Under the post-mmap
+    # double-buffer schema (file[0] = active_slot, slot data at
+    # file[4 + active*1104]), offset 795 lands inside slot[0]'s Artist
+    # field. The two bytes read here will not be valid Repeat/Shuffle
+    # AVRCP enum values most of the time. The response builder rejects
+    # out-of-spec enum bytes upstream of T_papp; failing that, the
+    # CT-side display will momentarily show garbage Repeat/Shuffle state
+    # until the next T9 PApp CHANGED arrives (T9's emit reads the now
+    # active-slot-correct file_buf and ships the live state). Trampoline
+    # budget can absorb a slot_offset parameter on read_track_info; defer
+    # to the post-ship audit pass.
     a.adr_w(0, "path_track_info")
     a.movs_imm8(1, O_RDONLY)
     a.movs_imm8(2, 0)
@@ -1806,6 +1769,42 @@ G_AVRCP_REQ_EVENT_DATABASE_VADDR = 0xd2b5
 # trivial.
 G_Y1_AVRCP_TRACK_IDENTIFIER_VADDR = 0xd2c4
 
+# 4-byte slot in .bss padding (between g_y1_avrcp_track_identifier ending at
+# 0xd2cc and stock g_avrcp_auto_browse_connect at 0xd2d5). Holds the lazy-init
+# mmap'd base pointer for y1-track-info. NULL until the first successful
+# get_or_init_mmap call; populated thereafter so subsequent calls skip the
+# open + mmap + close syscall chain.
+#
+# .bss is zeroed on every libextavrcp_jni.so load (process-scoped). When the
+# bluetooth process restarts, ptr is NULL on first read and the lazy-init
+# re-mmaps. The mmap'd region itself follows the file's inode — since the
+# music app's TrackInfoWriter does in-place writes (no tmpfile + rename, which
+# would create a fresh inode and orphan our mapping), the same ptr stays
+# valid across every flush from the writer side.
+G_Y1_TRACK_INFO_MMAP_BASE_VADDR = 0xd2cc
+
+
+# y1-track-info schema. Music app's TrackInfoWriter ships file shape:
+#
+#   file[0]       active_slot (0 or 1) — single-byte atomic flag
+#   file[1..3]    RFA padding (4-B-align slot[0])
+#   file[4..1107] slot[0] — 1104-byte track-info image (existing schema)
+#   file[1108..2211] slot[1] — second 1104-byte copy
+#   file[2212]    RFA padding
+#
+# Writer flow: pick inactive = 1 - active_slot, fill that slot, atomically
+# update file[0] = inactive. Reader (us) reads file[0] once, dispatches to
+# the slot, and copies into its existing 1104-byte file_buf at the same
+# stack offset trampolines have always used. Old per-trampoline field offsets
+# (T*_OFF_FILE_*) are unchanged — they index into the copied slot.
+Y1_TRACK_INFO_FILE_SIZE  = 2213
+Y1_TRACK_INFO_SLOT_SIZE  = 1104
+Y1_TRACK_INFO_SLOT0_OFF  = 4
+Y1_TRACK_INFO_SLOT1_OFF  = Y1_TRACK_INFO_SLOT0_OFF + Y1_TRACK_INFO_SLOT_SIZE
+
+# mmap2 syscall number on ARM EABI (Linux arch/arm/include/asm/unistd.h).
+NR_mmap2 = 192
+
 
 def _emit_check_event_subscribed(a: Asm, event_id: int, skip_label: str) -> None:
     """Emit `movs r1, #event_id; bl event_subscribed; beq skip_label`.
@@ -2079,6 +2078,162 @@ def _emit_event_subscribed_subroutine(a: Asm) -> None:
     a._fixup(_emit_lit, 4)
 
 
+def _emit_get_or_init_mmap_subroutine(a: Asm) -> None:
+    """Lazy-init mmap of y1-track-info, cached at G_Y1_TRACK_INFO_MMAP_BASE_VADDR.
+
+    Pre: none.
+    Post: r0 = mmap base ptr (cached on success), or 0 on failure.
+    Clobbers r1, r2, r3, r7, ip, lr. r4-r6 preserved (used internally
+    across the push/pop window).
+
+    No sticky failure flag — every cache-miss call retries open + mmap.
+    The failure path (music app hasn't created the file yet, mmap2 rejects)
+    is rare; retrying is cheap and recovers automatically.
+
+    mmap2 ABI on ARM EABI Linux: r0=addr, r1=length, r2=prot, r3=flags,
+    r4=fd, r5=pgoff (units of pages, 0 = file start), r7=NR_mmap2 (192),
+    svc 0 → r0 = mapped vaddr (>= 0x10000) or -errno.
+    """
+    a.label("get_or_init_mmap")
+
+    # Compute &g_y1_track_info_mmap_base from PC.
+    a.ldr_lit_w(0, "get_or_init_mmap_lit")
+    a.label("get_or_init_mmap_add_pc")
+    a.add_reg(0, 15)                            # r0 = absolute vaddr of g_mmap_base
+
+    # Load cached ptr.
+    a.ldr_w(1, 0, 0)                            # r1 = *(g_mmap_base)
+    a.cmp_imm8(1, 0)
+    a.beq("mmap_do_init")
+    # Cache hit — return cached ptr.
+    a.mov_lo_lo(0, 1)
+    a.bx(14)                                    # bx lr
+
+    a.label("mmap_do_init")
+    # push {r3, r4-r7, lr} — bitmap 0xf8, R=1, halfword 0xb5f8, LE bytes f8 b5.
+    # 6 regs = 24 B, sp stays 8-aligned. r3 pushed only for alignment (caller-
+    # saved, never restored in any meaningful sense — we pop into r3 to discard).
+    a.raw(bytes([0xf8, 0xb5]))
+    a.mov_lo_lo(6, 0)                           # r6 = &g_mmap_base (preserved across blx)
+
+    # open(path_track_info, O_RDONLY, 0)
+    a.adr_w(0, "path_track_info")
+    a.movs_imm8(1, 0)                           # O_RDONLY
+    a.movs_imm8(2, 0)
+    a.blx_imm(PLT_open)
+    a.cmp_imm8(0, 0)
+    a.blt("mmap_init_fail_no_fd")
+    a.mov_lo_lo(4, 0)                           # r4 = fd (callee-save, preserved across svc)
+
+    # mmap2(NULL, 0x1000, PROT_READ, MAP_SHARED, fd, pgoff=0)
+    a.movs_imm8(0, 0)                           # r0 = addr (NULL)
+    a.movw(1, 0x1000)                           # r1 = length (4096, one page — covers 2213 B file)
+    a.movs_imm8(2, 1)                           # r2 = PROT_READ
+    a.movs_imm8(3, 1)                           # r3 = MAP_SHARED
+    # r4 = fd already (set above).
+    a.movs_imm8(5, 0)                           # r5 = pgoff
+    a.movw(7, NR_mmap2)
+    a.svc(0)                                    # r0 = ptr or -errno
+    a.mov_lo_lo(7, 0)                           # r7 = mmap result (preserve across close)
+
+    # close(fd) — Linux mmap'd region survives fd close.
+    a.mov_lo_lo(0, 4)
+    a.blx_imm(PLT_close)
+
+    # Validate mmap result. ARM mmap2 returns -errno (small negative) on
+    # failure; any valid mapped vaddr is well above 0 (PAGE_OFFSET-ish).
+    a.cmp_imm8(7, 0)
+    a.blt("mmap_init_fail")
+    # Success: store ptr in cache. str.w r7, [r6, #0].
+    #   Thumb-2 STR.W (immediate) T3:
+    #   hw1 = 0xF8C0 | Rn ; hw2 = (Rt<<12) | imm12.
+    #   r7→[r6,0]: hw1 = 0xF8C6, hw2 = 0x7000 → LE bytes c6 f8 00 70.
+    a.raw(bytes([0xc6, 0xf8, 0x00, 0x70]))
+    a.mov_lo_lo(0, 7)                           # r0 = mmap result (return value)
+    # pop {r3, r4-r7, pc} — bitmap 0xf8, R=1, halfword 0xbdf8, LE bytes f8 bd.
+    a.raw(bytes([0xf8, 0xbd]))
+
+    a.label("mmap_init_fail")
+    a.movs_imm8(0, 0)                           # return 0
+    a.raw(bytes([0xf8, 0xbd]))                  # pop {r3, r4-r7, pc}
+
+    a.label("mmap_init_fail_no_fd")
+    # open() failed — already in the pushed-state, so pop and return 0.
+    a.movs_imm8(0, 0)
+    a.raw(bytes([0xf8, 0xbd]))                  # pop {r3, r4-r7, pc}
+
+    a.align(4)
+    a.label("get_or_init_mmap_lit")
+    def _emit_lit(_pc: int) -> bytes:
+        offset = G_Y1_TRACK_INFO_MMAP_BASE_VADDR - (a.labels["get_or_init_mmap_add_pc"] + 4)
+        return (offset & 0xFFFFFFFF).to_bytes(4, "little")
+    a._fixup(_emit_lit, 4)
+
+
+def _emit_read_track_info_subroutine(a: Asm) -> None:
+    """Copy nbytes from y1-track-info's active slot into caller's buffer.
+
+    Pre: r0 = dst buffer (1104-aligned-or-not stack address), r1 = nbytes
+        (1..1104; caller picks the trampoline's existing FILE_SIZE constant).
+    Post: r0 = nbytes copied on success, 0 on mmap unavailable. r4-r11
+        preserved. Clobbers r1, r2, r3, ip, lr (and r7 transiently inside
+        get_or_init_mmap).
+
+    Reads file[0] as active_slot, computes src = mmap_base + 4 + (active*1104),
+    byte-copies nbytes into dst. Slow path (mmap miss) returns 0; caller
+    treats dst as unchanged (already memset-zeroed at trampoline entry).
+
+    Byte-copy loop is O(nbytes) but executes in cache after the first
+    iteration — ~1100 instructions for a full 1104-byte copy, well under a
+    microsecond on Cortex-A7. Compare to ~21 ms for the prior open+read+close
+    syscall chain (Trace #74).
+    """
+    a.label("read_track_info")
+    # push {r3, r4-r7, lr} — same alignment rationale as get_or_init_mmap.
+    a.raw(bytes([0xf8, 0xb5]))
+
+    a.mov_lo_lo(4, 0)                           # r4 = dst (preserved across bl)
+    a.mov_lo_lo(5, 1)                           # r5 = nbytes (preserved)
+
+    a.bl_w("get_or_init_mmap")                  # r0 = mmap base or 0
+    a.cmp_imm8(0, 0)
+    a.beq("read_track_info_fail")
+
+    # r0 = mmap base. Read active_slot byte.
+    a.ldrb_w(1, 0, 0)                           # r1 = base[0] (active slot in low bit)
+    # r1 is 0 or 1 in the writer's contract. We don't mask here — a non-
+    # 0/non-1 value would mean the writer crashed mid-flip or someone wrote
+    # garbage; in that case dispatching to slot[active & whatever] still
+    # reads consistent slot data (the previous flush's slot stays valid
+    # because the writer always writes the OTHER slot first).
+    a.movw(2, Y1_TRACK_INFO_SLOT_SIZE)
+    a.muls_lo_lo(1, 2)                          # r1 = active * 1104
+    # adds r1, #4 (T2 ADD imm8): 0011 0 Rdn imm8 → 0x3000 | (1<<8) | 4 = 0x3104.
+    a.raw(bytes([0x04, 0x31]))
+    a.adds_lo_lo(1, 1, 0)                       # r1 = src = mmap_base + 4 + active*1104
+
+    # Byte-copy loop: r3=i, r5=count, r1=src, r4=dst. Unrolled would be
+    # faster but byte loop fits naturally and the bytes-per-call is small
+    # enough that the win isn't load-bearing.
+    a.movs_imm8(3, 0)
+    a.label("read_track_info_loop")
+    a.ldrb_reg(0, 1, 3)                         # r0 = src[i]
+    # strb r0, [r4, r3] — Thumb-1 STRB (register) T1: 0101 010 Rm Rn Rt.
+    #   Rm=3, Rn=4, Rt=0 → 0x5400 | (3<<6) | (4<<3) | 0 = 0x54E0.
+    a.raw(bytes([0xe0, 0x54]))
+    # adds r3, #1 (T2 ADD imm8): 0x3000 | (3<<8) | 1 = 0x3301.
+    a.raw(bytes([0x01, 0x33]))
+    a.cmp_w(3, 5)
+    a.bne("read_track_info_loop")
+
+    a.mov_lo_lo(0, 5)                           # return nbytes
+    a.raw(bytes([0xf8, 0xbd]))                  # pop {r3, r4-r7, pc}
+
+    a.label("read_track_info_fail")
+    a.movs_imm8(0, 0)                           # return 0
+    a.raw(bytes([0xf8, 0xbd]))
+
+
 def _emit_native_log_u32(a: Asm, fmt_label: str, value_reg: int) -> None:
     """Emit __android_log_print(INFO, "Y1T", fmt, value_reg) before a wire-side
     response blx. Used by build(debug=True) to record exactly what bytes the
@@ -2170,23 +2325,10 @@ def _emit_t8(a: Asm) -> None:
     a.movw(2, 800)
     a.blx_imm(PLT_memset)
 
-    # ---- open + read y1-track-info ----
-    a.adr_w(0, "path_track_info")
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("t8_skip_track_read")
-    a.mov_lo_lo(4, 0)                         # r4 = fd
-
-    a.mov_lo_lo(0, 4)
-    a.add_sp_imm(1, T8_OFF_FILE)              # r1 = file_buf
-    a.movw(2, 800)
-    a.movs_imm8(7, NR_read)
-    a.svc(0)
-
-    a.mov_lo_lo(0, 4)
-    a.blx_imm(PLT_close)
+    # ---- copy active slot of y1-track-info into file_buf ----
+    a.add_sp_imm(0, T8_OFF_FILE)
+    a.movw(1, 800)
+    a.bl_w("read_track_info")
 
     a.label("t8_skip_track_read")
 
@@ -2538,23 +2680,10 @@ def _emit_t9(a: Asm) -> None:
     a.movs_imm8(2, 24)
     a.blx_imm(PLT_memset)
 
-    # ---- open + read y1-track-info into file_buf ----
-    a.adr_w(0, "path_track_info")
-    a.movs_imm8(1, O_RDONLY)
-    a.movs_imm8(2, 0)
-    a.blx_imm(PLT_open)
-    a.cmp_imm8(0, 0)
-    a.blt("t9_skip_track_read")
-    a.mov_lo_lo(5, 0)                         # r5 = fd
-
-    a.mov_lo_lo(0, 5)
-    a.add_sp_imm(1, T9_OFF_FILE)              # r1 = file_buf
-    a.movw(2, 800)
-    a.movs_imm8(7, NR_read)
-    a.svc(0)
-
-    a.mov_lo_lo(0, 5)
-    a.blx_imm(PLT_close)
+    # ---- copy active slot of y1-track-info into file_buf ----
+    a.add_sp_imm(0, T9_OFF_FILE)
+    a.movw(1, 800)
+    a.bl_w("read_track_info")
 
     a.label("t9_skip_track_read")
 
@@ -2890,6 +3019,11 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     _emit_event_subscribed_subroutine(a)
     _emit_clear_event_database_subroutine(a)
     _emit_incr_track_identifier_subroutine(a)
+    # mmap-backed reads of y1-track-info (writer-side ships double-buffer
+    # 2213-byte schema; reader-side dispatches active slot and byte-copies
+    # the chosen slot into the caller's existing file_buf stack region).
+    _emit_get_or_init_mmap_subroutine(a)
+    _emit_read_track_info_subroutine(a)
 
     # Path strings, 4-byte-aligned for clean ADR offsets.
     a.align(4)

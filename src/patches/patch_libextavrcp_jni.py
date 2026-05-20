@@ -41,12 +41,17 @@ NATIVE_TRACK_CHANGED_VADDR = 0x3bc0
 NATIVE_PLAY_STATUS_CHANGED_VADDR = 0x3c88
 
 STOCK_MD5         = "fd2ce74db9389980b55bccf3d8f15660"
-OUTPUT_MD5        = "b0faea8544fc2ee737b6f4b206e6e7fb"
+# Set to None during the mmap-rework cycle — trampoline blob shape changed
+# (added get_or_init_mmap + read_track_info subroutines, dropped per-site
+# open+read+close inline in T4/T5/T6/T8/T9/extended_T2). Patcher will print
+# the computed MD5 on first flash; replace this with that value once
+# verified against a successful flash + capture cycle.
+OUTPUT_MD5        = None
 
 # --debug: splices __android_log_print calls into T5/T6/T8/T9 emit sites
 # (tag "Y1T"). Release builds remain byte-identical without the env var.
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "a7fe9353b9cf49b6163733ecb31a24d4"
+OUTPUT_DEBUG_MD5  = None
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
 # ---------------------------------------------------------------- T1
