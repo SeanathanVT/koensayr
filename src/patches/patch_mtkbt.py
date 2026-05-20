@@ -35,10 +35,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _thumb2asm import Asm
 
 STOCK_MD5         = "3af1d4ad8f955038186696950430ffda"
-OUTPUT_MD5        = "e466763d12cd516103de05ce4af174b9"
+OUTPUT_MD5        = "80d9275ab1ae7f71f0f6c57412d214a6"
 
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "ab5cf72d485fc46a277839ef3f4f5e14"
+OUTPUT_DEBUG_MD5  = "19429e3cd2498a14dc23605e5f29d687"
 
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
@@ -193,6 +193,41 @@ BASE_PATCHES = [
         "offset": 0x0eba4e,
         "before": bytes([0x21]),
         "after":  bytes([0x01]),
+    },
+    {
+        # Write SDP TEXT_STR_8 " " (single space) at 0x0eb938. Encoding:
+        #   0x25 = TEXT_STR_8 descriptor (Bluetooth Core §SDP Data Element Type 4 size index 5)
+        #   0x02 = length (1 char + null terminator)
+        #   0x20 = ' ' (space)
+        #   0x00 = null terminator
+        # Region 0x0eb938..0x0eb95b is a 36-byte zero-padded gap between
+        # two unrelated SDP data blocks (0xeb928 protocol-id table tail and
+        # 0xeb95c next protocol entry). The 4-byte write here is purely
+        # additive and consumed only by [P_PN1]'s new entry pointer below.
+        "name":   "[P_PN0] write TEXT_STR_8 \" \" SDP descriptor for ProviderName attribute",
+        "offset": 0x0eb938,
+        "before": bytes([0x00, 0x00, 0x00, 0x00]),
+        "after":  bytes([0x25, 0x02, 0x20, 0x00]),
+    },
+    {
+        # Repurpose the AVRCP 1.3 TG record's 0x0005 BrowseGroupList slot to
+        # 0x0102 ProviderName, matching the Pixel-as-TG SDP shape (which ships
+        # 0x0102 ProviderName with a single-space value alongside 0x0100
+        # ServiceName). Per Bluetooth Core SDP, attribute 0x0005
+        # BrowseGroupList is OPTIONAL; absence drops the record from public
+        # browse-group searches but spec-conforming CTs key on UUID search
+        # (which we still satisfy via attribute 0x0001 ServiceClassIDList).
+        # Net wire delta: TG record gains attribute 0x0102 ProviderName=" "
+        # at the cost of dropping 0x0005 BrowseGroupList={PublicBrowseRoot}.
+        #
+        # New entry: attr=0x0102, len=4 (one TEXT_STR_8 ds + 4 byte payload),
+        # ptr=0x0eb938 (the descriptor written by [P_PN0]).
+        "name":   "[P_PN1] 0x0005 BrowseGroupList -> 0x0102 ProviderName  AVRCP 1.3 TG record entry slot",
+        "offset": 0x0f978c,
+        # stock entry: attr=0x0005, len=5, ptr=0x0eba3d (-> SEQ UUID16 0x1002 PublicBrowseRoot)
+        "before": entry(0x0005, 0x0005, 0x000eba3d),
+        # patched: attr=0x0102, len=4, ptr=0x0eb938 (-> TEXT_STR_8 " ")
+        "after":  entry(0x0102, 0x0004, 0x000eb938),
     },
     {
         # `cmp r3, #0x30` at 0x144e8 → `b.n 0x14528` (unconditional). Bypasses
