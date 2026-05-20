@@ -2188,19 +2188,19 @@ DBG_VALUE_PATCHES_TRACKINFOWRITER = [
     # after a PAUSE iff T9 emitted PLAYBACK_STATUS_CHANGED).
     (
         ".method public wakePlayStateChanged()V\n"
-        "    .locals 5\n"
+        "    .locals 7\n"
         "\n"
         "    :try_start_0\n"
-        "    iget-object v0, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mContext:Landroid/content/Context;\n",
+        "    # Rate-limit gate. Suppress broadcast when mPlayStatus is unchanged AND\n",
         ".method public wakePlayStateChanged()V\n"
-        "    .locals 5\n"
+        "    .locals 7\n"
         "\n"
         "    :try_start_0\n"
         "    # === DEBUG: log trampoline-state pre-broadcast ===\n"
         "    const-string v0, \"wPSC.pre\"\n"
         "    invoke-static {v0}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->_dbgLogTrampolineState(Ljava/lang/String;)V\n"
         "    # === END DEBUG ===\n"
-        "    iget-object v0, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mContext:Landroid/content/Context;\n",
+        "    # Rate-limit gate. Suppress broadcast when mPlayStatus is unchanged AND\n",
         "wakePlayStateChanged.preBroadcast",
     ),
     # wakeTrackChanged post-broadcast: schedule a ~50 ms delayed
