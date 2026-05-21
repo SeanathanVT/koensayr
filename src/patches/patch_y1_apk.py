@@ -2014,17 +2014,20 @@ DBG_VALUE_PATCHES_TRACKINFOWRITER = [
 ]
 
 DBG_VALUE_PATCHES_PLAYBACKSTATEBRIDGE = [
-    # onPlayValue entry: log raw newValue + reason ints (pre-mapping).
-    # .locals 8 because the host method uses v3..v7 for the B5.2t track-change
-    # blip-suppression cmp-long check. Our debug prelude clobbers v0..v2 only,
-    # which the host method re-initialises immediately after the const/4 v0
-    # line we anchor on.
+    # onPlayValue entry: log raw newValue + reason ints. Injected immediately
+    # after :try_start_b5 — runs before the reason==1 init-seed suppression so
+    # suppressed events are still visible in logcat (an "oPV.reason=1" line with
+    # no matching wakePlayStateChanged = suppression fired). .locals 8 because
+    # the host method uses v3..v7 for the track-change blip-suppression cmp-long
+    # check. Our debug prelude clobbers v0..v2 only, which the host method
+    # re-initialises with const/4 v0, 0x1 right after.
     (
         ".method public static onPlayValue(II)V\n"
         "    .locals 8\n"
         "\n"
         "    :try_start_b5\n"
-        "    const/4 v0, -0x1\n",
+        "\n"
+        "    # MusicPlayerActivity.initView()",
         ".method public static onPlayValue(II)V\n"
         "    .locals 8\n"
         "\n"
@@ -2037,7 +2040,8 @@ DBG_VALUE_PATCHES_PLAYBACKSTATEBRIDGE = [
         "    const-string v2, \"oPV.reason\"\n"
         "    invoke-static {v2, v0, v1}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->_dbgKV(Ljava/lang/String;J)V\n"
         "    # === END DEBUG ===\n"
-        "    const/4 v0, -0x1\n",
+        "\n"
+        "    # MusicPlayerActivity.initView()",
         "onPlayValue.entry",
     ),
 ]

@@ -92,6 +92,30 @@
     .locals 8
 
     :try_start_b5
+
+    # MusicPlayerActivity.initView() seeds Static.setPlayValue(1, 1) the moment
+    # the music-player Activity reaches its first valid-music-list / file-exists
+    # branch — see MusicPlayerActivity.smali line 286-288 (const/4 v4, 0x1 /
+    # setPlayValue(v4, v4)). The seed exists purely so the activity's own UI
+    # renders the play glyph as it comes up; actual playback transitions later
+    # go through PlayerService.play() / playOrPause() / restartPlay() and emit
+    # one of the other reason codes (4 / 5 / 8 / 9). Reason 1 is exclusively
+    # this Activity-init seed. The exact same initView() body had already
+    # invoked pause$default(0xc, false, 2) — pause$default's flags=0x2 path
+    # forces p2=true, so that pause reaches PlayerService.pause(IZ) line 4370
+    # and emits setPlayValue(3, 3) ~9 ms before the (1, 1) seed. Propagating
+    # both edges to the AVRCP wire ships PSC CHANGED PAUSED → PSC CHANGED
+    # PLAYING in rapid succession; CTs see the trailing PLAYING and refuse
+    # to flip their pause→play button after a user PAUSE on the CT side.
+    # Static.setPlayValue still updates mPlayValue (the local LiveData) after
+    # we return, so the on-device UI is unaffected.
+    const/4 v0, 0x1
+
+    if-ne p1, v0, :do_dispatch
+
+    return-void
+
+    :do_dispatch
     const/4 v0, -0x1
 
     if-nez p0, :cond_one
