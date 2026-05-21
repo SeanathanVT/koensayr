@@ -381,6 +381,50 @@
 
     if-ne v0, p1, :cond_changed
 
+    # Same-state setPlayStatus call. Normally a no-op, but if newStatus is
+    # PLAYING (1) we re-anchor from MediaPlayer.getCurrentPosition() before
+    # returning. Y1's music app fires setPlayValue(1) at multiple points
+    # (track-load init, audio-focus regain, restartPlay's auto-resume)
+    # often BEFORE MediaPlayer actually begins emitting audio. The first
+    # such call sets mPlayStatus=1 + stamps mStateChangeTime at that
+    # pre-play moment; subsequent setPlayStatus(1) calls early-return
+    # without re-stamping, so the trampoline's live_pos = anchor +
+    # (now - stale_time) accumulates phantom seconds until actual
+    # playback start. Bolt's playhead then renders ahead-of-reality (Bolt
+    # 1326 capture: Y1 UI 0:30 vs IPC-shipped 3:18 = 2:48 phantom drift).
+    # Ground-truthing here keeps IPC in sync with MediaPlayer regardless
+    # of which redundant setPlayStatus(1) the actual play-start lands on.
+    const/4 v1, 0x1
+
+    if-ne p1, v1, :early_return
+
+    invoke-static {}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->getPlayerService()Lcom/innioasis/y1/service/PlayerService;
+
+    move-result-object v1
+
+    if-eqz v1, :early_return
+
+    invoke-virtual {v1}, Lcom/innioasis/y1/service/PlayerService;->getPlayerIsPrepared()Z
+
+    move-result v2
+
+    if-eqz v2, :early_return
+
+    invoke-virtual {v1}, Lcom/innioasis/y1/service/PlayerService;->getCurrentPosition()J
+
+    move-result-wide v2
+
+    iput-wide v2, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mPositionAtStateChange:J
+
+    invoke-static {}, Landroid/os/SystemClock;->elapsedRealtime()J
+
+    move-result-wide v2
+
+    iput-wide v2, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mStateChangeTime:J
+
+    invoke-direct {p0}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->flushLocked()V
+
+    :early_return
     monitor-exit p0
 
     return-void
