@@ -39,10 +39,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _thumb2asm import Asm
 
 STOCK_MD5         = "3af1d4ad8f955038186696950430ffda"
-OUTPUT_MD5        = "f84a04d09b2b86abd3d28b7d67c867d9"
+OUTPUT_MD5        = "5f3475fc22cf19aee7312a88425544d4"
 
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "28bceaa22a6d9c0831e4acb0fc808c4a"
+OUTPUT_DEBUG_MD5  = "556c40345ad7115f8cae9fec60f55d6d"
 
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
@@ -428,6 +428,57 @@ BASE_PATCHES = [
         "offset": 0x6df42,
         "before": bytes([0x84, 0xf8, 0xf2, 0x00]),  # strb.w r0, [r4, #0xf2]
         "after":  bytes([0x00, 0xbf, 0x00, 0xbf]),  # nop; nop
+    },
+    {
+        # M10 — Path A `chan+0xf2` GATE-CHECK bypass at fcn.0x6df20:0x6df3a.
+        #
+        # Companion to M3. M3 NOPs ONE of two writers of `chan+0xf2` (the
+        # outbound serialization SET at `0x6df42`). The OTHER writer at
+        # `fcn.0x6d9ac:0x6dda8` (inbound-AVRCP-CMD callback path; fires
+        # when the callback returns CType=0x0F INTERIM) is left intact —
+        # NOPping it broke Sonos (see Sonos 1640 regression at M9 revert
+        # df133fa: Sonos's PSC CHANGED count went from 6 → 0 and ev=01
+        # re-registration cycle stopped; the strb at 0x6dda8 is part of
+        # the inbound-CMD acknowledgement state machine Sonos depends on).
+        #
+        # The CHECK at `0x6df3a` (`cbnz r3, 0x6df52`) drops the outbound
+        # frame with rc=0xb if `chan+0xf2 != 0`. M3 alone doesn't disarm
+        # the gate because the inbound SET at `0x6dda8` still fires for
+        # every RegisterNotification CMD whose callback returns INTERIM,
+        # leaving `chan+0xf2 = 1` indefinitely for sparse-re-registration
+        # CTs (Bolt EV: registers ev=01 once at pair time, then waits
+        # 18+ seconds before any state change; chan+0xf2 stays set the
+        # whole window and the PSC CHANGED emit at the state edge drops).
+        # Sonos works pre-M10 because it re-registers ev=01 ~9 times per
+        # session, and the L2CAP TX-complete callbacks for those INTERIM
+        # responses cycle the flag through CLEAR sites in fcn.0x6da50
+        # fast enough that the CHANGED emit windows usually find
+        # chan+0xf2 = 0.
+        #
+        # M10 NOPs the CHECK instead of the SET. After M10, the gate is
+        # informational only (`chan+0xf2` still gets read at 0x6df36
+        # but the result no longer controls flow). Both readers of the
+        # flag (`0x6df2a` and `0x6df36`) are inside `fcn.0x6df20`, and
+        # only the second (`0x6df36`) feeds the cbnz. The first read
+        # at `0x6df2a` is for an xlog format-string call (log level 0xc,
+        # filtered out of btlog) — no functional impact.
+        #
+        # Verified safe via exhaustive byte search of `[r4, #0xf2]` and
+        # `[r0, #0xf2]` access sites: 8 writers, 2 readers, all writers
+        # and readers in known functions. After M10, no code in mtkbt
+        # makes a flow decision based on `chan+0xf2`. The 8 writers
+        # continue to fire but their writes are dead.
+        #
+        # Race safety: mtkbt's IPC dispatcher is single-threaded
+        # (same rationale as M2/M3); fcn.0xae5e4's downstream chain
+        # (fcn.0xae418 → fcn.0x7d204 → mtk_bt_write) is a blocking
+        # UART write. No concurrent Path A emits can race on chan state.
+        # L2CAP layer's own per-channel TX queue (chan+0x2c in
+        # fcn.0xae5e4) handles ordering for back-to-back emits.
+        "name":   "[M10] Path A busy-flag GATE bypass: NOP cbnz (mtkbt 0x6df3a)",
+        "offset": 0x6df3a,
+        "before": bytes([0x53, 0xb9]),  # cbnz r3, 0x6df52
+        "after":  bytes([0x00, 0xbf]),  # nop
     },
     {
         # M4 — analogue of M2 on the TWIN outbound-frame builder fcn.0x6d0f0.
