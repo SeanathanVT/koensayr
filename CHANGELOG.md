@@ -6,7 +6,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 ### Fixed
-- Bluetooth metadata refresh and playback-indicator updates on a broader range of car head units and speakers. The wire shape Y1 emits now matches a reference AVRCP 1.3 target's: per-event transaction-id echoing, continuous CHANGED notifications across track / play-state / position / repeat-shuffle edges, monotonic track-change identifier so head units detect each new track, and clean subscription state on every fresh connection.
+- Bluetooth metadata refresh and playback-indicator updates on a broader range of car head units and speakers. The wire shape Y1 emits now matches a reference AVRCP 1.3 target's: per-event transaction-id echoing, continuous CHANGED notifications across track / play-state / position / repeat-shuffle edges, spec-compliant track-change identifier so head units detect each new track, and clean subscription state on every fresh connection.
 - Metadata no longer freezes on head units that close the audio stream between tracks. The Bluetooth stack now keeps the AVRCP control channel open across audio stream open/close cycles, so the head unit's metadata view stays in sync without re-handshaking after every track skip.
 - Restored the public-browse-group SDP attribute on the AVRCP Target record. Some head units (notably Chevy Bolt EV) read this attribute as a discriminator for "this peer supports full AVRCP" — without it, those head units silently fell back to forwarding only key presses (PLAY / PAUSE / NEXT / PREV) and never requested metadata.
 - Discrete PAUSE on head units with separate Play and Pause buttons now pauses idempotently instead of toggling.
