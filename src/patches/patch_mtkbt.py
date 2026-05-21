@@ -39,10 +39,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _thumb2asm import Asm
 
 STOCK_MD5         = "3af1d4ad8f955038186696950430ffda"
-OUTPUT_MD5        = "f84a04d09b2b86abd3d28b7d67c867d9"
+OUTPUT_MD5        = "6ed897253b6513c62de20285697c8012"
 
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "28bceaa22a6d9c0831e4acb0fc808c4a"
+OUTPUT_DEBUG_MD5  = "0cd08fe321c24b8c80652b17193571cc"
 
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
@@ -427,6 +427,56 @@ BASE_PATCHES = [
         "name":   "[M3] Chip-busy gate bypass: NOP set-busy-flag (mtkbt 0x6df42)",
         "offset": 0x6df42,
         "before": bytes([0x84, 0xf8, 0xf2, 0x00]),  # strb.w r0, [r4, #0xf2]
+        "after":  bytes([0x00, 0xbf, 0x00, 0xbf]),  # nop; nop
+    },
+    {
+        # M9 — second writer of `chan+0xf2` (the Path A busy gate M3 reads).
+        #
+        # `fcn.0x6df20` (M3-patched) is one writer. The OTHER writer is
+        # `fcn.0x6d9ac:0x6dda8`, reached from mtkbt's inbound AVRCP CMD
+        # processing path. When an inbound RegisterNotification CMD arrives,
+        # mtkbt invokes the upper-layer callback. If the callback returns
+        # CType=0x0F (INTERIM — the normal "I'll respond with INTERIM and
+        # keep this subscription open for a CHANGED later" semantic), this
+        # site sets chan+0xf2 = 1, and EVERY subsequent Path A outbound
+        # frame on this channel silently drops at `fcn.0x6df20:0x6df3a`
+        # (cbnz r3, 0x6df52; rc=0xb) until the flag is cleared on L2CAP
+        # TX-complete via fcn.0x6d9ac:0x6d9f0 / 0x6da10.
+        #
+        # **This is what dropped PSC CHANGED frames for Bolt** (deep-RE
+        # 2026-05-21): Bolt sent RegNotify(ev=0x01) once at pair time, the
+        # callback returned INTERIM, chan+0xf2 = 1, the INTERIM frame
+        # shipped (one len=15 INTERIM observed in btlog), and then every
+        # subsequent PSC CHANGED emit from T9 — 3 attempts in the test
+        # session, all matched by EXTADP_AVRCP "send msg success" log
+        # entries — silently dropped because the L2CAP completion didn't
+        # arrive in the window before T9 fired. PPC/NPC/TC CHANGEDs ship
+        # because their inbound RegNotify cadence (PPC re-registers every
+        # second, NPC/TC have less frequent emits) keeps the flag-clear
+        # cycle ahead of the emit attempts. PSC has no re-register cadence
+        # from §6.7.1-strict CTs, so the post-INTERIM stale flag persists.
+        #
+        # Disasm at 0x6dda2..0x6ddac:
+        #   0x6dda2: cmp  r1, #0xf          ; if callback CType == INTERIM
+        #   0x6dda4: bne  0x6de94            ; not INTERIM → skip
+        #   0x6dda6: movs r1, #1
+        #   0x6dda8: strb.w r1, [r4, #0xf2]  ; ← the SET we NOP
+        #   0x6ddac: b    0x6de94
+        # Both paths converge at 0x6de94; the only side effect of 0x6dda8
+        # is the flag write. NOPping leaves control flow intact.
+        #
+        # Safe to NOP: M3's rationale applies — the completion handler at
+        # fcn.0x6d9ac:0x6d9f0/0x6da10 still clears the flag on ACK events
+        # (harmless no-op when already 0). mtkbt's IPC dispatcher is
+        # single-threaded; no concurrency race on the per-channel state.
+        # M4-style argument that Path B is unaffected doesn't apply here
+        # because (a) all AVRCP RegNotify INTERIM/CHANGED responses
+        # actually go through Path A (event_id != 0 at fcn.0xf0bc:0xf12a),
+        # not Path B as M4's docstring claims; (b) chan+0xf2 is read only
+        # by the Path A gate.
+        "name":   "[M9] Path-A busy-flag second-writer bypass: NOP inbound-callback SET (mtkbt 0x6dda8)",
+        "offset": 0x6dda8,
+        "before": bytes([0x84, 0xf8, 0xf2, 0x10]),  # strb.w r1, [r4, #0xf2]
         "after":  bytes([0x00, 0xbf, 0x00, 0xbf]),  # nop; nop
     },
     {

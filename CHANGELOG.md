@@ -11,6 +11,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 - Restored the public-browse-group SDP attribute on the AVRCP Target record. Some head units (notably Chevy Bolt EV) read this attribute as a discriminator for "this peer supports full AVRCP" — without it, those head units silently fell back to forwarding only key presses (PLAY / PAUSE / NEXT / PREV) and never requested metadata.
 - Discrete PAUSE on head units with separate Play and Pause buttons now pauses idempotently instead of toggling.
 - Spurious paused-state blips no longer interrupt head-unit playback indicators during track changes.
+- Play/Pause button on head units that subscribe to PlaybackStatusChanged once and don't re-register (Bolt EV) now reflects Y1's actual play state. The Bluetooth stack was silently dropping PlaybackStatusChanged CHANGED responses on the wire whenever the inbound subscription had been processed but the previous L2CAP send hadn't completed; head units never saw the play→pause→play transitions and their UI stayed at the initial cached value.
 
 ### Changed
 - Track-info exchange between the music app and the Bluetooth stack now uses shared memory instead of an atomic write + rename to disk on every state change. The data file (`/data/data/com.innioasis.y1/files/y1-track-info`) ships a double-buffered schema and the Bluetooth-side reader memory-maps it once. End-user impact: lower-latency metadata responses (single-digit ms vs ~25 ms) under sustained head-unit polling, no torn reads while a track edge is mid-flush.
