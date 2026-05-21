@@ -7277,3 +7277,83 @@ If a non-destructive path to adding a 7th attribute entry is found later (e.g., 
 ### Spec basis
 
 Per Bluetooth Core specification (Volume 3, Part B, §2.2), `0x0005 BrowseGroupList` is OPTIONAL but standard practice is to advertise `{PublicBrowseRoot}` (UUID `0x1002`) so that `SDP_ServiceSearchPattern` against `0x1002` returns the record. Some CT implementations use BrowseGroupList membership as a heuristic for "is this peer a fully-implemented BT profile target or a stub". Bolt EV is empirically in that group.
+
+---
+
+## Trace #88 — 2026-05-21 Debug-build SIGSEGV in `BTAvrcpMusicAda`: T5id log clobbers T5's conn struct ptr
+
+### Symptom
+
+`dual-sonos-20260521-1841`: 12 ms after Sonos drives a track change, MtkBt (PID 1065, thread `BTAvrcpMusicAda`) takes `SIGSEGV` at fault addr `0x00000019`. ActivityManager schedules a restart of every `com.mediatek.bluetooth` service; the process death wipes `g_avrcp_req_event_database` (`.bss`), so per-event subscriptions established earlier in the session are lost and Sonos's PSC/Track CHANGED subscriptions never recover. Net effect: pause-button glyph stops flipping back to play after the first track edge.
+
+Release build (`OUTPUT_MD5 = 5c8ab18…`) does not reproduce. The crash only occurs in `KOENSAYR_DEBUG=1` builds (deployed `OUTPUT_DEBUG_MD5 = c83182e9…`).
+
+### Decoding the tombstone
+
+```
+F libc    : Fatal signal 11 (SIGSEGV) at 0x00000019 (code=1), thread 1462 (BTAvrcpMusicAda)
+I DEBUG   :     r0 00000008  r1 00000009  r2 527242b5  r3 00000001
+I DEBUG   :     r4 00000000  r5 5177b9d8  r6 00000007  r7 522e6ec8
+I DEBUG   :     ... lr 52722047  pc 5272277e
+I DEBUG   :     #00  pc 0000b77e  /system/lib/libextavrcp_jni.so
+I DEBUG   :     #01  pc 0000b043  /system/lib/libextavrcp_jni.so
+```
+
+Load base `0x52717000` (from `pc - 0xb77e`). The `code around pc` dump shows the actual instruction at vaddr `0xb77e` is `7443` (Thumb-1 `strb r3, [r0, #0x11]`) — the tail of `restore_conn_tid`. With `r0=8`, the store targets `[8 + 0x11] = [0x19]` → `SEGV_MAPERR`. `lr=0x52722047` (Thumb bit set; return addr `0xb046`) lands two instructions past a `bl restore_conn_tid` inside a per-event emit dispatch arm.
+
+The disassembly of the caller arm shows it is inside `notificationTrackChangedNative`'s patched wrapper (= T5):
+
+```
+b034: 09 21          movs r1, #9            ; event_id = 0x09 NPCC
+b036: 00 f0 af fb    bl   event_subscribed
+b03a: 08 d0          beq  +8                 ; skip if database[9] == 0
+b03c: 04 f1 08 00    add.w r0, r4, #8        ; r0 = conn = r4 + 8  ← r4 is NULL
+b040: 09 21          movs r1, #9
+b042: 00 f0 97 fb    bl   restore_conn_tid   ; strb r3, [r0, #0x11] = strb [0x19]
+```
+
+### Root cause
+
+`_emit_t5` stores the `BluetoothAvrcpService` struct ptr in `r4` at its prologue (line 779: `mov_lo_lo(4, 0)` after `bl jni_get_avrcp_state`). Every CHANGED emit in T5's chain — POS_CHANGED, TRACK_CHANGED, NowPlayingContentChanged, REACHED_END, REACHED_START — does `add.w r0, r4, #8` to recompute the conn ptr before invoking the per-event response builder.
+
+At T5's TRACK_CHANGED emit site (line 885), the debug-only `T5id` log captures `selected_track_id[7]` (always 0; the SELECTED-track AVRCP 1.3 §6.7.2 sentinel) for diagnostics:
+
+```python
+if DEBUG_NATIVE_LOG:
+    a.ldrb_w(4, 3, 7)                     # r4 = id[7]
+    _emit_native_log_u32(a, "log_fmt_t5id", 4)
+```
+
+`_emit_native_log_u32` push/pops `{r0, r1, r2, r3}` around the `__android_log_print` blx (the comment block at `_trampolines.py:2228` is explicit: *"caller has its full r0..r3 arg vector already loaded ... so push/pop all four caller-arg registers around the call to preserve the emit's setup"*). It does **not** save r4 — r4 is the *value-passing* register, and the helper's contract was written assuming the caller could spare it.
+
+In T5 the caller cannot spare r4. The `ldrb_w(4, 3, 7)` overwrites the conn struct ptr with `selected_track_id[7] = 0`. The TRACK_CHANGED `blx_imm(PLT_track_changed_rsp)` immediately following uses r0-r3 (which are correct) and tail-returns. The next event in the chain — NPCC at `0xb03c` — recomputes `r0 = r4 + 8`. With r4 now `0`, `r0 = 8`. `restore_conn_tid`'s final `strb r3, [r0, #0x11]` writes `[0x19]` → fault.
+
+### Why only debug, why only NPCC
+
+- **Debug only**: `DEBUG_NATIVE_LOG` is `False` in release builds — the `ldrb_w(4, 3, 7)` isn't emitted. r4 stays intact through the whole emit chain.
+- **NPCC first**: T5's chain is PPC → TC → NPCC → REACHED_END → REACHED_START. The clobber happens at TC's debug log (after r4-based setup). PPC fires before the clobber. TC fires immediately after the clobber but doesn't read r4 between the log and the blx (r0-r3 are already loaded). NPCC is the first downstream emit whose `event_subscribed` gate passes — that's the one that crashes. (POS_CHANGED at the chain's *head* fires before the clobber and was fine; the crash is specifically when database[9] != 0, i.e., the CT subscribed to NPCC. Sonos does.)
+
+### Identical pattern is harmless at two other sites
+
+`_emit_t4` (line 477) and `_emit_extended_t2` (line 742) have the same `ldrb_w(4, 3, 7); _emit_native_log_u32(..., 4)` pattern, but both functions store the conn struct ptr in r5 (not r4). The r4 clobber at those sites lands on a scratch register that nothing reads. Latent code smell, not a live bug.
+
+### Fix
+
+Wrap T5's debug log with `push {r4} / pop {r4}` so the conn struct ptr survives the value-passing clobber:
+
+```python
+if DEBUG_NATIVE_LOG:
+    a.raw(bytes([0x10, 0xB4]))            # push {r4}
+    a.ldrb_w(4, 3, 7)
+    _emit_native_log_u32(a, "log_fmt_t5id", 4)
+    a.raw(bytes([0x10, 0xBC]))            # pop  {r4}
+```
+
+Cost: +4 B (debug build only). Debug blob 3392 → 3396 B, headroom 628 → 624 B against the 4020 B cave. Release blob unchanged (3152 B).
+
+T4 and extended_T2 left untouched — the clobber is harmless there and a defensive push/pop would only add bytes without changing behaviour.
+
+### MD5 pin update
+
+- `OUTPUT_MD5`: `5c8ab181c221d3c31739fe5955f7a25b` (unchanged — release-side bytes are identical)
+- `OUTPUT_DEBUG_MD5`: `c83182e95edcaa0951ae1ca38fa0a350` → `778991030950699c2e2861bc7e457556`

@@ -882,8 +882,17 @@ def _emit_t5(a: Asm) -> None:
     a.movs_imm8(2, REASON_CHANGED)
     a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§5.14.1 SELECTED)
     if DEBUG_NATIVE_LOG:
+        # T5 stores the conn struct ptr in r4 and re-reads it before every
+        # subsequent emit in the chain (NPCC, REACHED_END, REACHED_START).
+        # _emit_native_log_u32 only preserves r0-r3 across the log call —
+        # r4 is the value-passing register, so a bare `ldrb_w(4, 3, 7)`
+        # would drop the conn struct ptr on the floor and the next
+        # `add.w r0, r4, #8` would dereference 0x19. Push/pop around the
+        # log keeps r4 intact.
+        a.raw(bytes([0x10, 0xB4]))            # push {r4}
         a.ldrb_w(4, 3, 7)                     # r4 = id[7] (always 0; SELECTED)
         _emit_native_log_u32(a, "log_fmt_t5id", 4)
+        a.raw(bytes([0x10, 0xBC]))            # pop  {r4}
     a.blx_imm(PLT_track_changed_rsp)
 
     # state[16] stays armed across CHANGED — universal §5.4.2 reading.
