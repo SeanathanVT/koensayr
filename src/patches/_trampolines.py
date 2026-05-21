@@ -2966,9 +2966,8 @@ def _emit_t9(a: Asm) -> None:
     a.raw(bytes([0x08, 0xBC]))                # pop {r3}
     a.movs_imm8(1, 0)                         # success
     a.movs_imm8(2, REASON_CHANGED)
-    # Trampoline-side `T9emit pos=` log dropped 2026-05-19 to free budget
-    # for the per-event-TID restore code; the mtkbt-side `M5wire c39=` (D1
-    # cave) covers wire-emit timing for position frames.
+    if DEBUG_NATIVE_LOG:
+        _emit_native_log_u32(a, "log_fmt_t9pos", 3)
     a.blx_imm(PLT_reg_notievent_pos_changed_rsp)
 
     # state[13] stays armed across CHANGED — see T5 TRACK_CHANGED arm.
@@ -3117,6 +3116,12 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         a.align(4)
         a.label("log_fmt_t9papp")
         a.asciiz("T9papp")
+        a.align(4)
+        # Position CHANGED live_pos value (host-order u32 ms). Pair with
+        # M5wire c39= for wire-emit confirmation. Verifies "frozen in time"
+        # symptom = stale value shipped (vs CT-side render bug).
+        a.label("log_fmt_t9pos")
+        a.asciiz("T9pos=%08x")
         a.align(4)
         # Inbound RegisterNotification entry marker — confirms extended_T2
         # was reached on a PDU=0x31 CMD. value = event_id. Pair with the
