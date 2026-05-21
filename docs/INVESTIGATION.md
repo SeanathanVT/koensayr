@@ -7199,3 +7199,81 @@ Blob size impact: zero (the PC-relative offset changes value but stays 4 bytes).
 1. `__bss_start` is a hostile location for tucking in new globals. The linker collects uninitialized statics from individual compilation units at the beginning of `.bss`, so stripped/local statics cluster near `__bss_start`. Gaps *between* named globals are safer because the linker has already accounted for both endpoints.
 2. The `axt` query on radare2's full analysis is the cheapest verification for "is this `.bss` address used by stock code". Run it per-byte over any candidate range before committing.
 3. Bisection by flashing successive commits is *much* faster than static analysis when the bug is a single commit's regression. User's flash-box workflow turned this from a multi-day RE problem into a 4-flash bisection in ~45 minutes.
+
+---
+
+## Trace #87 — 2026-05-21 Bolt CT skips full AVRCP setup when BrowseGroupList is absent; P_PN1 reverted
+
+### Symptom
+
+After commit `f19ad7c` (added `0x0102 ProviderName " "` SDP attribute to AVRCP 1.3 TG record by repurposing the `0x0005 BrowseGroupList` entry slot), Bolt's AVRCP CT connects to Y1, issues a single `GetCapabilities` CMD, receives the response, then goes completely silent on AVRCP for the rest of the session. No `InformDisplayableCharacterSet`, no `RegisterNotification × 9` (the spec-default subscription burst), no `GetElementAttributes`. Bolt's HU UI shows no metadata and does not refresh on track skip. PASSTHROUGH still works because that's a CT→TG flow Bolt initiates without prior subscription.
+
+Pre-f19ad7c (e.g. `dual-bolt-20260519-2112` at commit `52a8a80..105eef5`): same Bolt issued the full handshake — GetCap → InformDisplayableCharacterSet → RegNotif × 9 → CHANGED-driven steady state with 93 inbound `T2reg` re-subscriptions visible across the session.
+
+### Decisive capture
+
+`dual-bolt-20260520-2154` was a deliberate "pair fresh, wait 100 s, don't touch anything" capture against `HEAD=5db2aee` (post-`f19ad7c`). Y1 logcat shows:
+
+```
+21:54:18  capture starts (BT process up, PID 701)
+21:54:52  Bolt connect_ind
+21:54:52  Bolt → Y1: GetCap CMD (size:9 vendor-dependent)
+21:54:52  Y1 → Bolt: GetCap RSP (IPC msg=522, AVRCP_SendMessage len=30)
+21:54:52  M5dbg / M5wire pair for the GetCap RSP outbound frame
+─────────────────────  100 s of total AVRCP silence  ─────────────────────
+21:55:19  screen off
+21:56:33  capture ends
+```
+
+`grep "T2reg"` over the session: **zero** matches. Bolt's CT didn't issue a single `RegisterNotification` and the user touched no controls. The "wait it out" hypothesis (Bolt was racing user input ahead of CT setup) is ruled out — Bolt actively chose passthrough-only mode based on what it observed about Y1.
+
+### Bisection
+
+| Commit | Date (UTC) | Capture | T2reg |
+|---|---|---|---|
+| `52a8a80..105eef5` | May 19 ~21:00 | dual-bolt-20260519-2112 | **93** (Bolt does full setup) |
+| `f19ad7c`..`5db2aee` | May 20 22:00+ | dual-bolt-20260520-2154 | **0** (Bolt silent on AVRCP) |
+
+The only mtkbt-affecting commit between the two ranges that touches SDP record shape is `f19ad7c` (P_PN0 + P_PN1). M8 (`dd8a85d`) is the other mtkbt commit in the window but it touches `AVRCP_HandleA2DPInfo`'s info=1 disconnect path — a runtime post-track-skip behavior that doesn't affect what the CT observes during AVRCP setup. The .bss state move at `e2719c7` + relocation fix at `5db2aee` are libextavrcp_jni.so changes orthogonal to SDP record contents.
+
+### Verification: Pixel ships both attributes, our patch shipped only one
+
+`f19ad7c`'s commit message claimed "Pixel parity" — Pixel's AVRCP 1.3 TG record advertises `0x0102 ProviderName " "`. The XML (`/work/logs/pixel4-sdptool-browse-avrcp-1.3.xml`) confirms:
+
+```xml
+<attribute id="0x0005">
+    <sequence>
+        <uuid value="0x1002" />            ← BrowseGroupList = PublicBrowseRoot
+    </sequence>
+</attribute>
+<attribute id="0x0102">
+    <text value=" " />                     ← ProviderName = " "
+</attribute>
+```
+
+Pixel ships **both** `0x0005` and `0x0102`. P_PN1's wire delta swapped `0x0005 BrowseGroupList → 0x0102 ProviderName` (one slot, swap not add). So our "Pixel parity" patch actually shipped a TG record with `0x0102` present *but `0x0005` absent* — the opposite of Pixel's shape for `0x0005`. Bolt's CT reads BrowseGroupList membership (`{PublicBrowseRoot}`) as a discriminator for "this peer is in the public browse group and supports full AVRCP" vs "treat as minimal/legacy"; removing it dropped Bolt onto the minimal path.
+
+### Deep RE on adding a 7th entry slot
+
+To restore `BrowseGroupList` AND ship `ProviderName`, the AVRCP 1.3 TG record's entry table needs 7 entries instead of 6. Confirmed during the deep dive:
+
+- Entry table at file `0xf978c` (vaddr `0xfa78c`, in LOAD1 / `.data`) holds exactly 6 attribute entries × 12 bytes (`attr_id(2) + len(2) + ptr(4) + zeros(4)`), tightly packed.
+- Next SDP record begins immediately at `0xf97c8`; no padding or gap.
+- Searched the entire binary for any 4-byte value equal to vaddr `0xfa78c` or file offset `0xf978c`: only the `R_ARM_RELATIVE` relocation entries in `.rel.dyn` reference these addresses. Those are bookkeeping for the dynamic loader's pointer fixups, not an SDP-specific entry index.
+- The single consumer function found by radare2 `aaaa` xrefs (`fcn.0x43a18`) scans the table with a hardcoded `cmp sl, 0x14` (20 iterations × 4-byte stride = 80 bytes = 6 entries plus 8 bytes slop) — not a per-record attribute count, just a fixed scan bound. Adjusting it would affect every other caller of the function.
+- mtkbt's binary has 230 dynamic symbols; none are named `SDP_*`, `Sdp_*`, or anything related to record iteration. Static symbols are fully stripped. The actual SDP record-builder function that iterates entries to construct on-wire responses can't be found by symbol name.
+- Sdptool against Y1 confirms the daemon serves attribute `0x0002 ServiceRecordState` and `0x0000 ServiceRecordHandle` for this record — neither is in the 6-slot entry table. So mtkbt definitely has a mechanism for adding attributes outside the table; the mechanism just isn't exposed via labeled symbols or obvious data structures.
+
+After deep search, **no safe, verified path to add a 7th entry was found**. Inserting bytes between records (shifting the next record's entries forward by 12) requires understanding all code that addresses the affected entries, which the stripped binary doesn't make tractable in reasonable time.
+
+### Fix
+
+Revert `P_PN1`. Keep `P_PN0`. The descriptor bytes for `0x0102 ProviderName " "` remain written into a previously-unused gap at file `0x0eb938`, but no entry slot references them — they're dormant. The TG record returns to its post-V7+V8 shape: `BrowseGroupList={PublicBrowseRoot}` present, `0x0102 ProviderName` absent. Bolt's CT sees the BrowseGroupList membership and takes the full-AVRCP-setup path.
+
+### Future work
+
+If a non-destructive path to adding a 7th attribute entry is found later (e.g., locating the daemon's implicit-attribute injection point that adds `0x0002 ServiceRecordState`, or finding a record-builder count-limit constant that's per-record rather than global), `P_PN0` is already in place — only a `P_PN1`-style entry write would be needed. Until then, "every spec-meaningful attribute except `0x0102 ProviderName`" is the closest Pixel parity we can ship.
+
+### Spec basis
+
+Per Bluetooth Core specification (Volume 3, Part B, §2.2), `0x0005 BrowseGroupList` is OPTIONAL but standard practice is to advertise `{PublicBrowseRoot}` (UUID `0x1002`) so that `SDP_ServiceSearchPattern` against `0x1002` returns the record. Some CT implementations use BrowseGroupList membership as a heuristic for "is this peer a fully-implemented BT profile target or a stub". Bolt EV is empirically in that group.
