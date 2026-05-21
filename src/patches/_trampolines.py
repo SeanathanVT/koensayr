@@ -362,6 +362,8 @@ def _emit_t4(a: Asm) -> None:
     # PDU 0x30 → GetPlayStatus (T6)
     # else     → restore lr canary + r0 and fall through to "unknow indication"
     a.ldrb_w(0, 13, T4_PDU_OFF_ENTRY)         # r0 = PDU
+    if DEBUG_NATIVE_LOG:
+        _emit_native_log_u32(a, "log_fmt_t1pdu", 0)
     a.cmp_imm8(0, 0x20)
     a.beq("t4_main")
     # PDU 0x17 / 0x18 / 0x30 dispatch via bne+b.w because T_charset / T_battery
@@ -471,6 +473,9 @@ def _emit_t4(a: Asm) -> None:
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_CHANGED)
     a.bl_w("incr_and_get_track_identifier")   # r3 = &id_buf (counter++)
+    if DEBUG_NATIVE_LOG:
+        a.ldrb_w(4, 3, 7)                     # r4 = id_buf[7] (post-incr counter)
+        _emit_native_log_u32(a, "log_fmt_t5id", 4)
     a.blx_imm(PLT_track_changed_rsp)
 
     # Update state in-memory: state[0..7] = file[0..7]
@@ -733,6 +738,9 @@ def _emit_extended_t2(a: Asm) -> None:
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
     a.movs_imm8(2, REASON_INTERIM)
     a.bl_w("incr_and_get_track_identifier")   # r3 = &id_buf (counter++)
+    if DEBUG_NATIVE_LOG:
+        a.ldrb_w(4, 3, 7)                     # r4 = id_buf[7] (post-incr counter)
+        _emit_native_log_u32(a, "log_fmt_t5id", 4)
     a.blx_imm(PLT_track_changed_rsp)
 
     # No separate "arm" write needed: save_event_seq_id (called at the top
@@ -874,9 +882,8 @@ def _emit_t5(a: Asm) -> None:
     a.movs_imm8(2, REASON_CHANGED)
     a.bl_w("incr_and_get_track_identifier")   # r3 = &id_buf (counter++)
     if DEBUG_NATIVE_LOG:
-        # No-arg fmt; r3 ignored by printf. Confirms TRACK_CHANGED CHANGED
-        # emit fires per track edge.
-        _emit_native_log_u32(a, "log_fmt_t5tc", 3)
+        a.ldrb_w(4, 3, 7)                     # r4 = id_buf[7] (post-incr counter)
+        _emit_native_log_u32(a, "log_fmt_t5id", 4)
     a.blx_imm(PLT_track_changed_rsp)
 
     # state[16] stays armed across CHANGED — universal §5.4.2 reading.
@@ -3108,8 +3115,8 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         # the §6.7.1 loose-clear refactor: if a given event's CHANGED never
         # appears in a session that should produce one, the state[N] gate
         # never armed (T8/extended_T2 INTERIM didn't run for that event).
-        a.label("log_fmt_t5tc")
-        a.asciiz("T5tc")
+        a.label("log_fmt_t5id")
+        a.asciiz("T5id=%02x")
         a.align(4)
         a.label("log_fmt_t9ps")
         a.asciiz("T9ps")
@@ -3130,6 +3137,14 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         # CHANGED gate skipped" (T2reg ev=N present, no matching T5tc/T9ps).
         a.label("log_fmt_t2reg")
         a.asciiz("T2reg ev=%02x")
+        a.align(4)
+        # Inbound non-RegNotif CMD PDU dispatcher entry. RegNotif (0x31)
+        # has T2reg already; T1pdu covers GetCap (0x10), PApp (0x11..0x16),
+        # Charset (0x17), Battery (0x18), GetEA (0x20), GetPlayStatus
+        # (0x30), Continuation (0x40/0x41). Tells us what CT sends after
+        # a CHANGED emit.
+        a.label("log_fmt_t1pdu")
+        a.asciiz("T1pdu=%02x")
         a.align(4)
 
     # PApp UTF-8 attribute / value text strings (charset 0x006A).
