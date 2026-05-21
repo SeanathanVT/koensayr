@@ -7357,3 +7357,33 @@ T4 and extended_T2 left untouched — the clobber is harmless there and a defens
 
 - `OUTPUT_MD5`: `5c8ab181c221d3c31739fe5955f7a25b` (unchanged — release-side bytes are identical)
 - `OUTPUT_DEBUG_MD5`: `c83182e95edcaa0951ae1ca38fa0a350` → `778991030950699c2e2861bc7e457556`
+
+---
+
+## Trace #89 — 2026-05-21 Delete T5id debug log (dead code; resolves #88 bug class)
+
+### Motivation
+
+Trace #88 fixed the T5 `r4`-clobber crash by wrapping the `T5id` debug log in `push {r4} / pop {r4}`. That fix preserved a log that, on review, has no actual diagnostic value:
+
+- **Value is constant.** `T5id=%02x` always logs `00` — `selected_track_id` is a static `.rodata` buffer of eight zero bytes (AVRCP 1.3 §6.7.2 SELECTED sentinel). The byte cannot become non-zero at runtime (no mprotect writer).
+- **Source site is indistinguishable.** The same `log_fmt_t5id` format string is used at all three call sites (T4 reactive CHANGED, extended_T2 INTERIM, T5 proactive CHANGED). Logcat shows `T5id=00` but doesn't say which path fired.
+- **Never cited as load-bearing.** Across 88 prior INVESTIGATION traces, `T5id` is referenced exactly once — by Trace #88, which documents it causing a crash. No trace ever used it as a positive diagnostic signal. Other Y1T tags (`T2reg`, `T9ps`, `T9papp`, `T9pos`) already confirm CHANGED emits with site-distinguishing names.
+
+The log was probably added during the Identifier-value design churn (commits `9c4ae0e` monotonic-counter → `53e6153` SELECTED 0x00*8) as a sanity check that the wire payload settled at the spec-correct zero value. Once the design stabilised, the log became dead weight.
+
+### Action
+
+Deleted all three `if DEBUG_NATIVE_LOG: ldrb_w(4, 3, 7); _emit_native_log_u32(a, "log_fmt_t5id", 4)` blocks plus the `log_fmt_t5id` label and asciiz. Also removed the row from `docs/PATCHES.md` and the mention from `src/patches/README.md`'s Y1T tag inventory. T1pdu / T2reg cross-references updated to drop the `T5id` pointer.
+
+### Net effect vs. b1c113d (Trace #88's fix)
+
+- T5 `r4` clobber cannot recur: the source-code pattern that produced it no longer exists at any site.
+- The `push {r4} / pop {r4}` scaffolding from b1c113d is gone — there's nothing to guard against.
+- Debug blob: 3396 B → 3308 B (88 B saved: 3 × ~26 B per call site + ~10 B for the dropped format string).
+- Release blob: 3152 B (unchanged — `DEBUG_NATIVE_LOG` was already gating release-side emission).
+
+### MD5 pin update
+
+- `OUTPUT_MD5`: `5c8ab181c221d3c31739fe5955f7a25b` (unchanged)
+- `OUTPUT_DEBUG_MD5`: `778991030950699c2e2861bc7e457556` → `c81d15339c73ec4db6703eb03c25cc59`
