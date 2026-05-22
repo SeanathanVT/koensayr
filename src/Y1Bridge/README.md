@@ -44,7 +44,7 @@ declare the `<service>` MtkBt's `bindService` resolves to.
   20–23, 32–37) ack with the success replies that keep
   `BTAvrcpMusicAdapter.mRegBit` armed.
 - The proactive wake path is independent of the Binder: the music app
-  fires `com.android.music.metachanged` / `playstatechanged`, MtkBt's
+  fires `com.android.music.metachanged` / `com.android.music.playstatechanged`, MtkBt's
   cardinality-NOP-patched JNI natives fire, and the trampoline chain in
   `libextavrcp_jni.so` builds the wire response from the same
   `y1-track-info` file.

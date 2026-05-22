@@ -118,10 +118,10 @@ The advertised set in the GetCapabilities response (T1's `EventsSupported` array
 | 0x02 | TRACK_CHANGED | §5.4.2 Tbl 5.30 | ✓ extended_T2 | ✓ T5 on track edge (gated on `database[2] != 0`) |
 | 0x05 | PLAYBACK_POS_CHANGED | §5.4.2 Tbl 5.33 | ✓ T8 | ✓ T9 at ~1Hz while playing + T5 on track edge (gated on `database[5] != 0`) |
 | 0x08 | PLAYER_APPLICATION_SETTING_CHANGED | §5.4.2 Tbl 5.37 | ✓ T8 (reads `y1-track-info[795..796]`) | ✓ T9 on Repeat/Shuffle edge (gated on `database[8] != 0`) |
-| 0x09 | NOW_PLAYING_CONTENT_CHANGED | AVRCP 1.4 §6.9.5 | ✓ T8 (zero/empty payload) | ✓ T5 on track edge + T9 on play/pause edge (gated on `database[9] != 0`) |
-| 0x0a | AVAILABLE_PLAYERS_CHANGED | AVRCP 1.4 §6.9.4 | ✓ T8 (zero/empty payload) | n/a (Y1 has one player) |
-| 0x0b | ADDRESSED_PLAYER_CHANGED | AVRCP 1.4 §6.9.2 | ✓ T8 (PlayerID=0, UidCtr=0) | n/a (Y1 has one player) |
-| 0x0c | UIDS_CHANGED | AVRCP 1.4 §6.10.3.3 | ✓ T8 (UidCtr=0) | n/a (Y1 has no UID database) |
+| 0x09 | NOW_PLAYING_CONTENT_CHANGED | 1.4+ event ID | ✓ T8 (zero/empty payload) | ✓ T5 on track edge + T9 on play/pause edge (gated on `database[9] != 0`) |
+| 0x0a | AVAILABLE_PLAYERS_CHANGED | 1.4+ event ID | ✓ T8 (zero/empty payload) | n/a (Y1 has one player) |
+| 0x0b | ADDRESSED_PLAYER_CHANGED | 1.4+ event ID | ✓ T8 (PlayerID=0, UidCtr=0) | n/a (Y1 has one player) |
+| 0x0c | UIDS_CHANGED | 1.4+ event ID | ✓ T8 (UidCtr=0) | n/a (Y1 has no UID database) |
 
 ---
 
@@ -307,7 +307,7 @@ AVRCP 1.3 sits on top of AVCTP, which rides L2CAP. A2DP rides AVDTP, signalled b
 
 ### 9.2 AVRCP playback state ↔ AVDTP source state coupling — *A2DP / AVDTP* — SHIPPED
 
-**Spec.** AVDTP 1.3 §8.13 / §8.15: when AVRCP TG signals PAUSED, the A2DP source should keep the stream paused (NOT torn down); resume without renegotiation on PLAYING. SUSPEND is reserved for explicit policy changes (phone call routing, etc.), not for normal pause / silence handling.
+**Spec.** AVDTP 1.3 §8.14 / §8.15: when AVRCP TG signals PAUSED, the A2DP source should keep the stream paused (NOT torn down); resume without renegotiation on PLAYING. SUSPEND is reserved for explicit policy changes (phone call routing, etc.), not for normal pause / silence handling.
 
 **Stock deviation.** AudioFlinger's silence-timeout (~3 s after the music app stops writing samples) hits `libaudio.a2dp.default.so::A2dpAudioStreamOut::standby_l`, which calls `a2dp_stop` unconditionally → AVDTP SUSPEND on the wire. Peer CTs that aggressively close + reopen their A2DP sink on SUSPEND cycle once per pause-of-≥3 s, producing burst-on-resume audio and playhead drift.
 

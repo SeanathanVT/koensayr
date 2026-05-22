@@ -91,7 +91,7 @@ source ~/.bashrc
 
 **Gradle (this doc's setup): JDK 17 minimum.** Confirmed working: JDK 17, 21, and 25 with the in-tree AGP 9.2.0 + Gradle 9.5.0.
 
-**`patch_y1_apk.py` (invoked under `--avrcp` and `--music-apk`): JDK 11–21 only.** apktool 2.9.3's bundled smali assembler silently drops patches on Java 22+, so the music-APK patcher refuses to run on a newer JDK. If you only have JDK 22+ installed, either install a 17 or 21 alongside it and point `JAVA_HOME` at the older one before running `--avrcp`/`--music-apk`, or use the patcher's own `--skip-md5` after manually verifying its DEX-signature check passes.
+**`patch_y1_apk.py` (invoked under `--music-apk`, and by extension `--all`): JDK 11–21 only.** apktool 2.9.3's bundled smali assembler silently drops patches on Java 22+, so the patcher warns on a newer JDK and its DEX-signature check will fail. If you only have JDK 22+ installed, install a 17 or 21 alongside it and point `JAVA_HOME` at the older one before running `--music-apk`.
 
 Install whatever you prefer (within the appropriate range):
 
