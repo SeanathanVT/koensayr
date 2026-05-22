@@ -58,9 +58,9 @@ Override bundled tooling with `--mtkclient-dir <path>` / `--python-venv <path>` 
 | Flag | Effect |
 |---|---|
 | `--adb` | Append `persist.service.adb.enable=1` + `persist.service.debuggable=1` to `build.prop`. |
-| `--avrcp` | AVRCP 1.3 metadata pipeline: patches `mtkbt`, `libextavrcp.so`, `libextavrcp_jni.so`, `MtkBt.odex`, the music app, plus `Y1Bridge.apk` install. Pre-requires `gradlew assembleDebug` in `src/Y1Bridge/`. Patch ID legend in [`docs/PATCHES.md`](docs/PATCHES.md); architecture in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). |
+| `--avrcp` | AVRCP 1.3 metadata pipeline: patches `mtkbt`, `libextavrcp.so`, `libextavrcp_jni.so`, `MtkBt.odex`, `libaudio.a2dp.default.so`, `usr/keylayout/AVRCP.kl`, plus `Y1Bridge.apk` install. Pre-requires `gradlew assembleDebug` in `src/Y1Bridge/`. Patch ID legend in [`docs/PATCHES.md`](docs/PATCHES.md); architecture in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). |
 | `--bluetooth` | Pairing-essential `audio.conf` / `auto_pairing.conf` / `blacklist.conf` / `build.prop` edits. Required for car pairing. |
-| `--music-apk` | Patch Y1 music player APK (Artist→Album navigation). |
+| `--music-apk` | Patch Y1 music player APK (Artist→Album navigation; discrete PASSTHROUGH routing; media-key propagation; Y1Bridge smali injections). |
 | `--remove-apps` | Remove bloatware (`ApplicationGuide`, `BasicDreams`, …). |
 | `--root` | Install `src/su/build/su` at `/system/xbin/su` (mode 06755). Pre-requires `make` in `src/su/`. |
 | `--all` | All of the above. Pre-requires the `src/su/` + `src/Y1Bridge/` builds. |

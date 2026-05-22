@@ -55,8 +55,9 @@ declare the `<service>` MtkBt's `bindService` resolves to.
 ## What it does NOT do
 
 All AVRCP observation + state production lives in the music app
-(`com.innioasis.y1`) via the Patch B3..B6 smali injections in
-`src/patches/inject/com/koensayr/y1/*`:
+(`com.innioasis.y1`) via the Patch B3..B5 smali injections in
+`src/patches/inject/com/koensayr/y1/*` (B6's `AvrcpBinder` is dormant
+groundwork — see `docs/PATCHES.md`):
 
 - `TrackInfoWriter` — writes the 2213-byte double-buffer `y1-track-info`
   and the 2-byte `y1-papp-set` under `/data/data/com.innioasis.y1/files/`
