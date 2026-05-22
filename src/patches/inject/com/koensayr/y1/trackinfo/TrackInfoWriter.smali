@@ -651,7 +651,7 @@
 # mLastKnownDuration reset is critical: flushLocked falls back to the cached
 # duration when getPlayerIsPrepared() is false (the prepareAsync gap). Without
 # the reset, the file briefly reports the previous track's duration. 0 reads
-# as "unknown" per AVRCP §5.3.4 / 1.3 attr 0x07; the B5.2c playerPrepared-tail
+# as "unknown" per AVRCP 1.3 Appendix E attr 0x07 (PlayingTime); the B5.2c playerPrepared-tail
 # hook re-flushes once getPlayerIsPrepared() flips true.
 .method public declared-synchronized onFreshTrackChange()V
     .locals 3

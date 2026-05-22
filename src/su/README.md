@@ -31,7 +31,7 @@ make check     # asserts ARM ELF + statically linked + no NEEDED entries
 make clean
 ```
 
-Output is ~900 bytes, statically linked, stripped, no dynamic dependencies. Idempotent — re-running `make` is a no-op if sources are unchanged.
+Output is ~1-2 KB, statically linked, stripped, no dynamic dependencies. Idempotent — re-running `make` is a no-op if sources are unchanged.
 
 ## Deploy
 

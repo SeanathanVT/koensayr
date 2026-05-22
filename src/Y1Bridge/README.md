@@ -86,6 +86,6 @@ Output: `app/build/outputs/apk/debug/app-debug.apk` (~5-10 KB). `apply.bash
 
 Source is tiny — three files total:
 
-- `app/src/main/java/com/koensayr/y1/bridge/MediaBridgeService.java` (~260 lines)
-- `app/src/main/java/com/koensayr/y1/bridge/BootReceiver.java` (~28 lines)
-- `app/src/main/AndroidManifest.xml` (~43 lines)
+- `app/src/main/java/com/koensayr/y1/bridge/MediaBridgeService.java` (~440 lines)
+- `app/src/main/java/com/koensayr/y1/bridge/BootReceiver.java` (~24 lines)
+- `app/src/main/AndroidManifest.xml` (~41 lines)

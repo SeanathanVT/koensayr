@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-patch_libextavrcp.py — make GetElementAttributes response §5.3.4-compliant.
+patch_libextavrcp.py — make GetElementAttributes response §5.3.1 Table 5.24-compliant.
 
 2-byte CBZ→NOP at file offset 0x00002266 in
 btmtk_avrcp_send_get_element_attributes_rsp. Disables the "ignore empty
 attrib" check that drops zero-length attributes from the wire (a deviation
-from AVRCP 1.3 §5.3.4, which requires unsupported attributes to emit with
+from AVRCP 1.3 §5.3.1 Table 5.24, which requires unsupported attributes to emit with
 AttributeValueLength=0). T4 in libextavrcp_jni.so emits zero-length
 entries for any requested AttributeID outside 0x01-0x07; this patch lets
-those entries reach the wire so strict CTs see a §5.3.4-compliant
+those entries reach the wire so strict CTs see a §5.3.1 Table 5.24-compliant
 response shape.
 
 Byte-level reference: docs/PATCHES.md.
@@ -30,7 +30,7 @@ EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
 PATCHES = [
     {
-        "name":   "[E1] GetElementAttributes empty-attr drop -> NOP (§5.3.4 zero-length emit)",
+        "name":   "[E1] GetElementAttributes empty-attr drop -> NOP (§5.3.1 Table 5.24 zero-length emit)",
         "offset": 0x00002266,
         "before": bytes([0x88, 0xb3]),  # cbz r0, +0x62 (-> 0x22cc 'ignore empty')
         "after":  bytes([0x00, 0xbf]),  # nop T1 (fall through to emit)
@@ -72,7 +72,7 @@ def print_results(label: str, results: list[dict], mode: str) -> None:
 def main():
     parser = argparse.ArgumentParser(
         description="libextavrcp.so byte-patch — drop the 'ignore empty attrib' check"
-                    " so GetElementAttributes responses honor AVRCP 1.3 §5.3.4"
+                    " so GetElementAttributes responses honor AVRCP 1.3 §5.3.1 Table 5.24"
                     " (unsupported attributes emit with AttributeValueLength=0)"
     )
     parser.add_argument("input", help="Path to stock libextavrcp.so")

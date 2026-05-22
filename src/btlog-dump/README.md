@@ -11,7 +11,7 @@ The socket exists in stock firmware; root is only needed because the mtkbt proce
 ## Files
 
 - **`btlog-dump.c`** — direct ARM-EABI syscall implementation, no libc. `socket(AF_UNIX, SOCK_STREAM)` → `connect()` to abstract `"btlog"` (sun_path[0]=NUL, then "btlog") → loop `read()` to stdout. Zero command-line args; runs until EOF or interrupt.
-- **`Makefile`** — cross-compile via `arm-linux-gnu-gcc`. Same `-nostdlib -ffreestanding -static -Os -mthumb -mfloat-abi=soft` flags as `src/su/`. Reuses `../su/start.S` as the entry stub.
+- **`Makefile`** — cross-compile via `arm-linux-gnu-gcc`. Same flags as `src/su/`: compile `-nostdlib -ffreestanding -fno-builtin -fno-stack-protector -Os -Wall -Wextra -std=gnu99 -march=armv7-a -mthumb -mfloat-abi=soft -fno-asynchronous-unwind-tables -fno-unwind-tables`; link `-nostdlib -static -Wl,--build-id=none -Wl,--gc-sections`. Reuses `../su/start.S` as the entry stub.
 
 ## Build
 

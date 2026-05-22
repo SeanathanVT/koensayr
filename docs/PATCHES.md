@@ -119,7 +119,7 @@ End-to-end byte chain: IPC msg=544 → `fcn.00067768` (sets ctxt ptr at msg+0x1c
 `AVRCP_HandleA2DPInfo` (`fcn.0xf8e0`) is mtkbt's notification sink for A2DP stream-state changes. The `info_id == 1` path ("A2DP lost") logs `AVRCP: disconnect because a2dp is lost` and calls `fcn.0x1117c` — the AVRCP per-handle cleanup routine that emits `L2CAP DisconnectReq` on the AVCTP control channel + any remaining AVRCP-owned channels. The same routine is also called from the `info_id == 0` ("a2dp connected with other device") branch at `0xf9b8`; M8 only NOPs the info=1 site so multi-device A2DP collisions still tear AVRCP down appropriately.
 
 Wire trigger:
-1. CT sends AVDTP `CLOSE` (sig 0x08, ACP_SEID=1) on cid 0x42 — normal stream teardown per AVDTP 1.3 §8.13 (STREAMING → OPEN → IDLE state transition).
+1. CT sends AVDTP `CLOSE` (sig 0x08, ACP_SEID=1) on cid 0x42 — normal stream teardown per AVDTP 1.3 §8.14 (Stream Release / Close Stream Command).
 2. mtkbt's AVDTP upper layer tears down PSM 0x19 L2CAP channels; `[AvdtpSigMgrConnCallback]AVDTP_CONN_EVENT_DISCONNECT stat:5` fires.
 3. mtkbt calls `AVRCP_HandleA2DPInfo(1, 0)` — wrongly treating CLOSE as link loss rather than the normal stream-state transition.
 4. Pre-M8: `info=1` path calls `fcn.0x1117c` which emits `DisconnectReq` for the AVCTP control channel.
@@ -222,8 +222,8 @@ Cave disassembly (24 bytes at `0xf3680`):
 0xf3684  00 bf           nop                         ; padding
 0xf3686  01 d0           beq 0xf368c                 ; skip strb on outbound
 0xf3688  84 f8 29 00     strb.w r0, [r4, 0x29]      ; inbound: chan+0x39 = TID
-0xf368c  00 bf 00 bf     2 × nop                     ; (was M7 ldrb.w; removed)
-0xf3690  00 bf 00 bf     2 × nop                     ; (was M7 strb.w; removed)
+0xf368c  00 bf 00 bf     2 × nop                     ; padding
+0xf3690  00 bf 00 bf     2 × nop                     ; padding
 0xf3694  79 f7 7a bd     b.w 0x6d18c                 ; return into Path B
 ```
 
@@ -290,13 +290,13 @@ Other PDU / event combos fall through to T4 (PDU 0x20 → main, 0x17 → T_chars
 
 ### T4 — GetElementAttributes (PDU 0x20) and universal non-RegNotif entry
 
-In the LOAD #1 padding region, reached from extended_T2's `b.w T4` for every PDU other than 0x31 (RegNotif). T4's prologue writes `conn[+0x11] = sp[+0x171]` (the inbound CMD's TID byte) before any PDU dispatch — this is the universal §3.3.5 TID-echo write covering GetEA (0x20), GetPlayStatus (0x30), InformCharset (0x17), InformBattery (0x18), PApp (0x11..0x16), and Continuation (0x40/0x41). After the conn[+0x11] write, T4 dispatches on the PDU byte and falls through to T_charset / T_battery / T6 / T_papp / T_continuation as appropriate, or executes the GetElementAttributes main body below for PDU 0x20.
+In the LOAD #1 padding region, reached from extended_T2's `b.w T4` for every PDU other than 0x31 (RegNotif). T4's prologue writes `conn[+0x11] = sp[+0x171]` (the inbound CMD's TID byte) before any PDU dispatch — this is the universal §3.3.5 TID-echo write covering GetEA (0x20), GetPlayStatus (0x30), InformCharset (0x17), InformBattery (0x18), PApp (0x11..0x16), and Continuation (0x40/0x41). After the conn[+0x11] write, T4 dispatches on the PDU byte and branches via `b.w` to T_charset / T_battery / T6 / T_papp / T_continuation as appropriate, or executes the GetElementAttributes main body below for PDU 0x20.
 
 The GetEA body implements the AVRCP 1.3 §5.3.1 Table 5.24 response contract: "If NumAttributes is set to zero, all attribute information shall be returned, else attribute information for the specified attribute IDs shall be returned by the TG."
 
 T4 reads the inbound `NumAttributes` byte (caller's sp+394) and:
 - **`NumAttributes == 0`**: emits all seven supported attributes in canonical order (1..7) via a compile-time-unrolled loop.
-- **`NumAttributes > 0`**: emits each requested `AttributeID[i]` in the CT-specified order. For IDs in {0x01..0x07}, the value comes from the corresponding `y1-track-info` slot below. For any other ID (e.g. 0x08 — "Reserved" in 1.3, never supported), Y1 emits the attribute header with `AttributeValueLength=0` per §5.3.4 "for attributes not supported by the TG, this field shall be sent with 0 length data".
+- **`NumAttributes > 0`**: emits each requested `AttributeID[i]` in the CT-specified order. For IDs in {0x01..0x07}, the value comes from the corresponding `y1-track-info` slot below. For any other ID (e.g. 0x08 — "Reserved" in 1.3, never supported), Y1 emits the attribute header with `AttributeValueLength=0` per AVRCP 1.3 §5.3.1 Table 5.24 "for attributes not supported by the TG, this field shall be sent with 0 length data".
 
 | attr_id | Name | Source slot in `y1-track-info` |
 |---|---|---|
@@ -308,7 +308,7 @@ T4 reads the inbound `NumAttributes` byte (caller's sp+394) and:
 | 0x06 | Genre | `[848..1103]` |
 | 0x07 | PlayingTime | `[832..847]` (UTF-8 ASCII decimal milliseconds) |
 
-All values ship as UTF-8 (charset `0x006A`); a missing attribute is signalled by `AttributeValueLength=0`. Y1's emission of zero-length entries requires `patch_libextavrcp.py` E1 to land — the stock `libextavrcp.so` response builder otherwise drops such attributes on the floor (a §5.3.4 violation in the stock code). The numeric attrs (4 / 5 / 7) are stored pre-formatted as ASCII strings by the music app's `TrackInfoWriter` rather than binary u16 / u32 with a Thumb-2 itoa, keeping the trampoline a uniform strlen+memcpy loop.
+All values ship as UTF-8 (charset `0x006A`); a missing attribute is signalled by `AttributeValueLength=0`. Y1's emission of zero-length entries requires `patch_libextavrcp.py` E1 to land — the stock `libextavrcp.so` response builder otherwise drops such attributes on the floor (an AVRCP 1.3 §5.3.1 Table 5.24 violation in the stock code). The numeric attrs (4 / 5 / 7) are stored pre-formatted as ASCII strings by the music app's `TrackInfoWriter` rather than binary u16 / u32 with a Thumb-2 itoa, keeping the trampoline a uniform strlen+memcpy loop.
 
 T4 also detects track-id edges (compares the active slot's `track_id` field from `y1-track-info` against the `.bss` trampoline-state block at `G_Y1_TRAMPOLINE_STATE + 0..7`) and emits a reactive CHANGED via `reg_notievent_track_changed_rsp` before the GetElementAttributes response, then writes the new track_id back to the `.bss` state.
 

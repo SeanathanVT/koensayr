@@ -67,7 +67,7 @@ Anchored against **ICS Table 7 (Target Features)** in `docs/spec/AVRCP 1.3/AVRCP
 | 16-17 | PApp Setting Attribute / Value Text (0x15-0x16) | §5.2.5-5.2.6 | O | ✓ T_papp (UTF-8 "Repeat" / "Shuffle" / "Off") | — |
 | 18 | InformDisplayableCharacterSet (PDU 0x17) | §5.2.7 | O | ✓ T_charset (NOT_IMPLEMENTED reject; spec-permissible for Optional PDU) | — |
 | 19 | InformBatteryStatusOfCT (PDU 0x18) | §5.2.8 | O | ✓ T_battery | — |
-| **20** | GetElementAttributes (PDU 0x20) | §5.3.1 | **M (C.3: M IF cat 1)** | ✓ T4 (all 7 §5.3.4 attrs: Title / Artist / Album / TrackNumber / TotalNumberOfTracks / Genre / PlayingTime, single packed frame) | — |
+| **20** | GetElementAttributes (PDU 0x20) | §5.3.1 | **M (C.3: M IF cat 1)** | ✓ T4 (all 7 Appendix E attrs: Title / Artist / Album / TrackNumber / TotalNumberOfTracks / Genre / PlayingTime, single packed frame) | — |
 | **21** | GetPlayStatus (PDU 0x30) | §5.4.1 | **M (C.2: M IF GetElementAttributes Response)** | ✓ T6 with live position via `clock_gettime(CLOCK_BOOTTIME)` | — |
 | **22** | RegisterNotification (PDU 0x31) | §5.4.2 | **M (C.12: M IF cat 1)** | ✓ T2 / extended_T2 / T8 | — |
 | **23** | Notify EVENT_PLAYBACK_STATUS_CHANGED | §5.4.2 Tbl 5.29 | **M (C.4: M IF GetElementAttributes + RegisterNotification)** | ✓ T8 INTERIM + T9 CHANGED on edge | — |
@@ -202,8 +202,8 @@ Per-slot schema (offsets relative to the active slot's start):
 | 792 | playing_flag | 1 | shipped | `TrackInfoWriter.mPlayStatus` (3-valued AVRCP §5.4.1 Tbl 5.26 enum: 0=STOPPED, 1=PLAYING, 2=PAUSED — set by `PlaybackStateBridge.onPlayValue` hooking `Static.setPlayValue` newValue 0/1/3/5) |
 | 793 | previous_track_natural_end | 1 | shipped | `TrackInfoWriter.mPreviousTrackNaturalEnd` (T5 gate for AVRCP §5.4.2 Tbl 5.31 TRACK_REACHED_END CHANGED) |
 | 794 | battery_status | 1 | shipped | `TrackInfoWriter.mBatteryStatus` (T8 INTERIM + T9 CHANGED-on-edge for AVRCP §5.4.2 Tbl 5.34 BATT_STATUS_CHANGED) |
-| 795 | repeat_avrcp | 1 | shipped | `TrackInfoWriter.mRepeatAvrcp` (AVRCP §5.2.4 Tbl 5.20 enum; written by `PappSetFileObserver` on `y1-papp-set` writes; T8 0x08 INTERIM + T9 papp CHANGED-on-edge read this byte) |
-| 796 | shuffle_avrcp | 1 | shipped | `TrackInfoWriter.mShuffleAvrcp` (AVRCP §5.2.4 Tbl 5.21 enum; same write/read pipeline as 795) |
+| 795 | repeat_avrcp | 1 | shipped | `TrackInfoWriter.mRepeatAvrcp` (AVRCP 1.3 Appendix F attribute 0x02 enum; written by `PappSetFileObserver` on `y1-papp-set` writes; T8 0x08 INTERIM + T9 papp CHANGED-on-edge read this byte) |
+| 796 | shuffle_avrcp | 1 | shipped | `TrackInfoWriter.mShuffleAvrcp` (AVRCP 1.3 Appendix F attribute 0x03 enum; same write/read pipeline as 795) |
 | 797..799 | reserved | 3 | — | available for future PApp attribute additions (Equalizer / Scan if a Y1 release ever surfaces them) |
 | 800..815 | TrackNumber (UTF-8 ASCII decimal) | 16 | shipped | `MediaStore.Audio.Media.TRACK % 1000` / parsed from `METADATA_KEY_CD_TRACK_NUMBER` |
 | 816..831 | TotalNumberOfTracks (UTF-8 ASCII decimal) | 16 | shipped | `count(*) WHERE ALBUM_ID=?` / parsed from `CD_TRACK_NUMBER` "n/total" |
@@ -212,7 +212,7 @@ Per-slot schema (offsets relative to the active slot's start):
 
 Total slot size: **1104 B**. Per-slot schema is append-only; we never relocate existing fields. The file-level wrapper (1 B `active_slot` + 3 B pad + 2 × 1104 B slots + 1 B pad = 2213 B) keeps reader / writer race-free without `tmpfile + rename`.
 
-The numeric AVRCP §5.3.4 attrs (4 / 5 / 7) are stored pre-formatted as ASCII decimal strings rather than binary u16 / u32 with a Thumb-2 itoa, keeping the T4 trampoline a uniform strlen+memcpy loop.
+The numeric AVRCP 1.3 Appendix E attrs (4 / 5 / 7) are stored pre-formatted as ASCII decimal strings rather than binary u16 / u32 with a Thumb-2 itoa, keeping the T4 trampoline a uniform strlen+memcpy loop.
 
 Trampoline edge state lives in `libextavrcp_jni.so` `.bss` at `G_Y1_TRAMPOLINE_STATE_VADDR = 0xd2d6` (13 B): bytes 0..7 = last_seen track_id (T5 / T4 edge detect), byte 8 = unused (was last RegNotif transId; per-event TIDs now live in `g_avrcp_req_event_database`), byte 9 = last_play_status (T9), byte 10 = last_battery_status (T9), byte 11 = last_repeat_avrcp (T9 papp), byte 12 = last_shuffle_avrcp (T9 papp). Zero-init at process load (same scope as `g_avrcp_req_event_database`).
 

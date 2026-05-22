@@ -522,9 +522,12 @@ def _emit_t4(a: Asm) -> None:
     # idx+1 == total && total != 0; we accumulate and emit on the final call.
     #
     # AVRCP 1.3 §5.3.1 Table 5.24: TG returns exactly the requested attribute IDs
-    # in the requested order (NumAttributes=0 means all). §5.3.4: unsupported
-    # attributes emit with length=0. Supported attrs 0x01..0x07 mapped via the
-    # inline t4_attr_offset_table; zero-length emit relies on patch_libextavrcp.py E1.
+    # in the requested order (NumAttributes=0 means all); unsupported attributes
+    # emit with AttributeValueLength=0. Attribute IDs are listed in AVRCP 1.3
+    # Appendix E (0x01=Title, 0x02=Artist, 0x03=Album, 0x04=TrackNumber,
+    # 0x05=TotalNumberOfTracks, 0x06=Genre, 0x07=PlayingTime). Supported attrs
+    # 0x01..0x07 mapped via the inline t4_attr_offset_table; zero-length emit
+    # relies on patch_libextavrcp.py E1.
 
     # ---- read NumAttributes from inbound request ----
     a.ldrb_w(7, 13, T4_NUMATTR_OFF)           # r7 = N (CT-requested count)

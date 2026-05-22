@@ -15,7 +15,7 @@ _thumb2asm.py. Per-trampoline behaviour: docs/PATCHES.md. Stack frame
 and JNI calling convention: docs/ARCHITECTURE.md.
 
 Pairs with patch_mtkbt.py's P1 (msg 519 size=9 routing) and
-patch_libextavrcp.py's E1 (§5.3.4 zero-length emit).
+patch_libextavrcp.py's E1 (§5.3.1 Table 5.24 zero-length emit).
 """
 
 import argparse

@@ -325,7 +325,7 @@ BASE_PATCHES = [
         #      `AvdtpSigMgrConnCallback ... stat:5` fires.
         #   3. mtkbt then calls `AVRCP_HandleA2DPInfo(1, 0)` — wrongly
         #      treating CLOSE as "A2DP link lost" rather than the per-AVDTP-
-        #      §8.13 STREAMING→OPEN state transition it actually is.
+        #      §8.14 STREAMING→OPEN state transition it actually is.
         #   4. info=1 path calls fcn.0x1117c which emits DisconnectReq for
         #      the AVCTP control channel(s).
         #   5. CT reconnects everything fresh on the next AV/C command,

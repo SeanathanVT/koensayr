@@ -13,8 +13,7 @@ case "${1:-}" in
 Usage: ./tools/install-android-sdk.sh
 
 Auto-installer for the Android SDK on Linux. Required for building
-src/Y1Bridge/ via Gradle; needed only for the --avrcp flag
-(which is currently known-broken — see INVESTIGATION.md).
+src/Y1Bridge/ via Gradle; needed only for the --avrcp flag.
 
 Detects existing \$ANDROID_HOME and short-circuits; otherwise
 downloads Google's pinned commandline-tools archive into
