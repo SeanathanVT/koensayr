@@ -167,7 +167,7 @@ Full PLT inventory (from `libextavrcp_jni.so` md5 `fd2ce74db9389980b55bccf3d8f15
 
 ### Code-cave budget
 
-LOAD #1 padding currently used: `0xac54..0xb448` (2036 B). Free space past `0xb448` to LOAD #2 at `0xbc08`: **~1984 bytes** (4020 B padding total).
+LOAD #1 padding budget: 4020 bytes total (`0xac54..0xbc08`). The patcher computes the assembled trampoline blob size at build time and prints it on every run; release builds currently land in the low 3 kB range, debug builds (`KOENSAYR_DEBUG=1`) ~150 B larger from the spliced `__android_log_print` calls. The patcher asserts on overflow before it can corrupt LOAD #2's `.data` / `.got`.
 
 If we ever do exhaust LOAD #1 padding, the fallback is to extend the same trick to the LOAD #2 padding region by bumping LOAD #2's `p_filesz`/`p_memsz`.
 
@@ -175,7 +175,7 @@ If we ever do exhaust LOAD #1 padding, the fallback is to extend the same trick 
 
 ## 4. y1-track-info schema (cumulative)
 
-File-level wrapper (since v[Unreleased]; mmap-rework):
+File-level wrapper:
 
 | File offset | Size | Contents |
 |---|---|---|

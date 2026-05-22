@@ -595,10 +595,8 @@ def _emit_t4(a: Asm) -> None:
     a.movs_imm8(1, 0)                         # r1 = 0
     a.mov_lo_lo(2, 6)                         # r2 = i
     a.mov_lo_lo(3, 7)                         # r3 = N
-    # T4a= per-attribute log dropped 2026-05-19 to free trampoline budget
-    # for the per-event-TID restore subroutine. GEA wire-size predictions
-    # remain available via mtkbt-side btlog parsing (`tools/btlog-parse.py
-    # --avrcp`); the trampoline-side per-attr log was diagnostic-only.
+    # No per-attribute debug log here; GEA wire-size diagnostics live on
+    # the mtkbt side via `tools/btlog-parse.py --avrcp`.
     a.blx_imm(PLT_get_element_attributes_rsp)
 
     # i++; if i < N: loop.
@@ -636,10 +634,6 @@ def _emit_t4(a: Asm) -> None:
         a.str_sp_imm(6, T4_OFF_ARGS + 8)      # sp[8]  = strlen
         a.add_sp_imm(4, str_offset)
         a.str_sp_imm(4, T4_OFF_ARGS + 12)     # sp[12] = ptr
-        # Note: no debug log on the N==0 fallback path — that's only hit by
-        # CTs that send an empty attribute-ID list (§6.6.1 "return all"
-        # variant), which is rare. The request-driven loop above carries the
-        # primary T4attr debug log site. Keeps blob within the 4020-B budget.
         a.blx_imm(PLT_get_element_attributes_rsp)
 
     # ---- restore stack and tail-call the function epilogue ----
@@ -1140,14 +1134,9 @@ def _emit_t6(a: Asm) -> None:
     # r0 = conn buffer (r5+8); r1 = 0 (success); r3 = position (already set)
     a.add_imm_t3(0, 5, 8)
     a.movs_imm8(1, 0)
-    # T6 GetPlayStatus debug logs (dur / pos) removed 2026-05-17 to make
-    # room within the 4020-B LOAD #1 padding budget for the T4 per-attribute
-    # wire-size log — far more diagnostic for the Bolt-side AVRCP
-    # fragmentation investigation. T6 fires on every CT poll, generating
-    # high-volume low-signal noise; the same play_status / position values
-    # surface in T9emit logs at lower frequency. If needed, re-enable by
-    # restoring the two `_emit_native_log_u32(a, "log_fmt_t6*", ...)` calls
-    # and the matching format-string definitions below.
+    # T6 fires on every CT GetPlayStatus poll (high-frequency, low-signal
+    # for diagnostics); no debug log emit here. The same play_status /
+    # position values surface in T9pos at the 1 Hz cadence.
     a.blx_imm(PLT_get_playstatus_rsp)
 
     # ---- restore stack and tail-call epilogue ----

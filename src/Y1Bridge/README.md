@@ -15,7 +15,8 @@ platform key (required by `android:sharedUserId="android.uid.system"`) and
 any change to `AndroidManifest.xml` invalidates `META-INF/MANIFEST.MF`'s
 recorded SHA1-Digest. PackageManager rejects the APK at `/system/app/` scan
 with "no certificates at entry AndroidManifest.xml; ignoring!" — see
-[`docs/INVESTIGATION.md`](../../docs/INVESTIGATION.md) Trace #23.
+[`docs/INVESTIGATION.md`](../../docs/INVESTIGATION.md) for the
+JarVerifier RE.
 
 Y1Bridge is its own package (`com.koensayr.y1.bridge`), signed with the
 debug keystore. Its manifest is freely editable. It exists solely to

@@ -5,12 +5,22 @@ patch_y1_apk.py — smali patches on the Y1 music player APK.
 Patches (per docs/PATCHES.md ## patch_y1_apk.py):
   A/B/C  Artist→Album navigation (tapping an artist drills into that
          artist's albums instead of a flat song list).
-  B5/B6  In-music-app TrackInfoWriter + PlaybackStateBridge +
-         BatteryReceiver + PappSetFileObserver injection (companions to
-         the libextavrcp_jni.so trampoline chain).
-  E      Discrete PASSTHROUGH routing in PlayControllerReceiver
+  B3     PappSetReceiver — receives CT-driven AVRCP Repeat/Shuffle Set
+         and applies it to the music app's preferences.
+  B4     PappStateBroadcaster — Y1-side Repeat/Shuffle SharedPreferences
+         edges → AVRCP wire CHANGED via the trampoline chain.
+  B5     In-music-app `TrackInfoWriter` + `PlaybackStateBridge` +
+         `PositionTicker` + `BatteryReceiver` + `PappSetFileObserver` +
+         `PscPulse` + `NowPlayingRefresher` injection (canonical writer
+         of y1-track-info; companions to the libextavrcp_jni.so
+         trampoline chain).
+  B6     `AvrcpBridgeService` + `AvrcpBinder` smali drop into
+         smali_classes2/ (unused groundwork for a future architecture
+         where MtkBt's bindService routes directly into the music-app
+         process; currently MtkBt resolves to Y1Bridge.apk instead).
+  E      Discrete PASSTHROUGH routing in `PlayControllerReceiver`
          (PLAY / PAUSE / STOP / NEXT / PREVIOUS).
-  H      BaseActivity / BasePlayerActivity dispatchKeyEvent propagates
+  H/H'   BaseActivity / BasePlayerActivity dispatchKeyEvent propagates
          unhandled media keys past the foreground activity, with a
          framework-synthetic-repeat filter.
 
