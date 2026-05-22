@@ -355,6 +355,51 @@ def _emit_t4(a: Asm) -> None:
     """
     a.label("T4")
 
+    # ---- AVRCP §3.3.5 strict TID echo: write conn[+0x11] = inbound CMD TID
+    #
+    # Stock libextavrcp_jni.so writes conn[+0x11] = inbound seq_id before
+    # invoking any response builder; the rsp builders read [conn, #0x11]
+    # to pack the AVCTP transaction label on outbound frames. Our R1
+    # redirect at 0x6538 hijacks the path upstream of stock's write, so
+    # for non-RegNotif PDUs (which never go through extended_T2's
+    # save_event_seq_id → restore_conn_tid database mechanism) conn[+0x11]
+    # stays pinned at whatever value the *first* outbound RSP left there
+    # — usually the inbound TID of the initial GetCapabilities CMD.
+    #
+    # Empirical evidence (dual-bolt-20260521-2111, dual-kia-20260521-2109):
+    #   - Bolt cycles AVCTP TIDs 0x01..0x0b; every Y1 outbound shipped
+    #     c39=07 (Bolt's GetCap TID). Bolt's TID=0x01 GetEA RSP echoed
+    #     0x07 → §3.3.5 mismatch → Bolt rejected → metadata pane stayed
+    #     blank for the entire 164 s session.
+    #   - Kia happens to use TID=0x07 for ~10/12 of its CMDs, so the
+    #     stale-07 mostly matched and metadata worked; the 2 TID=0x03
+    #     CMDs got TID=0x07 responses (rejected, no visible impact since
+    #     Kia polls anyway).
+    #   - Sonos / TV avoid the bug because they RegNotify frequently;
+    #     each RegNotif INTERIM emit refreshes conn[+0x11] via the
+    #     database+restore path.
+    #
+    # Pixel-as-TG (pixel4-bugreport-20260518 btsnoop frames 1480..1900):
+    # echoes inbound TID on every PDU type — GetCap, Charset, RegNotif
+    # INTERIM/CHANGED, GetEA, PApp. AVRCP §3.3.5 strict; Y1 must match.
+    #
+    # The fix replicates stock's pre-rsp-builder write at T4's universal
+    # entry (covers GetEA, GetPlayStatus, Charset, Battery, PApp 0x11..0x16,
+    # Continuation 0x40/0x41 — every non-RegNotif PDU dispatches through
+    # this single point). RegNotif keeps its existing per-event database
+    # path (extended_T2 / T5 / T8 / T9 use restore_conn_tid). GetCap
+    # arm at 0xac5c is unaffected — Sonos/Bolt GetCap RSPs already echo
+    # correctly (stock JNI path pre-R1).
+    #
+    # Cost: 6 B unconditional. r1 clobbered (used as the TID register;
+    # all downstream T4/T6/T_charset/T_battery/T_papp/T_continuation
+    # prologues re-set r1 before invoking their rsp builder).
+    a.ldrb_w(1, 13, 0x171)                    # r1 = inbound seq_id (TID) at sp+0x171
+    # strb r1, [r5, #0x19]  — struct[+0x19] = conn[+0x11] = TID
+    # T1 STRB imm5 encoding: 0111 0 imm5 Rn Rt = 0x7000 | (0x19<<6) | (5<<3) | 1
+    hw = 0x7000 | (0x19 << 6) | (5 << 3) | 1
+    a.raw(bytes([hw & 0xFF, (hw >> 8) & 0xFF]))
+
     # ---- pre-check: dispatch on PDU ----
     # PDU 0x20 → GetElementAttributes (T4 main body)
     # PDU 0x17 → InformDisplayableCharacterSet (T_charset)

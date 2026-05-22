@@ -46,12 +46,12 @@ STOCK_MD5         = "fd2ce74db9389980b55bccf3d8f15660"
 # open+read+close inline in T4/T5/T6/T8/T9/extended_T2). Patcher will print
 # the computed MD5 on first flash; replace this with that value once
 # verified against a successful flash + capture cycle.
-OUTPUT_MD5        = "5c8ab181c221d3c31739fe5955f7a25b"
+OUTPUT_MD5        = "4ebd181976c1dbdd19b6a06112dce484"
 
 # --debug: splices __android_log_print calls into T5/T6/T8/T9 emit sites
 # (tag "Y1T"). Release builds remain byte-identical without the env var.
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
-OUTPUT_DEBUG_MD5  = "c81d15339c73ec4db6703eb03c25cc59"
+OUTPUT_DEBUG_MD5  = "384f0c630feff36d43e62a122764bade"
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
 # ---------------------------------------------------------------- T1

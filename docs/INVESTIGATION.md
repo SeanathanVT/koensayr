@@ -7387,3 +7387,85 @@ Deleted all three `if DEBUG_NATIVE_LOG: ldrb_w(4, 3, 7); _emit_native_log_u32(a,
 
 - `OUTPUT_MD5`: `5c8ab181c221d3c31739fe5955f7a25b` (unchanged)
 - `OUTPUT_DEBUG_MD5`: `778991030950699c2e2861bc7e457556` → `c81d15339c73ec4db6703eb03c25cc59`
+
+---
+
+## Trace #90 — 2026-05-22 Non-RegNotif AVCTP TID echo broken; fixed at T4 entry
+
+### Symptom
+
+`dual-bolt-20260521-2111`: Bolt connects, exchanges A2DP, issues PASSTHROUGH PLAY (works), then issues a single `GetElementAttributes` and goes completely silent on AVRCP for the remaining 160 s. Metadata pane never populates. PASSTHROUGH control continues to work because that's a different AV/C subprotocol with its own TID echo path.
+
+`dual-kia-20260521-2109`: Kia metadata works (polling-driven), but the playhead lingers ~1 s after track changes. Kia issues 37 GetPlayStatus polls + 17 GetEA fetches in 79 s, never a single RegisterNotification.
+
+### M5 wire-tag census (debug-build c81d15339c…)
+
+Outbound `chan+0x39` (the byte mtkbt encodes as AVCTP transaction-label upper nibble) per CT, across the four-CT matrix:
+
+| CT | Outbound c39 distribution | Inbound TID pattern |
+|---|---|---|
+| Sonos | 47× `00`, 24× `01`, 14× `04`, 11× mixed | Varies (RegNotif-driven refresh) |
+| TV (Samsung Frame Pro) | similar mixed | Varies (poll + subscribe) |
+| Kia EV6 | **57× `07` (every outbound)** | 12 inbound: 2× TID=03, 10× TID=07 |
+| Bolt EV | **2× `07` (both outbound)** | 12 inbound: TIDs 0x01..0x0b cycling |
+
+Kia works by accident — its CT-side TID generator happens to use 0x07 for most CMDs, so the stale-07 echo matches what Kia expects. The 2 TID=03 CMDs got TID=07 responses (rejected; no visible impact since Kia polls regardless).
+
+Bolt cycles TIDs starting at 0x01. The GetEA CMD (TID=0x01) got an RSP with TID=0x07. Bolt rejected per AVCTP §3.3.5 strict-echo and stopped issuing CMDs that required a response.
+
+### Root cause: stale conn[+0x11] on non-RegNotif PDUs
+
+Stock libextavrcp_jni.so writes `conn[+0x11] = inbound seq_id` right before every response-builder call. The rsp builders pack `conn[+0x11]` into the AVCTP TL field on outbound frames, fulfilling §3.3.5 strict echo.
+
+The R1 redirect at JNI vaddr `0x6538` (commit history) hijacks the dispatcher path **upstream** of stock's `conn[+0x11]` write. For RegNotif PDUs, our trampoline re-establishes the write via `extended_T2` → `save_event_seq_id` → `_emit_restore_conn_tid_from_db`, which uses the per-event database at `g_avrcp_req_event_database[event_id]`. That path works.
+
+For non-RegNotif PDUs (GetEA, GetPlayStatus, InformCharset, InformBattery, PApp 0x11..0x16, Continuation 0x40/0x41), none of our T4-family handlers wrote `conn[+0x11]`. The slot kept whatever value the *first* response after connect left there — which for both Bolt and Kia was 0x07 from the initial GetCapabilities RSP.
+
+CTs that RegNotify frequently (Sonos, TV) avoided the symptom because every RegNotif INTERIM/CHANGED emit refreshes `conn[+0x11]` through the database path. Their non-RegNotif responses inherit a "recent" value that, while not strictly correct per the inbound CMD's TID, was close enough or by coincidence matched.
+
+### Pixel-as-TG verification
+
+`/work/logs/pixel4-bugreport/FS/data/misc/bluetooth/logs/btsnoop_hci.log` — Pixel 4 acting as AVRCP TG to Kia (CT). Frames 1480..1900, AVCTP transaction column:
+
+| Frame | Dir | TID | PDU | Note |
+|---|---|---|---|---|
+| 1480 / 1481 | CT→TG / TG→CT | 0x00 | GetCap | RSP echoes 0x00 |
+| 1492 / 1493 | / | 0x01 | InformCharset | RSP echoes 0x01 |
+| 1498 / 1501 | / | 0x02 | RegNotif(PSC) INTERIM | RSP echoes 0x02 |
+| 1505 / 1506 | / | 0x03 | RegNotif(TC) INTERIM | RSP echoes 0x03 |
+| 1508 / 1509 | / | 0x04 | GetEA | RSP echoes 0x04 |
+| 1517 / 1518 | / | 0x07 | GetEA | RSP echoes 0x07 |
+| 1529 / 1530 | / | 0x0b | PApp 0x11 | RSP echoes 0x0b |
+
+Pixel echoes the inbound TID on **every** PDU type. Per-event CHANGED emits (frames 1584/1601/1602/1646…) use the most recent RegNotif CMD's TID for that event, which matches our database-driven mechanism for CHANGED.
+
+### Fix
+
+Add 6 bytes at `_emit_t4` entry (the universal dispatcher reached for every non-RegNotif PDU through `extended_T2` → `b.w T4`):
+
+```python
+a.ldrb_w(1, 13, 0x171)                    # r1 = inbound seq_id at sp+0x171
+hw = 0x7000 | (0x19 << 6) | (5 << 3) | 1  # strb r1, [r5, #0x19]
+a.raw(bytes([hw & 0xFF, (hw >> 8) & 0xFF]))
+```
+
+`sp+0x171` is the empirically-verified pre-`SUB SP` offset of the inbound `seq_id` byte at the testparmnum-derived entry context (same offset `extended_T2` reads for `save_event_seq_id`'s argument). `r5+0x19` is `conn[+0x11]` (with `conn = r5 + 8`). r1 is clobbered; every downstream T4 / T6 / T_charset / T_battery / T_papp / T_continuation rsp-builder prologue re-loads r1 before the blx.
+
+GetCap path at `T1_extended:0xac5c` is unaffected — Sonos/Bolt GetCap RSPs already echo correctly via stock JNI's pre-R1 path. RegNotif paths in `extended_T2` / T5 / T8 / T9 also unaffected — they continue using `restore_conn_tid` from the per-event database.
+
+### Predicted empirical outcomes for verification
+
+- **Bolt**: GetEA RSPs ship with TID matching CMD → Bolt accepts → metadata pane populates. Subscription cycle may resume (if BrowseGroupList was the only remaining blocker per Trace #87).
+- **Kia**: TID=03 CMDs now get TID=03 RSPs (was rejected, now accepted). Most behavior unchanged since TID=07 already worked. Playhead lag is structural (polling cadence ~2 Hz) and independent of TID echo.
+- **Sonos / TV**: No behavior change. Their non-RegNotif RSPs now ship the precise inbound CMD TID (was: most-recent-RegNotif TID via database); strictly more correct per §3.3.5.
+
+### Budget
+
+- Release blob: 3152 → 3156 B (+4 B; release-side bytes were already correct so why +4? — align padding shifted).
+- Debug blob: 3308 → 3312 B (+4 B).
+- 708 B headroom in debug, 864 B in release. Plenty.
+
+### MD5 pin update
+
+- `OUTPUT_MD5`: `5c8ab181c221d3c31739fe5955f7a25b` → `4ebd181976c1dbdd19b6a06112dce484`
+- `OUTPUT_DEBUG_MD5`: `c81d15339c73ec4db6703eb03c25cc59` → `384f0c630feff36d43e62a122764bade`
