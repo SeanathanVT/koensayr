@@ -110,8 +110,8 @@ def main():
     ap.add_argument('--avrcp', action='store_true',
                     help="AVRCP-only preset: includes any frame matching the standard AVRCP/AVCTP "
                          "log tags (avctpCB, [AVCTP], avrcp:, [AVRCP], transId). Pairs with "
-                         "tools/avrcp-wire-trace.py which parses the trampoline-side Y1T logcat "
-                         "tags emitted by apply.bash --debug.")
+                         "tools/avrcp-wire-trace.py which pretty-prints the trampoline-side Y1T "
+                         "logcat markers emitted by apply.bash --debug.")
     args = ap.parse_args()
 
     if args.avrcp:

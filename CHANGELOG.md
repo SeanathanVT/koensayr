@@ -18,7 +18,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 - Track-info exchange between the music app and the Bluetooth stack now uses shared memory instead of an atomic write + rename to disk on every state change. The data file (`/data/data/com.innioasis.y1/files/y1-track-info`) ships a double-buffered schema and the Bluetooth-side reader memory-maps it once. End-user impact: lower-latency metadata responses (single-digit ms vs ~25 ms) under sustained head-unit polling, no torn reads while a track edge is mid-flush.
 
 ### Added
-- `apply.bash --debug` captures per-emit wire shape for diagnosing head-unit-specific AVRCP issues. New `tools/avrcp-wire-trace.py` parses the logs for offline analysis; `tools/btlog-parse.py --avrcp` covers the matching `mtkbt` view.
+- `apply.bash --debug` build captures per-emit wire-side markers (`Y1T :` logcat tag) for diagnosing head-unit-specific AVRCP issues. Pair `tools/avrcp-wire-trace.py` (Y1T-tag pretty-printer with timestamps + tag filter) with `tools/btlog-parse.py --avrcp` on the simultaneously-captured `btlog.bin` for the matching mtkbt-internal view.
 
 ## [2.3.0] - 2026-05-16
 ### Added
