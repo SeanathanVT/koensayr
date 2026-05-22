@@ -355,45 +355,21 @@ def _emit_t4(a: Asm) -> None:
     """
     a.label("T4")
 
-    # ---- AVRCP §3.3.5 strict TID echo: write conn[+0x11] = inbound CMD TID
-    #
-    # Stock libextavrcp_jni.so writes conn[+0x11] = inbound seq_id before
-    # invoking any response builder; the rsp builders read [conn, #0x11]
-    # to pack the AVCTP transaction label on outbound frames. Our R1
-    # redirect at 0x6538 hijacks the path upstream of stock's write, so
-    # for non-RegNotif PDUs (which never go through extended_T2's
-    # save_event_seq_id → restore_conn_tid database mechanism) conn[+0x11]
-    # stays pinned at whatever value the *first* outbound RSP left there
-    # — usually the inbound TID of the initial GetCapabilities CMD.
-    #
-    # Empirical evidence (dual-bolt-20260521-2111, dual-kia-20260521-2109):
-    #   - Bolt cycles AVCTP TIDs 0x01..0x0b; every Y1 outbound shipped
-    #     c39=07 (Bolt's GetCap TID). Bolt's TID=0x01 GetEA RSP echoed
-    #     0x07 → §3.3.5 mismatch → Bolt rejected → metadata pane stayed
-    #     blank for the entire 164 s session.
-    #   - Kia happens to use TID=0x07 for ~10/12 of its CMDs, so the
-    #     stale-07 mostly matched and metadata worked; the 2 TID=0x03
-    #     CMDs got TID=0x07 responses (rejected, no visible impact since
-    #     Kia polls anyway).
-    #   - Sonos / TV avoid the bug because they RegNotify frequently;
-    #     each RegNotif INTERIM emit refreshes conn[+0x11] via the
-    #     database+restore path.
-    #
-    # Pixel-as-TG (pixel4-bugreport-20260518 btsnoop frames 1480..1900):
-    # echoes inbound TID on every PDU type — GetCap, Charset, RegNotif
-    # INTERIM/CHANGED, GetEA, PApp. AVRCP §3.3.5 strict; Y1 must match.
-    #
-    # The fix replicates stock's pre-rsp-builder write at T4's universal
-    # entry (covers GetEA, GetPlayStatus, Charset, Battery, PApp 0x11..0x16,
-    # Continuation 0x40/0x41 — every non-RegNotif PDU dispatches through
-    # this single point). RegNotif keeps its existing per-event database
-    # path (extended_T2 / T5 / T8 / T9 use restore_conn_tid). GetCap
-    # arm at 0xac5c is unaffected — Sonos/Bolt GetCap RSPs already echo
-    # correctly (stock JNI path pre-R1).
-    #
-    # Cost: 6 B unconditional. r1 clobbered (used as the TID register;
-    # all downstream T4/T6/T_charset/T_battery/T_papp/T_continuation
-    # prologues re-set r1 before invoking their rsp builder).
+    # AVRCP §3.3.5 strict TID echo for non-RegNotif PDUs. Stock
+    # libextavrcp_jni.so writes conn[+0x11] = inbound seq_id before invoking
+    # any response builder; the rsp builders read [conn, #0x11] to pack the
+    # AVCTP transaction label on outbound frames. R1's redirect at 0x6538
+    # bypasses stock's write, so without this prologue conn[+0x11] would
+    # stay pinned at whatever value the previous response left there.
+    # RegNotif paths refresh conn[+0x11] via the per-event database
+    # (save_event_seq_id at extended_T2 + restore_conn_tid at every emit
+    # site). Non-RegNotif paths (GetEA, GetPlayStatus, Charset, Battery,
+    # PApp, Continuation) all dispatch through this T4 entry, so the
+    # single ldrb+strb here covers them universally. GetCap (handled at
+    # T1_extended:0xac5c) is unaffected — stock JNI's pre-R1 path writes
+    # conn[+0x11] before our hijack takes effect.
+    # Cost: 6 B unconditional; r1 clobbered (downstream PDU dispatch
+    # arms re-load it before invoking their rsp builder).
     a.ldrb_w(1, 13, 0x171)                    # r1 = inbound seq_id (TID) at sp+0x171
     # strb r1, [r5, #0x19]  — struct[+0x19] = conn[+0x11] = TID
     # T1 STRB imm5 encoding: 0111 0 imm5 Rn Rt = 0x7000 | (0x19<<6) | (5<<3) | 1
@@ -870,23 +846,21 @@ def _emit_t5(a: Asm) -> None:
 
     a.label("t5_changed")
 
-    # ---- Emit order matches Pixel-as-TG-in-AVRCP-1.3-mode observed on
-    # the wire (Pixel↔Bolt btsnoop, frames 967/968/973): PPC=0 →
-    # TC → NPCC. Position reset arrives first so the CT zeroes the
-    # playhead before processing the identity change; TC arrives second
-    # so the CT registers the new track ID before NPCC's now-playing
-    # refresh hits. Empirically (Trace #82), Y1's prior NPCC-first
-    # ordering caused the now-playing refresh to land while the CT
-    # still considered the OLD track the "selected" one, briefly
-    # holding the OLD position on screen until TC arrived and forced
-    # a re-query.
+    # ---- Emit order matches a reference 1.3-as-TG implementation's
+    # observed wire order: PPC=0 → TC → NPCC. Position reset arrives
+    # first so the CT zeroes the playhead before processing the identity
+    # change; TC arrives second so the CT registers the new track ID
+    # before NPCC's now-playing refresh hits. NPCC-first ordering causes
+    # the now-playing refresh to land while the CT still considers the
+    # OLD track the "selected" one, briefly holding the OLD position on
+    # screen until TC arrives and forces a re-query.
     #
-    # TR_END / TR_START are emitted AFTER the Pixel-parity triple. Pixel
-    # itself doesn't advertise them (GetCap Events list = 01/02/05/08/
-    # 09/0a/0b/0c, no 03/04), so order-relative-to-Pixel is undefined.
-    # Keeping them where they are now (post-TC) maintains backward compat
-    # for any strict-1.3 CT that has subscribed to them via T8 INTERIM
-    # (rare in our test matrix but possible).
+    # TR_END / TR_START are emitted AFTER the reference triple. The
+    # reference implementation doesn't advertise them (its GetCap Events
+    # list = 01/02/05/08/09/0a/0b/0c, no 03/04), so order-relative-to-
+    # reference is undefined. Keeping them where they are now (post-TC)
+    # maintains backward compat for any strict-1.3 CT that has subscribed
+    # to them via T8 INTERIM.
 
     # ---- emit PLAYBACK_POS_CHANGED (event 0x05) on track edge ----
     # Carries the current position (= duration_ms on natural end, = 0 on
@@ -1213,7 +1187,7 @@ def _emit_t_papp(a: Asm) -> None:
         0x16 ValueText        : 1 byte attr_id + 1 byte n + n value_ids
 
     Builder calling conventions (see ARCHITECTURE.md "PlayerApplicationSettings
-    response builders" + INVESTIGATION.md Trace #17 for the disassembly).
+    response builders" + docs/INVESTIGATION.md for the disassembly).
     """
     a.label("T_papp")
 
@@ -1748,13 +1722,10 @@ G_Y1_TRACK_INFO_MMAP_BASE_VADDR = 0xd2cc
 # re-subscribed yet because the gate skips). The on-disk y1-trampoline-state
 # file is no longer read or written by the trampolines.
 #
-# History: the prior block at 0xd2a4 collided with a stripped stock global
-# at 0xd2ac that `fcn.000036c0` reads as a pointer and passes to a vtable
-# method via `blx r3`. Our state[8..11] writes corrupted that pointer, and
-# the next stock call SIGSEGV'd in the BTAvrcpMusicAda thread. The bisection
-# (1c233cc clean / e2719c7 broken) plus the radare2 xref scan at byte
-# granularity identified the exact corruption site and the verified-safe
-# replacement gap. See INVESTIGATION.md Trace #86.
+# 0xd2d6 was verified clean (no stock .text xrefs land within the 13-byte
+# range) via per-byte `axt` queries against the full radare2 analysis. The
+# 0xd2a4..0xd2b4 range nearby is hostile — stripped statics near __bss_start
+# cluster there. See docs/INVESTIGATION.md for the verification methodology.
 G_Y1_TRAMPOLINE_STATE_VADDR = 0xd2d6
 Y1_TRAMPOLINE_STATE_SIZE    = 13
 
@@ -2106,8 +2077,7 @@ def _emit_read_track_info_subroutine(a: Asm) -> None:
 
     Byte-copy loop is O(nbytes) but executes in cache after the first
     iteration — ~1100 instructions for a full 1104-byte copy, well under a
-    microsecond on Cortex-A7. Compare to ~21 ms for the prior open+read+close
-    syscall chain (Trace #74).
+    microsecond on Cortex-A7.
     """
     a.label("read_track_info")
     # push {r3, r4-r7, lr} — same alignment rationale as get_or_init_mmap.

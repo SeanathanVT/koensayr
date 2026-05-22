@@ -743,7 +743,7 @@
     #      live_pos = duration + (now - completion_time) on every PPC tick,
     #      which CTs render as "playhead at end of track, frozen there"
     #      even though audio is playing the freshly re-prepared track from 0.
-    #      Trace #79 in docs/INVESTIGATION.md.
+    #      Detail in docs/INVESTIGATION.md.
     iget-boolean v4, p0, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->mPreviousTrackNaturalEnd:Z
 
     if-nez v4, :cond_force_reset

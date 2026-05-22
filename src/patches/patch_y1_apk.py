@@ -1871,7 +1871,7 @@ DBG_VALUE_PATCHES_TRACKINFOWRITER = [
     # onTrackEdge: log when the reset branch fires. Two triggers funnel here:
     #   1. audio_id changed (real track edge)
     #   2. mPreviousTrackNaturalEnd was set (EOS-replay-same-track — see
-    #      Trace #79 in docs/INVESTIGATION.md)
+    #      docs/INVESTIGATION.md)
     # Inject AFTER :cond_force_reset so both paths emit the log.
     (
         "    if-eqz v4, :cond_same_track\n"
@@ -2659,7 +2659,7 @@ print(f"  Patch B5.5: MusicPlayerActivity onResume/onPause + refreshRepeatShuffl
 # hosts the Binder MtkBt actually resolves to.
 #
 # The smali is kept in tree so MtkBt.odex component-bind work (see
-# docs/INVESTIGATION.md Trace #23) doesn't have to recreate it from scratch.
+# docs/INVESTIGATION.md for the RE) doesn't have to recreate it from scratch.
 
 PATCH_B6_INJECT_FILES = [
     ("com/koensayr/y1/avrcp/AvrcpBridgeService.smali",

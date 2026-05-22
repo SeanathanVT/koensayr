@@ -54,13 +54,14 @@ EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 PLT_android_log_print = 0xaef8
 
 # LOAD #1 sizing. Stock filesz = 0xf366c (16 bytes before M5's cave end). M5
-# extends to 0xf3698 (M5 cave is 24 bytes after the M7 unconditional-sync
-# extension). The DEBUG caves add wire-frame log instrumentation past that
-# and the segment must be extended further to cover them.
+# extends to 0xf3698 (the 24-byte cave starts at 0xf3680; the 20 bytes of
+# preceding zero-padding are absorbed). The DEBUG caves add wire-frame log
+# instrumentation past that and the segment must be extended further to cover
+# them.
 LOAD1_STOCK_END      = 0xf366c
 LOAD1_RELEASE_END    = 0xf3698
 DEBUG_CAVE_VADDR     = 0xf36a0    # D1: chan+0x39 read-time log (M5wire c39=NN)
-DEBUG_CAVE2_VADDR    = 0xf3700    # D2: M5+M7 exit-time multi-value log
+DEBUG_CAVE2_VADDR    = 0xf3700    # D2: M5 exit-time multi-value log
 
 # Hard ceiling for any LOAD #1 padding writes. The stock ELF lays LOAD #2's
 # file offset at 0xf3d40; anything past that overwrites .data / .got and
@@ -153,8 +154,7 @@ BASE_PATCHES = [
         # populated by the request parser at RX time), not from the
         # dispatch handler. So the response carries sig_id=0x0c matching
         # the request, even though dispatch routes through the sig 0x02
-        # handler. See docs/BT-COMPLIANCE.md §9.13 and
-        # docs/INVESTIGATION.md Trace #16.
+        # handler. See docs/BT-COMPLIANCE.md §9.13 and docs/INVESTIGATION.md.
         "name":   "[V5] sig 0x0c -> sig 0x02 dispatch alias  AVDTP TBH jump table",
         "offset": 0x0aa834,
         "before": bytes([0x60, 0x06]),
@@ -219,8 +219,7 @@ BASE_PATCHES = [
         # to drop into a passthrough-only mode (no RegisterNotification,
         # no metadata refresh on track skip). The TG record's entry table
         # is hard-capped at 6 slots and a non-destructive way to add a 7th
-        # wasn't found in deep RE; restoring BrowseGroupList was the
-        # decisive fix per docs/INVESTIGATION.md Trace #87. P_PN0 is kept
+        # wasn't found in deep RE; BrowseGroupList must stay. P_PN0 is kept
         # so the descriptor bytes are present in the binary for if/when a
         # safe path to a 7th entry slot is found.
         "name":   "[P_PN0] write TEXT_STR_8 \" \" SDP descriptor for ProviderName attribute (dormant)",
@@ -288,8 +287,9 @@ BASE_PATCHES = [
         #                     → `movs r1, 0xD` at 0x12244 overwrites ctype to 0x0D
         # Both branches converge at 0x1224a and pass r1 to fcn.0x11894 which
         # stores it into packetFrame[0xb]; downstream fcn.0xef08 then writes
-        # packetFrame[0xb] as wire byte 0 (the AV/C ctype). Trace #37 verified
-        # the full chain by single-stepping INTERIM and CHANGED on the wire.
+        # packetFrame[0xb] as wire byte 0 (the AV/C ctype). The full chain
+        # is verified by single-stepping INTERIM and CHANGED on the wire
+        # (see docs/INVESTIGATION.md).
         #
         # The stock CHANGED branch hardcodes ctype = 0x0D. M6 NOPs the
         # `movs r1, 0xD` so the CHANGED branch retains whatever ctype value
@@ -306,7 +306,7 @@ BASE_PATCHES = [
         # CTs that don't subscribe to new ctype values.
         #
         # End-to-end static verification (no ctype filtering anywhere
-        # downstream): Trace #60 "M6 verification gap" walkthrough.
+        # downstream): see docs/INVESTIGATION.md.
         "name":   "[M6] RegNotif CHANGED-branch ctype pass-through: NOP movs r1, 0xD (mtkbt 0x12244)",
         "offset": 0x12244,
         "before": bytes([0x0d, 0x21]),  # movs r1, 0xD
@@ -370,21 +370,20 @@ BASE_PATCHES = [
         # wire frame — and the caller (fcn.0xf0bc) treats this as success
         # via `cmp r5, 2; bne 0xf208` so the drop is silent.
         #
-        # Empirically (dual-kia-20260515-2215, Trace #40), the list is
-        # populated whenever the chip is ready and emptied when the chip
-        # is mid-write. Under A2DP saturation the conn is in the list only
-        # ~10-20% of the time, so 80% of our T9 emits drop here. AVRCP_
-        # SendMessage's return path doesn't surface this because send()
-        # already succeeded (the datagram was queued into mtkbt's IPC recv
-        # buffer); the drop happens further down inside mtkbt itself.
+        # The list is populated whenever the chip is ready and emptied when
+        # the chip is mid-write. Under A2DP saturation the conn is in the
+        # list only intermittently and the gate drops outbound emits.
+        # AVRCP_SendMessage's return path doesn't surface this because
+        # send() already succeeded (the datagram was queued into mtkbt's
+        # IPC recv buffer); the drop happens further down inside mtkbt.
         #
         # M2 NOPs the `beq 0x6d0e0` at file offset 0x6d06e (2 bytes,
         # `37 d0` → `00 bf`). After M2, fcn.0x6d048 unconditionally builds
         # the wire frame and tail-calls fcn.0x6df20 — bypassing the
         # "is-this-conn-active" check. Safe because:
-        #   - The list state was a chip-readiness heuristic, not a
+        #   - The list state is a chip-readiness heuristic, not a
         #     correctness check. Conn pointer is stable across the BT
-        #     pairing session (per Trace #40's enableNative RE).
+        #     pairing session.
         #   - The downstream send (fcn.0xae5e4 / fcn.0xae418) handles
         #     its own per-channel busy state.
         "name":   "[M2] Outbound-frame drop bypass: NOP gate 1 list-contains check (mtkbt 0x6d06e)",
@@ -402,10 +401,9 @@ BASE_PATCHES = [
         # fcn.0xae5e4, and CLEARED at fcn.0x6d9b8:0x6da10 in the
         # send-completion handler when the chip ACKs the write.
         #
-        # Empirically (dual-kia-20260515-2215, Trace #40), this gate
-        # combines with M2's gate 1 to produce the ~18% delivery rate
-        # for PSTAT and ~9% for POS. Between mtkbt initiating a chip-write
-        # and the chip's ACK event, the busy flag is set and all new
+        # This gate combines with M2's gate 1 to drop outbound CHANGED
+        # emits under sustained traffic. Between mtkbt initiating a chip-
+        # write and the chip's ACK event, the busy flag is set and all new
         # emits drop silently.
         #
         # M3 NOPs the SET at 0x6df42 (4 bytes, `84 f8 f2 00` → two NOPs).
@@ -436,24 +434,20 @@ BASE_PATCHES = [
         # outbound serialization SET at `0x6df42`). The OTHER writer at
         # `fcn.0x6d9ac:0x6dda8` (inbound-AVRCP-CMD callback path; fires
         # when the callback returns CType=0x0F INTERIM) is left intact —
-        # NOPping it broke Sonos (see Sonos 1640 regression at M9 revert
-        # df133fa: Sonos's PSC CHANGED count went from 6 → 0 and ev=01
-        # re-registration cycle stopped; the strb at 0x6dda8 is part of
-        # the inbound-CMD acknowledgement state machine Sonos depends on).
+        # NOPping it breaks the inbound-CMD acknowledgement state machine
+        # some CTs depend on (verified empirically — see docs/INVESTIGATION.md).
         #
         # The CHECK at `0x6df3a` (`cbnz r3, 0x6df52`) drops the outbound
         # frame with rc=0xb if `chan+0xf2 != 0`. M3 alone doesn't disarm
         # the gate because the inbound SET at `0x6dda8` still fires for
         # every RegisterNotification CMD whose callback returns INTERIM,
         # leaving `chan+0xf2 = 1` indefinitely for sparse-re-registration
-        # CTs (Bolt EV: registers ev=01 once at pair time, then waits
-        # 18+ seconds before any state change; chan+0xf2 stays set the
-        # whole window and the PSC CHANGED emit at the state edge drops).
-        # Sonos works pre-M10 because it re-registers ev=01 ~9 times per
-        # session, and the L2CAP TX-complete callbacks for those INTERIM
-        # responses cycle the flag through CLEAR sites in fcn.0x6da50
-        # fast enough that the CHANGED emit windows usually find
-        # chan+0xf2 = 0.
+        # CTs (register an event once at pair time, then wait many seconds
+        # before any state change; chan+0xf2 stays set the whole window
+        # and the CHANGED emit at the state edge drops). CTs that re-register
+        # frequently (each subscription cycle's INTERIM L2CAP TX-complete
+        # callback runs the CLEAR sites in fcn.0x6da50) accidentally find
+        # chan+0xf2 = 0 most of the time and work pre-M10.
         #
         # M10 NOPs the CHECK instead of the SET. After M10, the gate is
         # informational only (`chan+0xf2` still gets read at 0x6df36
@@ -578,43 +572,30 @@ BASE_PATCHES = [
         #   00 bf              nop                        — padding
         #   01 d0              beq +2 (skip strb on outbound)
         #   84 f8 29 00        strb.w r0, [r4, 0x29]      — inbound: chan+0x39 = TID
-        #   00 bf 00 bf        2 × nop                    — was M7 ldrb.w (removed)
-        #   00 bf 00 bf        2 × nop                    — was M7 strb.w (removed)
+        #   00 bf 00 bf        2 × nop                    — reserved padding
+        #   00 bf 00 bf        2 × nop                    — reserved padding
         #   79 f7 7a bd        b.w 0x6d18c                — return into Path B
         #
-        # Rationale (post-Trace #70). mtkbt's STOCK outbound chain already
-        # writes the correct AVRCP §3.3.5 echo TID at chan+0x39 via
-        # fcn.0xf0bc:0xf1a8 (`ldrb r3, [r0, 0xa]; strb.w r3, [r4, 0x31]`),
-        # where r0 = packet pointer, packet[+0xa] = msg[5] = JNI-supplied
-        # TID = libextavrcp's conn[+0x11] read. The only TID-echo bug in
-        # the stock binary was that Path B's `0x6d186 strb.w r0, [r4, 0x29]`
-        # then clobbers chan+0x39 with `packet[+0xd]` (= 0 for outbound,
-        # allocator-zeroed). This cave's only job is to skip that strb on
-        # outbound while preserving inbound semantics.
+        # mtkbt's stock outbound chain writes the correct AVRCP §3.3.5
+        # echo TID at chan+0x39 via fcn.0xf0bc:0xf1a8 (`ldrb r3, [r0, 0xa];
+        # strb.w r3, [r4, 0x31]`), where r0 = packet pointer, packet[+0xa]
+        # = msg[5] = JNI-supplied TID = libextavrcp's conn[+0x11] read.
+        # The remaining TID-echo bug in the stock binary is that Path B's
+        # `0x6d186 strb.w r0, [r4, 0x29]` then clobbers chan+0x39 with
+        # `packet[+0xd]` (= 0 for outbound, allocator-zeroed). This cave's
+        # job is to skip that strb on outbound while preserving inbound
+        # semantics.
         #
         # Discriminator: `cmp r0, 0` (uses the already-loaded packet[+0xd]).
         # `packet[+0xd] == 0` ↔ outbound (allocator-zeroed); nonzero ↔
         # inbound (per-channel stash struct's TID slot). Empirically
-        # verified across TV / Sonos / Bolt sessions via the D2 cave's
-        # `M5dbg pd=NN` logs (D2 stays for forward verification).
+        # verified across CT sessions via the D2 cave's `M5dbg pd=NN`
+        # logs (D2 stays for forward verification).
         #
-        # M7's chan+0xba9-sync removed: M7 was a Trace #66 attempt to
-        # bypass M5's broken `cmp r2, 1` discriminator (which never matched
-        # because mtkbt's IPC allocators leave packet[+8] = 0xb8/0xea, not
-        # 1). M7 worked for fast-CHANGED events (chan+0xba9 happens to
-        # match the saved msg[5] when CHANGED fires within ms of the
-        # RegNotif) but ACTIVELY BROKE delayed CHANGEDs (M7 overwrote the
-        # correctly-saved per-event TID at chan+0x39 with the latest
-        # inbound CMD's TID). The Bolt 1053 session confirmed the
-        # interaction: per-event TID save/restore at JNI side (commit
-        # 705f145) was emitting the right msg[5], but M7 then clobbered
-        # chan+0x39 right before the wire builder read it.
-        #
-        # With M7 removed and M5's discriminator using packet[+0xd] == 0
-        # instead of packet[+8] == 1, the cave correctly preserves
-        # fcn.0xf0bc's chan+0x39 write on outbound while still latching
-        # inbound TIDs into chan+0x39 on inbound CMD frames.
-        "name":   "[M5-CAVE] TID echo cave @ 0xf3680 (24 B; skip-strb-on-outbound discriminator + NOP padding; M7 removed)",
+        # 8 bytes at 0xf368c..0xf3693 are NOP padding inside the 24-byte
+        # cave, reserved for future use without requiring a LOAD #1
+        # filesz bump.
+        "name":   "[M5-CAVE] TID echo cave @ 0xf3680 (24 B; skip-strb-on-outbound discriminator + NOP padding)",
         "offset": 0xf3680,
         "before": bytes([0x00] * 24),
         "after":  bytes([
@@ -623,8 +604,8 @@ BASE_PATCHES = [
             0x00, 0xbf,                    # nop (padding)
             0x01, 0xd0,                    # beq +2 (skip strb on outbound)
             0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]    (inbound only)
-            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (was M7 ldrb.w chan+0xba9)
-            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (was M7 strb.w chan+0x39)
+            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (reserved padding)
+            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (reserved padding)
             0x79, 0xf7, 0x7a, 0xbd,        # b.w 0x6d18c
         ]),
     },
@@ -714,7 +695,7 @@ def build_debug_cave2_blob(cave_vaddr: int) -> bytes:
     a.blx_imm(PLT_android_log_print)
 
     a.raw(bytes([0xbd, 0xe8, 0x1f, 0x40]))         # pop.w {r0-r4, lr}
-    a.labels["ret"] = 0x6d18c                       # original M5+M7 return target
+    a.labels["ret"] = 0x6d18c                       # Path B return target
     a.b_w("ret")
 
     a.align(2)
@@ -756,9 +737,9 @@ def build_patches(debug: bool) -> list[dict]:
             },
         ])
 
-        # D2: M5+M7 exit-time log. Re-emit the M5+M7 cave with its tail
-        # b.w pointed at the D2 cave instead of directly at 0x6d18c. D2
-        # logs packet[+8] / packet[+0xd] / chan+0xba9, then b.w's back to
+        # D2: M5 exit-time log. Re-emit the M5 cave with its tail b.w
+        # pointed at the D2 cave instead of directly at 0x6d18c. D2 logs
+        # packet[+8] / packet[+0xd] / chan+0xba9, then b.w's back to
         # 0x6d18c. Rewriting the M5-CAVE site (rather than overlapping it
         # with a separate hook patch) keeps post-patch verification clean.
         blob2 = build_debug_cave2_blob(DEBUG_CAVE2_VADDR)
@@ -768,19 +749,17 @@ def build_patches(debug: bool) -> list[dict]:
         m5_cave_tail = Asm(0xf3694)
         m5_cave_tail.labels["cave2"] = DEBUG_CAVE2_VADDR
         m5_cave_tail.b_w("cave2")
-        # Same cave body as the release build's BASE_PATCHES entry —
-        # M5 with skip-strb-on-outbound discriminator (cmp r0, 0), M7
-        # removed (replaced with NOP padding) — but with the final b.w
-        # redirected to the D2 cave so D2 can log packet[+8] / pd / ba9
-        # before returning to the original 0x6d18c.
+        # Same cave body as the release build's BASE_PATCHES entry, but
+        # with the final b.w redirected to the D2 cave so D2 can log
+        # packet[+8] / pd / ba9 before returning to the original 0x6d18c.
         m5_cave_with_d2_redirect = bytes([
             0x68, 0x7b,                    # ldrb r0, [r5, 0xd]
             0x00, 0x28,                    # cmp r0, 0
             0x00, 0xbf,                    # nop (padding)
             0x01, 0xd0,                    # beq +2 (skip strb on outbound)
             0x84, 0xf8, 0x29, 0x00,        # strb.w r0, [r4, 0x29]
-            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (was M7 ldrb.w)
-            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (was M7 strb.w)
+            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (reserved padding)
+            0x00, 0xbf, 0x00, 0xbf,        # nop, nop (reserved padding)
         ]) + m5_cave_tail.resolve()        # b.w D2_cave (replaces b.w 0x6d18c)
 
         # Replace the BASE_PATCHES M5-CAVE entry's `after` in-place so the
@@ -790,13 +769,13 @@ def build_patches(debug: bool) -> list[dict]:
             if p["offset"] == 0xf3680 and len(p["after"]) == 24:
                 p["after"] = m5_cave_with_d2_redirect
                 p["name"] = p["name"].replace(
-                    "M7 removed)",
-                    "M7 removed; D2 exit-log redirect for diagnostics)"
+                    "NOP padding)",
+                    "NOP padding; D2 exit-log redirect for diagnostics)"
                 )
                 break
 
         patches.append({
-            "name":   f"[D2-CAVE] M5+M7 multi-value log blob @ 0x{DEBUG_CAVE2_VADDR:x} ({len(blob2)} B in LOAD #1 padding)",
+            "name":   f"[D2-CAVE] M5 multi-value log blob @ 0x{DEBUG_CAVE2_VADDR:x} ({len(blob2)} B in LOAD #1 padding)",
             "offset": DEBUG_CAVE2_VADDR,
             "before": bytes([0x00] * len(blob2)),
             "after":  blob2,

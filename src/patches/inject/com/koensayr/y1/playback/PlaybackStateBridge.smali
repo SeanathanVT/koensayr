@@ -306,7 +306,7 @@
     # so CTs that gate metadata refresh on PlaybackStatus CHANGED (not
     # TrackChanged CHANGED) refetch immediately on track edge instead of
     # waiting for their polling cycle. See TrackInfoWriter.
-    # pulsePlayStatusForCT docstring + INVESTIGATION.md Trace #75.
+    # pulsePlayStatusForCT docstring + docs/INVESTIGATION.md.
     invoke-virtual {v0}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->pulsePlayStatusForCT()V
 
     return-void

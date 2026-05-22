@@ -21,7 +21,7 @@ Byte-level reference for the patches currently shipped by this repo. Each sectio
 
 Nine byte patches against stock `/system/bin/mtkbt`. Seven reshape the served SDP record so a peer CT engages with AVRCP 1.3 COMMANDs (per AVRCP 1.3 §6 Service Discovery Interoperability Requirements + ESR07 §2.1 / Erratum 4969 clarifying AVCTP version values), one reroutes inbound VENDOR_DEPENDENT frames into the JNI msg-519 emit path so the trampoline chain can respond, and one is a best-effort dispatch alias for AVDTP signal 0x0c.
 
-The mtkbt daemon ships two physical AVRCP TG SDP record templates in `.data.rel.ro`. The internal `activeVersion` field selects which is served on the wire: stock = 10 (legacy 1.0 record), V6 → 14 (AVRCP 1.3 record). V1/V2/S1 patch the legacy record (kept for the fall-through path); V7/V8 patch the AVRCP 1.3 record (where V6 routes the daemon by default) so it conforms to AVRCP 1.3 §6 Table 6.2 SDP record shape — no AdditionalProtocolDescriptorList (a 1.4-introduced attribute per AVRCP 1.4 §8 Table 8.2), Group Navigation feature bit cleared (the bit exists in 1.3 §6 Table 6.2 but Y1 doesn't implement the Group Navigation PASSTHROUGH PDUs). P_PN0 writes a `0x0102 ProviderName " "` SDP descriptor into a previously-unused gap in the data area; the descriptor is currently dormant because the AVRCP 1.3 TG record's entry table is hard-capped at 6 slots, all occupied by spec-mandatory or Bolt-critical attributes (see Trace #87 in `docs/INVESTIGATION.md`). `0x0005 BrowseGroupList={PublicBrowseRoot}` is retained — empirically required by some CTs (Bolt EV) to take the full AVRCP-setup CT path rather than a passthrough-only fallback.
+The mtkbt daemon ships two physical AVRCP TG SDP record templates in `.data.rel.ro`. The internal `activeVersion` field selects which is served on the wire: stock = 10 (legacy 1.0 record), V6 → 14 (AVRCP 1.3 record). V1/V2/S1 patch the legacy record (kept for the fall-through path); V7/V8 patch the AVRCP 1.3 record (where V6 routes the daemon by default) so it conforms to AVRCP 1.3 §6 Table 6.2 SDP record shape — no AdditionalProtocolDescriptorList (a 1.4-introduced attribute per AVRCP 1.4 §8 Table 8.2), Group Navigation feature bit cleared (the bit exists in 1.3 §6 Table 6.2 but Y1 doesn't implement the Group Navigation PASSTHROUGH PDUs). P_PN0 writes a `0x0102 ProviderName " "` SDP descriptor into a previously-unused gap in the data area; the descriptor is currently dormant because the AVRCP 1.3 TG record's entry table is hard-capped at 6 slots, all occupied by spec-mandatory attributes. `0x0005 BrowseGroupList={PublicBrowseRoot}` is retained — empirically required by some CTs to take the full AVRCP-setup CT path rather than a passthrough-only fallback.
 
 **V1 — AVRCP 1.0 → 1.3** at file `0x0eba58` (1 byte): `0x00` → `0x03`. LSB of the served Group D ProfileDescList Version field.
 
@@ -78,9 +78,7 @@ LSB of the AVRCP 1.3 served record's SupportedFeatures `uint16` (byte stream `09
 | before | `00 00 00 00` | (unused padding inside the SDP data area) |
 | after  | `25 02 20 00` | SDP TEXT_STR_8 ds + len=2 + `' '` + `'\0'` |
 
-Writes a `0x0102 ProviderName " "` SDP descriptor into a 36-byte zero-padded gap between two unrelated SDP data blocks. **The descriptor is dormant** — no entry slot in any record currently references it. P_PN0 was originally paired with a P_PN1 patch (removed; see history below) that swapped the AVRCP 1.3 TG record's `0x0005 BrowseGroupList` entry slot for `0x0102 ProviderName`. The descriptor write is left in place so the bytes are ready if a non-destructive way to add a 7th entry slot to the AVRCP 1.3 TG record is found in the future.
-
-History: P_PN1 (`0x0005 BrowseGroupList → 0x0102 ProviderName`) shipped briefly in commit `f19ad7c` (2026-05-20) and was reverted in commit `bde5707` (2026-05-21) after `dual-bolt-20260520-2154` showed that removing `BrowseGroupList={PublicBrowseRoot}` caused Bolt EV's AVRCP CT to skip the full setup handshake (no `InformDisplayableCharacterSet`, no `RegisterNotification × 9`) and fall into a passthrough-only mode. Bolt's CT reads `BrowseGroupList` membership as a signal of full AVRCP support. Full RE in `docs/INVESTIGATION.md` Trace #87. The AVRCP 1.3 TG record's entry table is hard-capped at 6 slots, all occupied by spec-mandatory + Bolt-critical attributes; a non-destructive path to a 7th slot wasn't found in deep RE of the SDP record builder.
+Writes a `0x0102 ProviderName " "` SDP descriptor into a 36-byte zero-padded gap between two unrelated SDP data blocks. **The descriptor is dormant** — no entry slot in any record currently references it. The AVRCP 1.3 TG record's entry table is hard-capped at 6 slots, all currently occupied by spec-mandatory attributes including `0x0005 BrowseGroupList={PublicBrowseRoot}` (empirically required by some CTs to take the full AVRCP-setup path rather than a passthrough-only fallback). The descriptor bytes are left in place so they're ready if a non-destructive way to add a 7th entry slot is found in the future.
 
 **S1 — `0x0311 SupportedFeatures` → `0x0100 ServiceName`** at file `0x0f97ec` (12 bytes):
 
@@ -129,7 +127,7 @@ Wire trigger (dual-bolt-20260520-1543 t=603547):
 
 After M8, step 4 is a no-op; the AVCTP control channel survives the audio stream cycle. Spec basis: AVRCP V13 §4 states the AVCTP signaling channel for AVRCP is independent of any AVDTP audio channel — CTs are allowed to cycle audio without disturbing AVRCP. True ACL link loss (peer powered off / out of range) is still caught by the baseband link-supervision timeout independently of this software path, so the failure mode for genuine disconnection is preserved.
 
-End-to-end RE walkthrough: `docs/INVESTIGATION.md` Trace #85.
+End-to-end RE walkthrough lives in `docs/INVESTIGATION.md`.
 
 **M6 — RegNotif CHANGED-branch ctype pass-through: NOP movs r1, 0xD** at file `0x12244` (1 site, 2 bytes):
 
@@ -148,7 +146,7 @@ M6 NOPs the `movs r1, 0xD` so the CHANGED branch retains whatever value `ctxt[8]
 
 Pure no-op for the existing 0x0F / 0x0D call sites in `_trampolines.py` (T2, extended_T2, T5, T8, T9, T_papp) and `libextavrcp.so`'s `reg_notievent_*_rsp` helpers. M6 only changes wire behaviour when a future caller deliberately passes a non-0x0F-and-non-0x0D AV/C ctype value via the helper's `reasonCode` argument.
 
-End-to-end static verification of the chain (no ctype filtering anywhere downstream of `packetFrame[0xb]`): `docs/INVESTIGATION.md` Trace #60 "Option 2 (M6) static verification" walkthrough.
+End-to-end static verification of the chain (no ctype filtering anywhere downstream of `packetFrame[0xb]`) lives in `docs/INVESTIGATION.md`.
 
 **M2 — Outbound-frame drop bypass: NOP gate 1 list-contains check** at file `0x6d06e` (1 site, 2 bytes):
 
@@ -158,7 +156,7 @@ End-to-end static verification of the chain (no ctype filtering anywhere downstr
 
 Stock `fcn.0x6d048` (outbound-frame builder reached from `fcn.0xf0bc → fcn.0xed50 → fcn.0x6d048 → fcn.0x6df20 → fcn.0xae5e4` for short-frame AVRCP responses under the L2CAP MTU — PSTAT, REACHED_END/START, batt status) calls `fcn.0x6ccdc` (doubly-linked-list contains check) against `g_active_conn_list` at `*(0xf99XX)`. If the conn isn't in the list, returns `0xd` and skips the wire-frame build; the caller (`fcn.0xf0bc`) treats this as success via `cmp r5, 2; bne 0xf208`.
 
-M2 NOPs the `beq 0x6d0e0`, so the function unconditionally builds the wire frame and tail-calls `fcn.0x6df20`. The list state was a chip-readiness heuristic that empirically gated nothing measurable (the wire-side drop rate was a btlog sampling artifact — see `docs/INVESTIGATION.md` Trace #40 closure). The downstream send chain handles its own per-channel state, so removing this gate is safe; net wire-side delivery unchanged in observed captures, but the gate's removal eliminates one source of "did this CHANGED reach the wire?" ambiguity for future RE.
+M2 NOPs the `beq 0x6d0e0`, so the function unconditionally builds the wire frame and tail-calls `fcn.0x6df20`. The list state was a chip-readiness heuristic that empirically gated nothing measurable. The downstream send chain handles its own per-channel state, so removing this gate is safe; net wire-side delivery unchanged in observed captures, but the gate's removal eliminates one source of "did this CHANGED reach the wire?" ambiguity for future RE.
 
 **M3 — Chip-busy gate bypass: NOP set-busy-flag** at file `0x6df42` (1 site, 4 bytes):
 
@@ -168,7 +166,7 @@ M2 NOPs the `beq 0x6d0e0`, so the function unconditionally builds the wire frame
 
 Stock `fcn.0x6df20` (second-stage outbound send, tail-called from M2's site) tests `ctx[0xf2]` (chip-write busy flag) at `0x6df3a`. If set, returns `0xb`. The flag is set at `0x6df42` just before the chip-send tail-call to `fcn.0xae5e4`, and cleared at `fcn.0x6d9b8:0x6da10` in the send-completion handler when the chip ACKs the write.
 
-M3 NOPs ONE of two writers of `chan+0xf2`. The other writer (`fcn.0x6da50:0x6dda8`, fires when the inbound RegisterNotification callback returns CType=0x0F INTERIM) is preserved — Sonos's inbound state machine depends on it (verified empirically via M9 regression at `df133fa`: NOPping `0x6dda8` made Sonos's ev=01 re-registration cycle stop, dropping PSC CHANGED count from 6 to 0). Because the inbound-side writer is still active, M3 alone leaves the gate able to trip for sparse-re-registration CTs (Bolt EV registers ev=01 once at pair time; `chan+0xf2` stays set indefinitely until L2CAP TX-complete events cycle the CLEAR sites in `fcn.0x6da50`, which only happens during sustained inbound traffic). **M10 (below) completes the bypass by NOPping the GATE CHECK rather than the inbound SET.**
+M3 NOPs ONE of two writers of `chan+0xf2`. The other writer (`fcn.0x6da50:0x6dda8`, fires when the inbound RegisterNotification callback returns CType=0x0F INTERIM) is preserved — some CTs' inbound state machines depend on it. Because the inbound-side writer is still active, M3 alone leaves the gate able to trip for sparse-re-registration CTs (CTs that register an event once at pair time then never re-register; `chan+0xf2` stays set indefinitely until L2CAP TX-complete events cycle the CLEAR sites in `fcn.0x6da50`, which only happens during sustained inbound traffic). **M10 (below) completes the bypass by NOPping the GATE CHECK rather than the inbound SET.**
 
 **M10 — Path A `chan+0xf2` GATE bypass: NOP cbnz** at file `0x6df3a` (1 site, 2 bytes):
 
@@ -178,7 +176,7 @@ M3 NOPs ONE of two writers of `chan+0xf2`. The other writer (`fcn.0x6da50:0x6dda
 
 Companion to M3. Removes the gate CHECK rather than the SET. After M3+M10, `fcn.0x6df20` unconditionally proceeds to `fcn.0xae5e4` (L2CAP send); the read of `chan+0xf2` at `0x6df36` still happens but its result no longer controls flow.
 
-**Empirical motivation:** Bolt 1326 capture (2026-05-21) showed `T9ps` firing 3× in logcat with paired `EXTADP_AVRCP: send msg success` entries, but ZERO `len=15 CType=0x0D` PSC CHANGED frames at AVCTP cid 0x43 in the matching `btlog.bin`. PPC CHANGED (46×), NPC CHANGED (3×), and TC CHANGED (1×) all shipped — only PSC was 100% dropped. Sonos 1102 capture (working baseline) showed 6× PSC CHANGED frames with 9× ev=01 re-registrations, suggesting the cycle worked but with ~25% drops. M9 (NOPping the inbound-SET at `0x6dda8`) was an incorrect fix: it broke Sonos's inbound state, dropping PSC CHANGED to 0 there too. The correct fix is M10: leave the inbound SET intact, NOP the outbound GATE CHECK.
+**Empirical motivation:** on sparse-re-registration CTs (a single RegisterNotification at pair time, no re-registers for the remainder of the session), the inbound INTERIM at `0x6dda8` SETs `chan+0xf2` and nothing CLEARs it before the next outbound PSC CHANGED tries to ship. The CHECK at `0x6df3a` drops the response. M10 NOPs the CHECK so the gate becomes informational only; the inbound SET stays intact so well-behaved CTs that depend on it are unaffected.
 
 **Safety:**
 
@@ -212,7 +210,7 @@ CTs that cycle AV/C transIds across the 0-15 range (`AVCTP §6.1` transaction-la
 
 The cave places a conditional-store trampoline in the LOAD #1 page-padding region (same ELF-extension trick used by `patch_libextavrcp_jni.py` for its trampoline blob — extend the segment's filesz / memsz to claim previously-unmapped zero-padding bytes as R+E). The cave skips the outbound strb (preserving `fcn.0xf0bc:0xf1a8`'s prior write of `chan+0x39 = packet[+0xa] = msg[5]`) and lets the inbound strb fire (writing `chan+0x39 = packet[+0xd]` = inbound TID).
 
-Discriminator: `cmp r0, 0` using the already-loaded `packet[+0xd]`. Outbound IPC packets have `packet[+0xd] = 0` (allocator-zeroed at `fcn.0x11894:0x11926` — `movs r6, 0; strb r6, [r4, 0xd]`). Inbound stash struct's `+0xd` is the inbound TID (nonzero in the common case). Empirically validated across TV / Sonos / Bolt sessions via the D2 cave's `M5dbg pd=NN` logs — `pd=0` correlates 1:1 with outbound IPC packets.
+Discriminator: `cmp r0, 0` using the already-loaded `packet[+0xd]`. Outbound IPC packets have `packet[+0xd] = 0` (allocator-zeroed at `fcn.0x11894:0x11926` — `movs r6, 0; strb r6, [r4, 0xd]`). Inbound stash struct's `+0xd` is the inbound TID (nonzero in the common case). Empirically validated across CT sessions via the D2 cave's `M5dbg pd=NN` logs — `pd=0` correlates 1:1 with outbound IPC packets.
 
 AVCTP §3.3.5 strict TID echo correctness depends on the JNI side writing `conn[+0x11] = inbound CMD's TID` before every `*_rsp` builder call. RegNotif paths source the TID from `g_avrcp_req_event_database[event_id]`; non-RegNotif paths source it from the stack at `sp+0x171` via T4's prologue. See `patch_libextavrcp_jni.py` "AVCTP V13 §3.3.5 strict TID echo" section below. With those writes in place, `fcn.0xf0bc:0xf1a8` writes the correct TID into chan+0x39, and this cave preserves it across the outbound strb at `0x6d186`.
 
@@ -231,11 +229,11 @@ Cave disassembly (24 bytes at `0xf3680`):
 
 Edge case: inbound CMDs with TID=0 fall into the outbound branch (skip strb). chan+0x39 isn't updated from the inbound. This doesn't affect wire echo because every outbound response goes through fcn.0xf0bc which rewrites chan+0x39 from packet[+0xa] = msg[5]. The inbound strb is therefore redundant in the working flow; it's kept for compatibility with any code path that reads chan+0x39 between an inbound CMD and the next outbound response.
 
-Historical: an earlier iteration (commit fe974f2) added an `M7` unconditional `chan+0xba9 → chan+0x39` sync after M5's conditional branch, attempting to bypass M5's then-broken `cmp r2, 1` discriminator (empirically `packet[+8]` is `0xb8` or `0xea`, never `1`). M7 appeared to fix CTs cycling AVCTP transaction IDs but actually overrode the correctly-saved per-event TID for delayed CHANGED emits — `chan+0xba9` carries the *latest* inbound CMD's TID, not the per-event saved TID. Removed once the JNI-side per-event TID save/restore was in place (commit 705f145) — see `docs/INVESTIGATION.md` Trace #70. The 8-byte M7 sequence is now NOP padding; cave size unchanged at 24 B to avoid touching LOAD #1 filesz.
+The 8 bytes at `0xf368c..0xf3693` are NOP padding inside the 24-byte cave, reserved for future use without requiring a LOAD #1 filesz bump.
 
 LOAD #1 filesz / memsz expand from `0xf366c` to `0xf3698` (a 44-byte extension — the cave at `0xf3680` is 24 bytes; the 20 bytes of preceding zero-padding `0xf366c..0xf3680` are absorbed harmlessly). No section headers are modified; the kernel ELF loader maps segments by program headers exclusively.
 
-**MD5s:** Stock `3af1d4ad8f955038186696950430ffda` → Output `dc01a7c1337ad2dc6573819bdc22834d`.
+**MD5s:** Stock + current output MD5s are pinned in `patch_mtkbt.py`'s `STOCK_MD5` / `OUTPUT_MD5` / `OUTPUT_DEBUG_MD5` constants; the patcher prints them on every run and verifies the output against the pinned values.
 
 ---
 
@@ -288,7 +286,7 @@ Other PDU / event combos fall through to T4 (PDU 0x20 → main, 0x17 → T_chars
 
 `r1=0` matters: response builders dispatch on r1 — `r1==0` writes the spec-correct event payload (reasonCode + event_id + 8-byte Identifier memcpy per AVRCP 1.3 §5.4.2 Table 5.30); `r1!=0` writes a reject-shape frame. We pass `r1=0` everywhere.
 
-**Identifier payload** = `0x0000000000000000` (8 zero bytes from the static `selected_track_id` data block in the trampoline blob). AVRCP 1.6 §5.14.1 names this value "SELECTED" — "the currently playing track, no specific UID". This is also the strict AVRCP 1.3 §6.7.2 reading ("Identifier shall always be set to 0x00…00" for TGs without Browseable Player UID support) and matches what Pixel 4 ships when no Now-Playing queue is in scope. Y1's served SDP record advertises AVRCP 1.3, so this is the spec-correct wire shape for the version we declare.
+**Identifier payload** = `0x0000000000000000` (8 zero bytes from the static `selected_track_id` data block in the trampoline blob). AVRCP 1.6 §5.14.1 names this value "SELECTED" — "the currently playing track, no specific UID". This is also the strict AVRCP 1.3 §6.7.2 reading ("Identifier shall always be set to 0x00…00" for TGs without Browseable Player UID support) and matches what a reference 1.3-as-TG implementation ships when no Now-Playing queue is in scope. Y1's served SDP record advertises AVRCP 1.3, so this is the spec-correct wire shape for the version we declare.
 
 ### T4 — GetElementAttributes (PDU 0x20) and universal non-RegNotif entry
 
@@ -460,7 +458,7 @@ The patcher writes the trampoline blob into LOAD #1's page-alignment padding (40
 
 `g_avrcp_req_event_database` (15 bytes at vaddr `0xd2b5`) lives in pre-existing `.bss` padding — costs zero bytes in LOAD #1's budget because `.bss` is zero-filled at load time and `clear_event_database` re-zeros it on each CT-connection boundary anyway.
 
-**MD5s:** Stock `fd2ce74db9389980b55bccf3d8f15660` → Output `b0faea8544fc2ee737b6f4b206e6e7fb`.
+**MD5s:** Stock + current release/debug MD5s are pinned in `patch_libextavrcp_jni.py`'s `STOCK_MD5` / `OUTPUT_MD5` / `OUTPUT_DEBUG_MD5` constants; the patcher prints them on every run and verifies the output against the pinned values.
 
 **For the full architectural reference** (data-path diagram, response-builder calling conventions, ELF program-header surgery details, code-cave inventory, msg-id taxonomy, Thumb-2 encoding gotchas), see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
@@ -536,7 +534,7 @@ PASSTHROUGH 0x46 PAUSE              (CT → Y1, AV/C wire)
   → PlayerService.pause(0x12, true)         ← discrete pause, idempotent
 ```
 
-Row 200 (`KEY_PLAYCD → MEDIA_PLAY`) is unchanged. CTs that send `PASSTHROUGH 0x44 PLAY` (the older toggle convention used by Samsung TV, Kia, Sonos) continue to route through `PlayControllerReceiver.cond_play_strict` (`if isPlaying: playOrPause() else play(true)` — discrete-with-toggle-fallback), preserving the existing toggle UX for those CTs.
+Row 200 (`KEY_PLAYCD → MEDIA_PLAY`) is unchanged. CTs that send `PASSTHROUGH 0x44 PLAY` (the older toggle convention) continue to route through `PlayControllerReceiver.cond_play_strict` (`if isPlaying: playOrPause() else play(true)` — discrete-with-toggle-fallback), preserving the existing toggle UX for those CTs.
 
 **MD5s:** Stock `366670c4f944150bd657d9377839463a` (identical across firmware 3.0.2 and 3.0.7) → Output `dfd9afd58e94c38fc6f92592674b4ef1`. `KNOWN_AVRCP_KL_MD5S` in the patcher maps each known firmware build to its expected stock MD5; a future build that diverges (e.g. Innioasis ships an updated AVRCP.kl with a different layout) gets a clean MD5-mismatch report rather than silent miscompare.
 

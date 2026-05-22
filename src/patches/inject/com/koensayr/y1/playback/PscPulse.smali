@@ -6,8 +6,8 @@
 
 # Two-phase PSC (PlaybackStatusChanged) pulse on the AVRCP wire to drive
 # CT-side metadata refresh on head units that gate refresh on PSC edges
-# rather than TrackChanged edges (empirical: Bolt 2221 capture, 2026-05-19,
-# Trace #75 in docs/INVESTIGATION.md).
+# rather than TrackChanged edges (see docs/INVESTIGATION.md for the
+# empirical evidence).
 #
 # Phase 1 (immediate, on the caller thread):
 #     setPlayStatus(PAUSED) → file[792]=2 + flushLocked

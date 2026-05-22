@@ -7,7 +7,7 @@
 # app's manifest can't declare the com.android.music.MediaPlaybackService
 # intent-filter (com.innioasis.y1 declares sharedUserId=android.uid.system,
 # constraining its signing key to the OEM platform key we don't have; any
-# AndroidManifest.xml byte change breaks JarVerifier — see Trace #23). MtkBt's
+# AndroidManifest.xml byte change breaks JarVerifier — see docs/INVESTIGATION.md). MtkBt's
 # bindService resolves to Y1Bridge.apk (com.koensayr.y1.bridge) instead, which
 # is a separate self-signed APK and can freely carry the intent-filter.
 #
