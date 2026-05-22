@@ -1892,10 +1892,9 @@ DBG_VALUE_PATCHES_TRACKINFOWRITER = [
     # flushLocked: 4-line summary just before the RandomAccessFile write —
     # captures exactly what got written to y1-track-info this flush
     # (audio_id, mPositionAtStateChange, mLastKnownDuration, mPlayStatus).
-    # Anchor updated post-mmap rewrite: flushLocked switched from
-    # FileOutputStream tmp + rename to RandomAccessFile in-place double-
-    # buffer writes so the libextavrcp_jni.so trampolines can mmap the
-    # same inode for race-free reads.
+    # The flush uses RandomAccessFile in-place double-buffer writes so
+    # libextavrcp_jni.so's trampolines can mmap the same inode for
+    # race-free reads.
     (
         "    invoke-static {v1, v0, v2, v7}, Lcom/koensayr/y1/trackinfo/TrackInfoWriter;->putUtf8Padded([BIILjava/lang/String;)V\n"
         "\n"

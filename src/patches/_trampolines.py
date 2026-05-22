@@ -173,7 +173,7 @@ T8_EVENT_ID_OFF    = 386 + T8_FRAME        # caller-frame event_id, post-SUB-SP
 T9_FRAME              = 840        # 8 args + 24 state + 800 file_buf + 8 timespec
 T9_OFF_ARGS           = 0
 T9_OFF_STATE          = 8
-T9_OFF_FILE           = 32          # state grew 20→24 for sub_now_playing_content + 4-B align
+T9_OFF_FILE           = 32          # 24 B state buf (13 B data + 11 B align padding)
 T9_OFF_FILE_DURATION   = T9_OFF_FILE + 776   # duration_ms (BE u32, T6 reads same)
 T9_OFF_FILE_POS        = T9_OFF_FILE + 780   # pos_at_state_change_ms (BE u32)
 T9_OFF_FILE_STATE_TIME = T9_OFF_FILE + 784   # state_change_time_ms (BE u32)
@@ -708,10 +708,10 @@ def _emit_extended_t2(a: Asm) -> None:
     a.b_w("T4")
 
     a.label("ext2_track_changed")
-    # ---- allocate small frame: stack scratch for state-file write ----
+    # ---- allocate small frame: stack scratch for the .bss state write ----
     # sp+0..7  : track_id (read from y1-track-info)
     # sp+8     : transId (caller-supplied)
-    # sp+9..15 : unused (we lseek+write only bytes 0..8 — see below)
+    # sp+9..15 : unused (write_state_block writes only bytes 0..7 — see below)
     a.subw(13, 13, T2_FRAME)                  # sub.w sp, sp, #16
 
     # Default sp+0..7 to zero (defensive — track-info read might fail).
@@ -792,15 +792,15 @@ def _emit_t5(a: Asm) -> None:
     a.bl_w("jni_get_avrcp_state")             # r0 = struct ptr
     a.mov_lo_lo(4, 0)                         # r4 = struct ptr (preserved)
 
-    # ---- allocate locals: 16 B state buf @ sp+0..15 + 800 B file buf @ sp+16..815 ----
-    a.subw(13, 13, T5_FRAME)                  # sub.w sp, sp, #816
+    # ---- allocate locals: 24 B state buf @ sp+0..23 + 800 B file buf @ sp+24..823 ----
+    a.subw(13, 13, T5_FRAME)                  # sub.w sp, sp, #824
 
     # ---- memset(file_buf, 0, 800) ----
     # Default everything to 0 so a partial read (file shorter than 800 B —
     # e.g. an older writer where file[793] is just a zero pad byte) gives
     # natural_end=0, which means T5 only emits 0x02 + 0x04 (no spurious 0x03
     # emission). Same shape T9 uses for safe defaults.
-    a.add_sp_imm(0, T5_OFF_FILE)              # r0 = sp+16
+    a.add_sp_imm(0, T5_OFF_FILE)              # r0 = sp+24
     a.movs_imm8(1, 0)
     a.movw(2, 800)
     a.blx_imm(PLT_memset)

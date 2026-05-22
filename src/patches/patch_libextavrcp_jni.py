@@ -41,31 +41,27 @@ NATIVE_TRACK_CHANGED_VADDR = 0x3bc0
 NATIVE_PLAY_STATUS_CHANGED_VADDR = 0x3c88
 
 STOCK_MD5         = "fd2ce74db9389980b55bccf3d8f15660"
-# Set to None during the mmap-rework cycle — trampoline blob shape changed
-# (added get_or_init_mmap + read_track_info subroutines, dropped per-site
-# open+read+close inline in T4/T5/T6/T8/T9/extended_T2). Patcher will print
-# the computed MD5 on first flash; replace this with that value once
-# verified against a successful flash + capture cycle.
 OUTPUT_MD5        = "4ebd181976c1dbdd19b6a06112dce484"
 
-# --debug: splices __android_log_print calls into T5/T6/T8/T9 emit sites
-# (tag "Y1T"). Release builds remain byte-identical without the env var.
+# KOENSAYR_DEBUG=1: splices __android_log_print calls (tag "Y1T") into the
+# inbound CMD dispatcher (T1pdu / T2reg markers) and T9's outbound emit
+# sites (T9ps / T9papp / T9pos). Release builds remain byte-identical
+# without the env var.
 DEBUG_LOGGING     = os.environ.get("KOENSAYR_DEBUG", "") == "1"
 OUTPUT_DEBUG_MD5  = "384f0c630feff36d43e62a122764bade"
 EXPECTED_OUTPUT_MD5 = OUTPUT_DEBUG_MD5 if DEBUG_LOGGING else OUTPUT_MD5
 
 # ---------------------------------------------------------------- T1
 
-# T1 — GetCapabilities trampoline at 0x7308 (overwrites testparmnum, 40 of
-# T1 is the testparmnum overlay at 0x7308; reduced to a 4-byte `b.w
-# T1_extended` bridge since the body now lives in the trampoline blob
-# (see `_emit_t1_extended` in `_trampolines.py`). The relocation gives
-# T1's GetCapabilities path room to bl clear_event_database — that call
-# resets the per-event subscription database on every fresh CT
-# connection, fixing ghost-arm leaks across CT disconnect/reconnect.
-# The remaining 36 bytes of the testparmnum slot are zero-padded
-# (never executed; reached only via the b.w bridge above which jumps
-# out to the trampoline blob).
+# T1 stub at 0x7308 overlays the unused `testparmnum` JNI debug method
+# (40 bytes available). The stub is a 4-byte `b.w T1_extended` bridge —
+# T1's GetCapabilities body lives in the trampoline blob (see
+# `_emit_t1_extended` in `_trampolines.py`). Hosting the body in the
+# blob gives T1's GetCapabilities path room to bl clear_event_database
+# (resets the per-event subscription database on every fresh CT
+# connection so ghost-arm subscriptions can't leak across CT
+# disconnect/reconnect). The remaining 36 bytes of the testparmnum
+# slot are zero-padded (never executed).
 def _t1_bridge(t1_extended_vaddr: int) -> bytes:
     a = Asm(0x7308)
     a.labels["target"] = t1_extended_vaddr

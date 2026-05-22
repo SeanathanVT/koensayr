@@ -5,8 +5,8 @@
 
 # Minimal IBTAvrcpMusic + IMediaPlaybackService Binder for MtkBt's
 # BTAvrcpMusicAdapter. The C-side trampoline chain in libextavrcp_jni.so reads
-# y1-track-info directly from disk for every CT-visible PDU; this Binder's
-# role is narrow:
+# y1-track-info via mmap for every CT-visible PDU; this Binder's role is
+# narrow:
 #
 #   - Be reachable via bindService so MtkBt's mMusicService is non-null and
 #     sPlayServiceInterface gets set.
