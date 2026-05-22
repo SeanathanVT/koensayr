@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """
 patch_mtkbt.py — SDP shape + AV/C op_code dispatch + outbound-frame gates
-+ AVDTP-CLOSE/AVRCP transport independence against the stock mtkbt
-Bluetooth daemon. Shapes the served AVRCP TG SDP record to AVRCP 1.3 /
-AVCTP 1.2 (V1+V2), A2DP/AVDTP 1.3 (V3+V4), drops the 1.4 Browse PSM
-advertisement (V7), clears the 1.4 GroupNavigation feature bit (V8),
-inserts a 0x0100 ServiceName attribute (S1), reroutes the daemon to the
-v=14 SDP template (V6), force-emits PASSTHROUGH dispatch for all AV/C
-frames (P1), best-effort aliases AVDTP sig 0x0c → 0x02 (V5), widens the
-RegNotif INTERIM/CHANGED dispatch cmp from 1 to 0x0F (M1), NOPs the
-hardcoded CHANGED-ctype write so non-INTERIM ctype values pass through to
-the wire (M6 — enables JNI-side trampolines to emit AV/C ctypes other
-than 0x0D for the RegNotif response path), removes the outbound-frame
-builder's chip-readiness list-contains check + chip-busy flag SET (M2 +
-M3 — eliminate ambiguity in "did this CHANGED reach the wire?" by
-removing two gates whose practical wire-side effect couldn't be
-distinguished from btlog sampling under sustained traffic), and NOPs the
-`AVRCP_HandleA2DPInfo` info=1 disconnect call so the AVCTP control
-channel survives AVDTP CLOSE/REOPEN cycles per AVRCP V13 §4 transport
-independence (M8).
++ AVDTP-CLOSE/AVRCP transport independence + AVCTP TID-echo cave against
+the stock mtkbt Bluetooth daemon.
+
+Shapes the served AVRCP TG SDP record to AVRCP 1.3 / AVCTP 1.2 (V1+V2),
+A2DP/AVDTP 1.3 (V3+V4), drops the 1.4 Browse PSM advertisement (V7),
+clears the 1.4 GroupNavigation feature bit (V8), inserts a 0x0100
+ServiceName attribute (S1), writes a dormant 0x0102 ProviderName " "
+descriptor for future use (P_PN0), reroutes the daemon to the v=14 SDP
+template (V6), force-emits PASSTHROUGH dispatch for all AV/C frames (P1),
+best-effort aliases AVDTP sig 0x0c → 0x02 (V5), widens the RegNotif
+INTERIM/CHANGED dispatch cmp from 1 to 0x0F (M1), NOPs the hardcoded
+CHANGED-ctype write so non-INTERIM ctype values pass through to the wire
+(M6), removes the outbound-frame builder's chip-readiness list-contains
+checks on both Path A and Path B (M2 + M4) and the Path A chip-busy
+flag SET + GATE CHECK (M3 + M10 — disarms the chan+0xf2 gate that
+otherwise drops outbound CHANGEDs for sparse-re-registration CTs),
+installs a TID-echo cave at 0xf3680 that preserves the per-event TID
+across Path B's outbound IPC packets (M5 — JNI side writes conn[+0x11]
+which mtkbt's stock fcn.0xf0bc:0xf1a8 propagates to chan+0x39), and
+NOPs the `AVRCP_HandleA2DPInfo` info=1 disconnect call so the AVCTP
+control channel survives AVDTP CLOSE/REOPEN cycles per AVRCP V13 §4
+transport independence (M8).
 
 Per-patch byte-level reference (offsets, before/after, rationale, ICS row
 coverage, spec citations): docs/PATCHES.md.

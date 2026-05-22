@@ -243,9 +243,9 @@
 
 
 # Make filesDir traversable for the BT process (uid bluetooth) and pre-create
-# the state files world-rw. y1-track-info gets pre-sized to 2213 B so the
-# trampolines' first mmap covers a valid file. y1-papp-set is pre-created
-# so T_papp 0x14 can open without O_CREAT on CT-initiated PApp Set.
+# the music-app-owned data files world-rw. y1-track-info gets pre-sized to
+# 2213 B so the trampolines' first mmap covers a valid file. y1-papp-set is
+# pre-created so T_papp 0x14 can open without O_CREAT on CT-initiated PApp Set.
 .method private prepareFilesLocked()V
     .locals 4
 

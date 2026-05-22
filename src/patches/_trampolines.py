@@ -68,8 +68,8 @@ UNKNOW_INDICATION = 0x65bc   # original "unknow indication" path
 JNI_GET_AVRCP_STATE = 0x36c0
 
 # T4 stack frame (post-SUB SP by T4_FRAME): args[0..15], state[16..31] (mirrors
-# y1-trampoline-state), file_buf[32..1135] (y1-track-info image; schema in
-# docs/BT-COMPLIANCE.md §4).
+# the .bss trampoline state at G_Y1_TRAMPOLINE_STATE_VADDR), file_buf[32..1135]
+# (y1-track-info image; schema in docs/BT-COMPLIANCE.md §4).
 T4_FRAME           = 1136
 T4_FILE_SIZE       = 1104
 T4_OFF_ARGS        = 0
@@ -151,24 +151,22 @@ T8_EVENT_ID_OFF    = 386 + T8_FRAME        # caller-frame event_id, post-SUB-SP
 # + PLAYER_APPLICATION_SETTING_CHANGED) frame:
 #   sp+0..7    = outgoing-args region (only reg_notievent_player_appsettings_
 #                changed_rsp uses stack args — its 5th + 6th are at sp[0]/sp[4])
-#   sp+8..23   = state buf (16 B; mirrors y1-trampoline-state schema)
+#   sp+8..23   = state buf (16 B; mirrors the .bss trampoline state schema)
 #   sp+24..823 = y1-track-info file buf (800 B)
 #   sp+824..831 = struct timespec for clock_gettime(CLOCK_BOOTTIME)
 #
-# State byte usage (24 B in-memory; on-disk file grows incrementally up to
-# 24 B as historical writers extend it. Short reads zero-fill):
+# State byte usage (13 B in-memory, 4-byte aligned to 16 B in the .bss
+# slot; short reads zero-fill):
 #   [0..7]   last_seen track_id (T5)
 #   [8]      last RegisterNotification transId (T5)
 #   [9]      last_play_status (T9 edge)
 #   [10]     last_battery_status (T9 edge)
 #   [11]     last_repeat_avrcp (T9 papp edge)
 #   [12]     last_shuffle_avrcp (T9 papp edge)
-#   [13..23] padding / legacy (formerly subscription gate bytes; the
-#            trampoline no longer reads or writes these. Per-event
-#            subscription state now lives in the JNI's
-#            g_avrcp_req_event_database global at vaddr 0xd2b5, .bss,
-#            session-scope — see _emit_event_subscribed_subroutine
-#            docstring for the full rationale.)
+#
+# Per-event subscription state lives in the JNI's g_avrcp_req_event_database
+# global at vaddr 0xd2b5 (.bss, session-scope) — see
+# _emit_event_subscribed_subroutine docstring.
 #
 # Single-writer regions (no read-modify-write race): T9 writes [9..12]
 # (4-B block at off 9), T5 writes [0..8] (9-B block at off 0).
@@ -195,18 +193,19 @@ T9_OFF_TIMESPEC_SEC  = T9_OFF_TIMESPEC + 0
 T9_OFF_TIMESPEC_NSEC = T9_OFF_TIMESPEC + 4
 
 # T5 (proactive TRACK_CHANGED + TRACK_REACHED_END / START 3-tuple) frame:
-# 16 B state buf at sp+0..15 + 800 B y1-track-info file buf at sp+16..815.
-# Same shape as T9. T5 reads enough of y1-track-info to see the natural-end
-# flag at offset 793 (= sp + T5_OFF_FILE_NATURAL_END).
-T5_FRAME              = 824                  # +4 vs prior to fit 24-B state (sub_now_playing_content gate at byte 20)
+# 24 B state buf at sp+0..23 (holds the 13-byte trampoline state mirror plus
+# 11 B zero-padding for 4-byte alignment) + 800 B y1-track-info file buf at
+# sp+24..823. Same shape as T9. T5 reads enough of y1-track-info to see the
+# natural-end flag at offset 793 (= sp + T5_OFF_FILE_NATURAL_END).
+T5_FRAME              = 824
 T5_OFF_STATE          = 0
-T5_OFF_FILE           = 24                   # state grew 20→24 for sub_now_playing_content + 4-B align
-T5_OFF_FILE_TID       = T5_OFF_FILE          # 20 - track_id (8 B) at file[0..7]
-T5_OFF_FILE_NATURAL_END = T5_OFF_FILE + 793  # 813 - previous_track_natural_end u8
-                                              #       at file[793] (set by the
-                                              #       music app before the
-                                              #       metachanged broadcast that
-                                              #       lands here).
+T5_OFF_FILE           = 24
+T5_OFF_FILE_TID       = T5_OFF_FILE          # track_id (8 B) at file[0..7]
+T5_OFF_FILE_NATURAL_END = T5_OFF_FILE + 793  # previous_track_natural_end u8
+                                              #   at file[793] (set by the
+                                              #   music app before the
+                                              #   metachanged broadcast that
+                                              #   lands here).
 
 # T_papp (PApp Settings PDUs 0x11-0x16) frame:
 #   sp+0..23  : outgoing args region (24 B; max-of-needs is 5 stack args =
@@ -242,7 +241,7 @@ PAPP_SHUFFLE_OFF      = 0x01
 # defaults.
 # - BATT_STATUS_CHANGED: real data wired through y1-track-info[794]
 #   (battery_status u8). T8 INTERIM reads byte 794; T9 emits CHANGED-on-edge
-#   when file[794] differs from y1-trampoline-state[10] (last_battery_status).
+#   when file[794] differs from .bss state[10] (last_battery_status).
 #   The music app's BatteryReceiver maps Android `Intent.ACTION_BATTERY_CHANGED`
 #   (level + plugged-state) to the AVRCP enum on every bucket transition and
 #   fires `playstatechanged` so T9 picks up the change. Spec values:
@@ -1525,8 +1524,9 @@ def _emit_t_papp(a: Asm) -> None:
     # open(path_papp_set, O_WRONLY|O_TRUNC, 0) — TrackInfoWriter.prepareFiles()
     # in the music app pre-creates it at process start; if it's somehow gone,
     # skip the write but still ACK (the peer's UI shouldn't get stuck because
-    # of a transient writer-side outage). No O_CREAT — same rationale as the
-    # y1-track-info / y1-trampoline-state writes elsewhere in this module.
+    # of a transient writer-side outage). No O_CREAT — same rationale as
+    # other writes in this module: trampoline opens files non-creating; the
+    # music app owns file creation.
     a.adr_w(0, "path_papp_set")
     a.movw(1, O_WRONLY | O_TRUNC)
     a.movs_imm8(2, 0)
@@ -1654,13 +1654,6 @@ def _emit_t_papp(a: Asm) -> None:
     a.b_w("t4_to_epilogue")
 
 
-# _emit_subscription_write was the trampoline-state[N] arm-on-disk helper
-# used before the database-as-gate refactor; per-event subscription state
-# now lives in the JNI's g_avrcp_req_event_database (.bss, session-scope),
-# which makes the lseek+write to disk redundant and eliminates the
-# cross-session stale-gate footgun. Removed 2026-05-19.
-
-
 # g_avrcp_req_event_database is a 15-byte global at vaddr 0xd2b5 (in
 # libextavrcp_jni.so's .bss). Stock JNI's inbound CMD dispatcher calls
 # saveRegEventSeqId(event_id, seq_id) on every inbound RegisterNotification,
@@ -1700,16 +1693,10 @@ G_Y1_TRACK_INFO_MMAP_BASE_VADDR = 0xd2cc
 # 30-byte gap between stock `g_avrcp_auto_browse_connect` (0xd2d5, 1 B) and
 # `g_avrcp_seq_id_database` (0xd2f4, 113 B). Per-byte radare2 cross-reference
 # analysis (full `aaaa` pass with relocs applied) confirms no stock code
-# accesses any byte in 0xd2d6..0xd2f3 — the methodology was validated by
-# correctly identifying the prior corruption site at 0xd2ac, where
-# stock `fcn.000036c0` reads a pointer that our state[8..11] writes
-# clobber. Layout mirrors the legacy on-disk y1-trampoline-state schema so
-# T4 / T5 / T9's T*_OFF_STATE + N offsets work unchanged once the bytes are
-# loaded into the trampoline's stack state_buf:
+# accesses any byte in 0xd2d6..0xd2f3. Layout:
 #
 #   state[0..7]  last_seen track_id (T5 / T4 edge detection)
-#   state[8]     unused (was last RegNotif transId; dead since per-event TIDs
-#                moved to g_avrcp_req_event_database)
+#   state[8]     unused (per-event TIDs live in g_avrcp_req_event_database)
 #   state[9]     last_play_status        (T9 edge detection)
 #   state[10]    last_battery_status     (T9 edge detection)
 #   state[11]    last_repeat_avrcp       (T9 papp edge)
@@ -1719,8 +1706,7 @@ G_Y1_TRACK_INFO_MMAP_BASE_VADDR = 0xd2cc
 # as g_avrcp_req_event_database. After mtkbt restart, the next T5/T9 fire
 # sees state[N] = 0 vs current file value → edge detected → one CHANGED per
 # event emitted (gated by subscription database — harmless if CT hasn't
-# re-subscribed yet because the gate skips). The on-disk y1-trampoline-state
-# file is no longer read or written by the trampolines.
+# re-subscribed yet because the gate skips).
 #
 # 0xd2d6 was verified clean (no stock .text xrefs land within the 13-byte
 # range) via per-byte `axt` queries against the full radare2 analysis. The
@@ -2626,7 +2612,7 @@ def _emit_t9(a: Asm) -> None:
       2. Read y1-track-info into file_buf @ sp+16..815. file[792] = current
          play_status (AVRCP §5.4.1 Tbl 5.26 enum); file[794] = current
          battery_status (AVRCP §5.4.2 Tbl 5.35 enum).
-      3. Read y1-trampoline-state (16 B) into state_buf @ sp+0..15.
+      3. Read .bss trampoline state (13 B) into state_buf @ sp+0..15.
          state[9]  = last_play_status.
          state[10] = last_battery_status.
       4. play_status compare → emit reg_notievent_playback_rsp CHANGED on
@@ -2634,9 +2620,9 @@ def _emit_t9(a: Asm) -> None:
       5. battery_status compare → emit
          reg_notievent_battery_status_changed_rsp CHANGED on edge; update
          state[10].
-      6. If either changed, write 16 B state back.
+      6. If either changed, write the modified state bytes back to .bss.
 
-    Race with T5: both read+modify+write the full 16 B state file. Concurrent
+    Race with T5: both read+modify+write the .bss trampoline state. Concurrent
     firings can lose one update. In practice T5 fires on `metachanged` and
     T9 fires on `playstatechanged` -- they overlap rarely, and the worst
     case is a single missed CHANGED that the next event recovers.
@@ -2691,7 +2677,7 @@ def _emit_t9(a: Asm) -> None:
 
     # r5 was the fd in the read blocks above; both closes ran, so r5 is
     # dead here. Repurpose r5 as `any_change` accumulator: 1 if either
-    # play_status or battery_status edge fired (so the state file gets
+    # play_status or battery_status edge fired (so .bss state bytes get
     # written back). r5 is callee-save so PLT calls below preserve it.
     a.movs_imm8(5, 0)                         # r5 = any_change = 0
 
@@ -2982,13 +2968,10 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     # the chosen slot into the caller's existing file_buf stack region).
     _emit_get_or_init_mmap_subroutine(a)
     _emit_read_track_info_subroutine(a)
-    # .bss-backed trampoline state (replaces y1-trampoline-state disk file).
-    # Same-process, zero-init at libextavrcp_jni.so load; eliminates the
-    # open + read + close (and open + write + close) syscall chains on
-    # every T5 / T9 fire. Cross-mtkbt-restart persistence dropped (was
-    # never load-bearing — first emit after restart sees state[N]=0 vs
-    # current file value, emits one CHANGED per event, subscription gates
-    # filter out events with no current subscriber).
+    # .bss-backed trampoline state. Process-scope, zero-init at
+    # libextavrcp_jni.so load. First emit after process restart sees
+    # state[N]=0 vs current file value, emits one CHANGED per event,
+    # subscription gates filter out events with no current subscriber.
     _emit_read_state_block_subroutine(a)
     _emit_write_state_block_subroutine(a)
 
@@ -2997,10 +2980,6 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     a.label("path_track_info")
     a.asciiz("/data/data/com.innioasis.y1/files/y1-track-info")
     a.align(4)
-    # path_state string dropped post-Tier-1 — trampoline state now lives in
-    # .bss at G_Y1_TRAMPOLINE_STATE_VADDR. The on-disk y1-trampoline-state
-    # file is still pre-created by the music app's prepareFilesLocked but is
-    # never read or written by the trampolines anymore.
     a.label("path_papp_set")
     a.asciiz("/data/data/com.innioasis.y1/files/y1-papp-set")
     a.align(4)

@@ -323,19 +323,19 @@ In LOAD #1 padding. Entered via `b.w T5` from the patched first instruction of `
 | before | `2D E9 F0 47` | `stmdb sp!, {r4, r5, r6, r7, r8, r9, sl, lr}` (function prologue) |
 | after  | `[b.w T5 emitted by patcher]` | branch to T5 trampoline |
 
-T5 obtains the AVRCP per-conn struct via JNI helper at `0x36c0` (the same helper the stock native called), reads `y1-track-info` (active slot, 800 B via the mmap-backed `read_track_info` subroutine) and trampoline state (13 B via `read_state_block` from `.bss`), and on track-id divergence emits a track-edge CHANGED burst:
+T5 obtains the AVRCP per-conn struct via JNI helper at `0x36c0` (the same helper the stock native called), reads `y1-track-info` (active slot, 800 B via the mmap-backed `read_track_info` subroutine) and trampoline state (13 B via `read_state_block` from `.bss`), and on track-id divergence emits a track-edge CHANGED burst in this order:
 
-1. `reg_notievent_now_playing_content_rsp` (PLT `0x330c`, event 0x09) with `r1=0`, `r2=REASON_CHANGED` (`0x0d`). Gated on `database[9] != 0` (subscription armed by T8's INTERIM ack for ev=0x09). Primary metadata-refresh trigger for at least one CT in the test matrix.
-2. `reg_notievent_pos_changed_rsp` (PLT `0x3360`, event 0x05 — Tbl 5.33) with `r1=0`, `r2=REASON_CHANGED`, `r3=REV(file[780..783])` (current position in host order — `duration_ms` on natural end, `0` on NEXT / PREV). Gated on `database[5] != 0`.
-3. `reg_notievent_reached_end_rsp` (PLT `0x3378`, event 0x03 — Tbl 5.31) **only when** `y1-track-info[793]` (the `previous_track_natural_end` flag set by `PlaybackStateBridge.onCompletion`) `== 1` AND `database[3] != 0`. Strict spec semantic: TRACK_REACHED_END fires on natural end, not on a skip.
-4. `reg_notievent_track_changed_rsp` (PLT `0x3384`, event 0x02 — Tbl 5.30) with `r1=0`, `r2=REASON_CHANGED`, `r3=&selected_track_id` (8 zero bytes per §5.14.1 SELECTED). Gated on `database[2] != 0`.
+1. `reg_notievent_pos_changed_rsp` (PLT `0x3360`, event 0x05 — Tbl 5.33) with `r1=0`, `r2=REASON_CHANGED`, `r3=REV(file[780..783])` (current position in host order — `duration_ms` on natural end, `0` on NEXT / PREV). Gated on `database[5] != 0`.
+2. `reg_notievent_track_changed_rsp` (PLT `0x3384`, event 0x02 — Tbl 5.30) with `r1=0`, `r2=REASON_CHANGED` (`0x0d`), `r3=&selected_track_id` (8 zero bytes per §5.14.1 SELECTED). Gated on `database[2] != 0`.
+3. `reg_notievent_now_playing_content_rsp` (PLT `0x330c`, event 0x09) with `r1=0`, `r2=REASON_CHANGED`. Gated on `database[9] != 0` (subscription armed by T8's INTERIM ack for ev=0x09). Some CTs use this as their primary metadata-refresh trigger.
+4. `reg_notievent_reached_end_rsp` (PLT `0x3378`, event 0x03 — Tbl 5.31) **only when** `y1-track-info[793]` (the `previous_track_natural_end` flag set by `PlaybackStateBridge.onCompletion`) `== 1` AND `database[3] != 0`. Strict spec semantic: TRACK_REACHED_END fires on natural end, not on a skip.
 5. `reg_notievent_reached_start_rsp` (PLT `0x336c`, event 0x04 — Tbl 5.32) with `r1=0`, `r2=REASON_CHANGED`. Gated on `database[4] != 0`.
 
 Each emit site is preceded by a `restore_conn_tid` call (passing the matching event_id in r1) so the response builder sees `conn[+0x11] = database[event_id] - 1` — the inbound TID for that event_id. Then writes the new track_id back to state and returns `jboolean(1)`.
 
-Emit ordering: NowPlayingContent → PlaybackPos → TrackChanged. 0x03 / 0x04 are AVRCP 1.3 extensions Y1 supports if the CT subscribes (they're not advertised in the current `T1` event set, so `database[3]` / `database[4]` are typically `0` and these emits become no-ops).
+Emit ordering (PPC → TC → NPCC) matches a reference 1.3-as-TG implementation's observed wire order. Position reset arrives first so the CT zeroes the playhead before processing the identity change; TC arrives second so the CT registers the new track ID before NPCC's now-playing refresh hits. 0x03 / 0x04 are AVRCP 1.3 extensions Y1 supports if the CT subscribes (they're not advertised in the current `T1` event set, so `database[3]` / `database[4]` are typically `0` and these emits become no-ops).
 
-Fired on every `com.android.music.metachanged` broadcast emitted by the music app (after the MtkBt.odex sswitch_1a3 cardinality NOP at 0x3c530 wakes the dispatch path). The remaining 196 bytes of the original native body are unreachable. T5's frame is 824 B (24 state mirror + 800 file_buf — the state-mirror region is preserved for `last_*` change-detection bytes at `[0..12]`; bytes `[13..23]` are unused).
+Fired on every `com.android.music.metachanged` broadcast emitted by the music app (after the MtkBt.odex sswitch_1a3 cardinality NOP at 0x3c530 wakes the dispatch path). The remaining 196 bytes of the original native body are unreachable. T5's frame is 824 B (24 state mirror + 800 file_buf — the state-mirror region holds `last_*` change-detection bytes at `[0..12]` and is zero-padded across `[13..23]`).
 
 ### T_charset — InformDisplayableCharacterSet (PDU 0x17)
 
@@ -420,7 +420,7 @@ T9 reads `y1-track-info` into its file buffer (via `read_track_info` — active 
 
 T9's frame is 840 B (8 outgoing-args at sp+0..7 + 24 state + 800 file_buf + 8 timespec).
 
-If play, battery, or papp changed, the state file is written back at offset 9 (4 B: bytes 9..12) — these are `last_*` change-detection mirrors only and carry no subscription information; the position emit is independent and never dirties state. Fires on every `playstatechanged` broadcast (after the MtkBt.odex sswitch_18a cardinality NOP at 0x3c4fe wakes the dispatch path). Closes AVRCP 1.3 §5.4.2 Table 5.29's CHANGED requirement on event-0x01 subscribers, Table 5.34's on 0x06, Table 5.33's on 0x05, and Table 5.36's on 0x08.
+If play, battery, or papp changed, the modified bytes are written back to .bss state at offset 9 (4 B: bytes 9..12) — these are `last_*` change-detection mirrors only and carry no subscription information; the position emit is independent and never dirties state. Fires on every `playstatechanged` broadcast (after the MtkBt.odex sswitch_18a cardinality NOP at 0x3c4fe wakes the dispatch path). Closes AVRCP 1.3 §5.4.2 Table 5.29's CHANGED requirement on event-0x01 subscribers, Table 5.34's on 0x06, Table 5.33's on 0x05, and Table 5.36's on 0x08.
 
 `playstatechanged` is emitted whenever any of the following occurs:
 - play state edge (the music app's `PlayerService` fires `com.android.music.playstatechanged` directly per android.music standard)
