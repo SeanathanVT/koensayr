@@ -324,43 +324,63 @@ All AVRCP observation, file writes, broadcast emission, and proactive-notificati
                                    │
                                    ▼
                        ┌───────────────────────┐
-                       │ T1 (file 0x7308)      │  Trampoline #1
-                       │ overwrites unused     │  GetCapabilities
-                       │   testparmnum         │
-                       │                       │
-                       │  read PDU at sp+382   │
-                       │  if PDU == 0x10:      │
-                       │     blx 0x35dc        │
-                       │     (get_caps_rsp)    │
-                       │     b.w 0x712a (epi)  │
-                       │  else: b.w 0x72d4     │  → T2
+                       │ T1 stub (file 0x7308) │  Overlays unused
+                       │ 4-byte `b.w           │  testparmnum slot;
+                       │  T1_extended` bridge  │  body lives in blob
+                       │  into the trampoline  │
+                       │  blob                 │
                        └───────────┬───────────┘
                                    │
                                    ▼
+                       ┌───────────────────────────────┐
+                       │ T1_extended (in blob, 0xac54) │  Trampoline #1
+                       │                               │  GetCapabilities
+                       │  read PDU at sp+382           │
+                       │  if PDU == 0x10:              │
+                       │     bl clear_event_database   │
+                       │     blx 0x35dc                │
+                       │       (get_caps_rsp)          │
+                       │     b.w 0x712a (epi)          │
+                       │  else: fall through to        │
+                       │        extended_T2 in blob    │
+                       └───────────┬───────────────────┘
+                                   │
+                                   ▼
                        ┌────────────────────────┐
-                       │ T2 (file 0x72d0)       │  Trampoline #2
-                       │ overwrites             │  RegisterNotif
-                       │   classInitNative      │  (TRACK_CHANGED)
-                       │ (4-byte stub at start  │
-                       │  preserves return-0)   │
-                       │                        │
-                       │  PDU == 0x31 AND       │
-                       │  event_id (sp+386)==2: │
-                       │     blx 0x3384         │
-                       │     (track_changed_rsp │
-                       │      with INTERIM,     │
-                       │      track_id=FFx8)    │
-                       │     b.w 0x712a         │
-                       │  else: b.w 0xac54      │  → T4
+                       │ T2 stub (file 0x72d0)  │  Overlays
+                       │ 8-byte stub:           │  classInitNative;
+                       │  `movs r0, #0; bx lr`  │  preserves
+                       │  + `b.w extended_T2`   │  return-0 contract
                        └───────────┬────────────┘
                                    │
                                    ▼
+                       ┌────────────────────────────────┐
+                       │ extended_T2 (in blob)          │  Trampoline #2
+                       │                                │  RegisterNotif
+                       │  PDU == 0x31:                  │  (PDU 0x31)
+                       │    save_event_seq_id()         │
+                       │    event_id (sp+386) == 2:     │
+                       │       blx 0x3384               │
+                       │       (track_changed_rsp,      │
+                       │        INTERIM, ID=0x00*8)     │
+                       │    else: b.w T8 (other events) │
+                       │  else: b.w T4 (non-RegNotif)   │
+                       └───────────┬────────────────────┘
+                                   │
+                                   ▼
               ┌──────────────────────────────────────────┐
-              │ T4 (vaddr 0xac54)                        │  Trampoline #3
-              │ in EXTENDED LOAD #1 segment              │  GetElementAttributes
-              │ (page-padding bytes between LOAD #1      │
-              │  and LOAD #2; LOAD #1 FileSiz / MemSiz   │
-              │  bumped from 0xac54 to 0xb2c8)           │
+              │ T4 (in blob, vaddr 0xac80)               │  Trampoline #3
+              │  Universal non-RegNotif entry            │  GetElementAttributes
+              │  in LOAD #1 page-padding region          │
+              │  (LOAD #1 FileSiz / MemSiz bumped to     │
+              │   cover the assembled blob — exact end   │
+              │   computed at patch time; printed by     │
+              │   the patcher)                           │
+              │                                          │
+              │  Prologue: conn[+0x11] = sp[+0x171]      │
+              │  (universal §3.3.5 TID echo for          │
+              │   GetEA / GetPlayStatus / Charset /      │
+              │   Battery / PApp / Continuation)         │
               │                                          │
               │  PDU == 0x20:                            │
               │     7 sequential calls to PLT 0x3570     │
