@@ -6,19 +6,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 ### Fixed
-- Bluetooth metadata + playback indicators now work on head units that cycle AVCTP transaction IDs (a common pattern in strict-§4.2.1 implementations). Every AVRCP response Y1 emits — both event notifications and direct query replies (GetElementAttributes, GetPlayStatus, character set / battery acks, PlayerApplicationSetting PDUs) — now echoes the inbound command's transaction ID back to the head unit. Without this echo, strict head units rejected the responses per AVRCP 1.3 §4.2.1 and silently fell back to forwarding only key presses; metadata panes stayed blank and play-state indicators desynchronised.
-- Metadata refresh and playback-indicator updates on a broader range of car head units and speakers. The wire shape Y1 emits now matches a reference AVRCP 1.3 target's: continuous CHANGED notifications across track / play-state / position / repeat-shuffle edges, spec-compliant track-change identifier so head units detect each new track, and clean subscription state on every fresh connection.
-- Metadata no longer freezes on head units that close the audio stream between tracks. The Bluetooth stack now keeps the AVRCP control channel open across audio stream open/close cycles, so the head unit's metadata view stays in sync without re-handshaking after every track skip.
-- Restored the public-browse-group SDP attribute on the AVRCP Target record. Some head units use this attribute as a discriminator for "this peer supports full AVRCP" — without it, those head units fall back to key-press-only mode and never request metadata.
-- Discrete PAUSE on head units with separate Play and Pause buttons now pauses idempotently instead of toggling.
-- Spurious paused-state blips no longer interrupt head-unit playback indicators during track changes.
-- Head-unit play / pause button glyphs now flip reliably after a CT-initiated PAUSE. The music-player Activity's startup sequence was seeding a PLAYING announcement immediately after its own reset PAUSE, which propagated to the AVRCP wire as PAUSED → PLAYING in rapid succession; head units saw the trailing PLAYING and refused to flip. The seed now stays local to the Y1 UI.
+- Metadata + play / pause indicators now work on the broad class of head units and speakers that strictly require their AVRCP transaction IDs be echoed back. Previously, those head units silently rejected every response Y1 sent and fell back to key-press-only mode — metadata panes stayed blank and play-state indicators drifted out of sync.
+- Head units that gate metadata on AVRCP browse capability now enter full metadata mode. Restored the public-browse-group SDP attribute that some head units use as a "this peer supports full AVRCP" discriminator.
+- Metadata no longer freezes on head units that close the audio stream between tracks. The AVRCP control channel now survives audio open/close cycles, so the metadata view stays in sync without re-handshaking after every skip.
+- Broader head-unit coverage for live metadata. Continuous notifications across track, play-state, position, and repeat/shuffle edges; head units detect each new track even when titles repeat; clean subscription state on every fresh connection.
+- Head-unit play / pause glyphs flip reliably after a head-unit-initiated PAUSE. The music-player Activity was seeding a PLAYING announcement immediately after its own startup-reset PAUSE, racing out to the AVRCP wire as PAUSED → PLAYING; head units saw the trailing PLAYING and refused to flip.
+- Discrete PAUSE on head units with separate Play and Pause buttons pauses idempotently instead of toggling.
+- Spurious paused-state blips during track changes no longer interrupt head-unit playback indicators.
 
 ### Changed
-- Track-info exchange between the music app and the Bluetooth stack now uses shared memory instead of an atomic write + rename to disk on every state change. The data file (`/data/data/com.innioasis.y1/files/y1-track-info`) ships a double-buffered schema and the Bluetooth-side reader memory-maps it once. End-user impact: lower-latency metadata responses (single-digit ms vs ~25 ms) under sustained head-unit polling, no torn reads while a track edge is mid-flush.
+- Lower-latency metadata responses under sustained head-unit polling. Track-info exchange between the music app and the Bluetooth stack now uses shared memory (single-digit-ms reads vs ~25 ms before) with no torn reads at track edges.
 
 ### Added
-- `apply.bash --debug` build captures per-emit wire-side markers (`Y1T :` logcat tag) for diagnosing head-unit-specific AVRCP issues. Pair `tools/avrcp-wire-trace.py` (Y1T-tag pretty-printer with timestamps + tag filter) with `tools/btlog-parse.py --avrcp` on the simultaneously-captured `btlog.bin` for the matching mtkbt-internal view.
+- `apply.bash --debug` build emits per-emit wire-side markers (`Y1T :` logcat tag) for diagnosing head-unit-specific AVRCP issues. Pair `tools/avrcp-wire-trace.py` with `tools/btlog-parse.py --avrcp` on a simultaneously-captured `btlog.bin` for the matching mtkbt-internal view.
 
 ## [2.3.0] - 2026-05-16
 ### Added
