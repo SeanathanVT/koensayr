@@ -26,7 +26,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [2.2.0] - 2026-05-16
 ### Changed
-- AVRCP 1.3 §6.7.1 strict subscription gating in the trampoline chain — one CHANGED per CT registration; CT re-registers to receive the next. Matches Pixel-as-TG observed cadence on spec-compliant Controllers.
+- AVRCP 1.3 §5.4.2 strict subscription gating in the trampoline chain — one CHANGED per CT registration; CT re-registers to receive the next. Matches reference-TG observed cadence on spec-compliant Controllers.
 - `mtkbt` outbound-frame drop bypass — every T9 / T5 CHANGED emit reaches the wire under sustained traffic (stock dropped silently under A2DP saturation).
 - TRACK_CHANGED `Identifier` carries the per-track audio ID so strict 1.4+ Controllers invalidate their `GetElementAttributes` cache on every track edge instead of serving stale metadata.
 - Faster perceived metadata refresh — TRACK_CHANGED pre-emits at `setDataSource` and at `playerPrepared` tail (was: `OnPreparedListener`, ~100-500 ms later). PLAYBACK_STATUS_CHANGED fresh-track edge fires ~260 ms earlier.
@@ -55,7 +55,7 @@ AVRCP 1.3 metadata + control pipeline over Bluetooth. A peer Controller now sees
 - Bidirectional Repeat / Shuffle. CT and Y1 UI stay in sync without navigating away and back.
 - Discrete PASSTHROUGH routing (PLAY / PAUSE / STOP / NEXT / PREVIOUS) for CTs that don't tolerate toggle behaviour, plus PLAY-while-playing → pause-toggle for non-spec CTs.
 - A2DP stream survives pauses — AudioFlinger silence-timeout no longer tears down the AVDTP source.
-- Per-subscription notification gating (AVRCP §6.7.1) — one INTERIM + one CHANGED per registration, matching spec-compliant TG semantics.
+- Per-subscription notification gating (AVRCP 1.3 §5.4.2) — one INTERIM + one CHANGED per registration, matching spec-compliant TG semantics.
 - `Y1Bridge` Android service satisfies MtkBt's `bindService(MediaPlaybackService)` and answers synchronous queries from the music-app-owned state file.
 - Spec-compliant `GetElementAttributes` response shape — TG emits exactly the requested attribute IDs in the requested order; unsupported IDs emit with length 0.
 
