@@ -889,15 +889,15 @@ def _emit_t5(a: Asm) -> None:
     a.adr_w(3, "selected_track_id")           # r3 = &0x00*8 (§5.14.1 SELECTED)
     a.blx_imm(PLT_track_changed_rsp)
 
-    # state[16] stays armed across CHANGED — universal §5.4.2 reading.
-    # The strict §6.7.1 single-shot semantic gated CHANGEDs on prompt
-    # CT re-registration after each emit, which several CTs in the test
-    # matrix didn't reliably do (they receive the first CHANGED, fetch
-    # metadata, but don't re-RegisterNotification(ev=02) before the next
-    # track edge — Y1's second-track CHANGED would then be gated out and
-    # the metadata pane stayed frozen on the first track). Keeping the
-    # gate set-once-by-INTERIM is consistent with extended_T2's INTERIM
-    # arm (byte_value=1, no auto-clear); per-event TID echo correctness
+    # database[2] (TRACK_CHANGED subscription gate) stays armed across the
+    # CHANGED emit — universal §5.4.2 reading. The strict §6.7.1 single-
+    # shot semantic gated CHANGEDs on prompt CT re-registration after
+    # each emit, which several CTs didn't reliably do (the first CHANGED
+    # would be received, metadata fetched, but the CT wouldn't re-
+    # RegisterNotification(ev=02) before the next track edge — Y1's
+    # second-track CHANGED would be gated out and the pane stayed frozen
+    # on the first track). Keeping the gate set-once-by-RegNotif-INTERIM
+    # matches extended_T2's INTERIM arm; per-event TID echo correctness
     # is preserved via the database read in _emit_restore_conn_tid_from_db.
 
     a.label("t5_skip_track_changed")
@@ -922,8 +922,8 @@ def _emit_t5(a: Asm) -> None:
     # AVRCP 1.3 §5.4.2 Table 5.31. ICS Table 7 row 25 (Optional). Two gates:
     #   1. previous-track-natural-end flag at file[793] (set by music app
     #      before metachanged broadcast)
-    #   2. sub_track_reached_end bit at state[17] (armed by T8 INTERIM emit;
-    #      stays armed across CHANGEDs — universal §5.4.2 reading).
+    #   2. database[3] (event_subscribed check below — armed by T8's
+    #      INTERIM ack for ev=03; stays armed across CHANGEDs).
     a.ldrb_w(0, 13, T5_OFF_FILE_NATURAL_END)
     a.cmp_imm8(0, 0)
     a.beq("t5_skip_reached_end")
@@ -2464,19 +2464,20 @@ def _emit_t8(a: Asm) -> None:
     a.b_w("t8_done")
 
     # Events 0x09..0x0c — AVRCP 1.4+ event IDs, advertised in T1 because
-    # the working Pixel-4-as-TG reference also advertises + INTERIM-acks
+    # a reference 1.3-as-TG implementation also advertises + INTERIM-acks
     # them on a 1.3-profile SDP record. ACK with INTERIM (empty / zero
     # payload depending on event). The 0x09 NowPlayingContentChanged
-    # subscription is load-bearing: at least one CT in our test matrix
-    # uses NowPlaying CHANGED (not TrackChanged CHANGED) as its primary
-    # metadata-refresh trigger — without state[20] armed, the CT falls
-    # back to ~20 s polling. T5/T9's NowPlaying CHANGED arms fire on
-    # every track/play edge gated on state[20] armed below.
+    # subscription is load-bearing: some CTs use NowPlaying CHANGED (not
+    # TrackChanged CHANGED) as their primary metadata-refresh trigger —
+    # without database[9] armed (= seq_id + 1 from the inbound RegNotif
+    # CMD; written here by save_event_seq_id at extended_T2's entry),
+    # they fall back to ~20 s polling. T5/T9's NowPlaying CHANGED arms
+    # fire on every track/play edge gated on `event_subscribed(0x09)`.
     #
     # For 0x0a / 0x0b / 0x0c we ACK but emit no CHANGED — Y1 has no
     # multi-player / UID-database semantics, so the subscriptions stay
-    # idle (matching Pixel-TG's observed behaviour: INTERIM-ack at
-    # connection time, no CHANGED in steady state).
+    # idle (matching the reference TG's observed behaviour: INTERIM-ack
+    # at connection time, no CHANGED in steady state).
     a.label("t8_check_9")
     a.cmp_imm8(0, 0x09)
     a.bne("t8_check_a")
@@ -2699,9 +2700,9 @@ def _emit_t9(a: Asm) -> None:
         _emit_native_log_u32(a, "log_fmt_t9ps", 3)
     a.blx_imm(PLT_reg_notievent_playback_rsp)
 
-    # state[14] stays armed across CHANGED — see "state[16] stays armed"
-    # comment in T5 TRACK_CHANGED for the rationale (universal §5.4.2
-    # reading; per-event TID echo correctness preserved via database).
+    # database[1] (PLAYBACK_STATUS subscription gate) stays armed across
+    # the CHANGED emit — universal §5.4.2 reading; per-event TID echo
+    # correctness preserved via the database read in restore_conn_tid.
 
     # ---- emit NowPlayingContentChanged CHANGED on play-edge ----
     # Paired with PlaybackStatus + TrackChanged as a 3-frame burst on
@@ -2792,7 +2793,7 @@ def _emit_t9(a: Asm) -> None:
         _emit_native_log_u32(a, "log_fmt_t9papp", 3)
     a.blx_imm(PLT_reg_notievent_player_appsettings_rsp)
 
-    # state[15] stays armed across CHANGED — see T5 TRACK_CHANGED arm.
+    # database[8] (PApp subscription gate) stays armed across CHANGED.
 
     a.label("t9_after_papp_check")
 
@@ -2888,9 +2889,9 @@ def _emit_t9(a: Asm) -> None:
         _emit_native_log_u32(a, "log_fmt_t9pos", 3)
     a.blx_imm(PLT_reg_notievent_pos_changed_rsp)
 
-    # state[13] stays armed across CHANGED — see T5 TRACK_CHANGED arm.
-    # Position CHANGED then fires at the music app's playstatechanged
-    # broadcast rate (~1 Hz when playing).
+    # database[5] (PLAYBACK_POS subscription gate) stays armed across
+    # CHANGED. Position CHANGED then fires at the music app's
+    # playstatechanged broadcast rate (~1 Hz when playing).
 
     a.label("t9_done")
     # ---- epilogue: return jboolean true ----
