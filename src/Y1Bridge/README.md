@@ -40,8 +40,8 @@ declare the `<service>` MtkBt's `bindService` resolves to.
   inode, so the bridge always sees current state without re-opening the
   file. `MediaBridgeService.readTrackInfo` dispatches `file[0]` to the
   active 1104-byte slot before per-field parsing. Callback-register,
-  notification-register, setter, and passthrough codes (1, 2, 3, 4, 6–14,
-  16, 18, 20, 22, 23, 32–37) ack with the success replies that keep
+  notification-register, setter, and passthrough codes (1–4, 6–16, 18,
+  20–23, 32–37) ack with the success replies that keep
   `BTAvrcpMusicAdapter.mRegBit` armed.
 - The proactive wake path is independent of the Binder: the music app
   fires `com.android.music.metachanged` / `playstatechanged`, MtkBt's

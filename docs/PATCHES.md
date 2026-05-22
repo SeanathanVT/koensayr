@@ -492,7 +492,7 @@ Patches `MtkBt.odex` with four byte edits and recomputes the DEX adler32 checksu
 
 **Cardinality NOP — PLAYBACK_STATUS_CHANGED** at file `0x03c4fe`: same idiom for sswitch_18a (event 0x01 case). Without this, `notificationPlayStatusChangedNative` is never invoked. With it, the native fires on every `playstatechanged` broadcast and lands in T9. Pairs with T9.
 
-**MD5s:** Stock `11566bc23001e78de64b5db355238175` → Output `fa2e34b178bee4dfae4a142bc5c1b701`.
+**MD5s:** Stock `11566bc23001e78de64b5db355238175` → Output `00cc642742044286966cbb7b01135ca7`.
 
 ---
 
@@ -680,10 +680,10 @@ Same setters the in-app Settings screen calls when the Y1 user toggles Repeat / 
 
 `OnSharedPreferenceChangeListener` against the `"settings"` SharedPreferences (the same prefs file `SharedPreferencesUtils` reads/writes), registered from `Y1Application.onCreate`. Fires for any write to any key, filters to two:
 
-| Key | Maps to | AVRCP §5.2.4 |
+| Key | Maps to | AVRCP 1.3 Appendix F |
 |---|---|---|
-| `musicRepeatMode` (int 0/1/2) | AVRCP repeat 0x01/0x02/0x03 (OFF/SINGLE/ALL) | Tbl 5.20 |
-| `musicIsShuffle` (boolean) | AVRCP shuffle 0x01/0x02 (OFF/ALL_TRACK) | Tbl 5.21 |
+| `musicRepeatMode` (int 0/1/2) | AVRCP repeat 0x01/0x02/0x03 (OFF/SINGLE/ALL) | attribute 0x02 |
+| `musicIsShuffle` (boolean) | AVRCP shuffle 0x01/0x02 (OFF/ALL_TRACK) | attribute 0x03 |
 
 On match, reads both live values via `SharedPreferencesUtils.INSTANCE.getMusicRepeatMode()` / `getMusicIsShuffle()`, maps to the AVRCP enum bytes, calls `TrackInfoWriter.setPapp(repeat, shuffle)` so the music-app `y1-track-info[795..796]` reflects the new state immediately, and fires `com.android.music.playstatechanged` so MtkBt's BluetoothAvrcpReceiver wakes T9 → AVRCP §5.4.2 Tbl 5.36 `PLAYER_APPLICATION_SETTING_CHANGED` CHANGED via PLT `0x345c`.
 

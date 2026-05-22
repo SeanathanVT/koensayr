@@ -56,7 +56,7 @@ Decoded by `tools/btlog-parse.py`. Roughly:
 | 2 | Sequence ID (2 ASCII chars; alphabetical, increments per frame) |
 | 1 | Severity / category (`0x12` for xlog text, `0xb4` for HCI snoop) |
 | 1 | `0x00` pad |
-| body[0..1]   | Often constant `00 e5` |
+| body[0..2]   | Often constant `00 e5` |
 | body[2..6]   | Timestamp (`u32` LE; monotonic per process lifetime, **separate domains per severity**) |
 | body[6..10]  | Zero/flag bytes |
 | body[10..12] | `u16` LE — typically the format-string base length |

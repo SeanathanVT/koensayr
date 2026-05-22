@@ -21,7 +21,7 @@ The bash entry-point at the root dispatches into source trees under `src/`:
 
 - `apply.bash` — single entry point; flag-driven dispatch into the trees below
 - [`src/patches/`](src/patches/) — byte/smali patchers (`patch_*.py`); see [`src/patches/README.md`](src/patches/README.md) for the per-patcher table and [`docs/PATCHES.md`](docs/PATCHES.md) for byte-level detail
-- [`src/su/`](src/su/) — minimal setuid-root `su` for `--root` (~900-byte direct-syscall ARM-EABI ELF, no libc). Build via `cd src/su && make`
+- [`src/su/`](src/su/) — minimal setuid-root `su` for `--root` (~1-2 KB direct-syscall ARM-EABI ELF, no libc). Build via `cd src/su && make`
 - [`src/Y1Bridge/`](src/Y1Bridge/) — Android service app source for `Y1Bridge.apk` (consumed by `--avrcp`; hosts the Binder declaration MtkBt resolves to). Build via `cd src/Y1Bridge && ./gradlew --stop && ./gradlew assembleDebug`
 - [`src/btlog-dump/`](src/btlog-dump/) — `@btlog` abstract-socket reader (diagnostic; same toolchain as `src/su/`). Build via `cd src/btlog-dump && make`
 - `tools/` — setup, diagnostic, and release helpers

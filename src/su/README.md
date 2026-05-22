@@ -10,7 +10,7 @@ The H1/H2/H3 byte patches in `/sbin/adbd` (formerly `../patches/patch_adbd.py`, 
 
 - **`su.c`** — direct ARM-EABI syscall implementation, no libc. `setgid(0)` → `setuid(0)` → `execve("/system/bin/sh", …)`. Three invocation forms: bare `su` (interactive root shell), `su -c "<cmd>"` (one-off), `su <prog> [args…]` (exec-passthrough).
 - **`start.S`** — ARM Thumb-2 entry stub. Extracts argc/argv/envp from the ELF process-start stack layout, calls `main`, exits via `__NR_exit`.
-- **`Makefile`** — cross-compile via `arm-linux-gnu-gcc`. `-nostdlib -ffreestanding -static -Os -mthumb -mfloat-abi=soft`; ARMv7-A target.
+- **`Makefile`** — cross-compile via `arm-linux-gnu-gcc`. CFLAGS: `-nostdlib -ffreestanding -fno-builtin -fno-stack-protector -Os -Wall -Wextra -std=gnu99 -march=armv7-a -mthumb -mfloat-abi=soft -fno-asynchronous-unwind-tables -fno-unwind-tables`. LDFLAGS: `-nostdlib -static -Wl,--build-id=none -Wl,--gc-sections`. ARMv7-A Thumb-2 EABI target.
 
 ## Build
 
