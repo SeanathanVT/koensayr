@@ -19,6 +19,10 @@ from _thumb2asm import Asm
 DEBUG_LOGGING = os.environ.get("KOENSAYR_DEBUG", "") == "1"
 
 # ---------------------------------------------------------------- constants
+# Blob base address (start of LOAD #1 page-padding region). Named T4_VADDR
+# for historical reasons — T4 used to be the first trampoline in the blob
+# before T1 was relocated in. The current first trampoline at this vaddr is
+# T1_extended.
 T4_VADDR = 0xac54
 
 PLT_open                       = 0x363c
@@ -345,7 +349,9 @@ def _emit_t1_extended(a: Asm) -> None:
 
 
 def _emit_t4(a: Asm) -> None:
-    """T4: GetElementAttributes handler at 0xac54.
+    """T4: universal non-RegNotif entry (GetElementAttributes / GetPlayStatus /
+    Charset / Battery / PApp / Continuation). Lives in-blob immediately after
+    T1_extended; reached via extended_T2's `b.w T4` for any PDU != 0x10/0x31.
 
     Entry conditions:
       - r5 holds JNI instance struct (conn buffer at r5+8)
@@ -458,9 +464,9 @@ def _emit_t4(a: Asm) -> None:
     a.label("t4_skip_track_read")
 
     # ---- copy trampoline state from .bss to sp+T4_OFF_STATE ----
-    # T4 only inspects state[0..7] (track_id) but copies the legacy 13-byte
-    # window for binary-compat with the prior stack layout; bytes 8..12
-    # are dead-or-T9-owned and end up zero-padded in the state buf anyway.
+    # T4 only inspects state[0..7] (track_id) but copies the full 13-byte
+    # state window; bytes 8..12 are T9-owned or unused and end up zero-
+    # padded in the state buf anyway.
     a.add_sp_imm(0, T4_OFF_STATE)
     a.movs_imm8(1, Y1_TRAMPOLINE_STATE_SIZE)
     a.movs_imm8(2, 0)                         # state_offset = 0
@@ -876,7 +882,7 @@ def _emit_t5(a: Asm) -> None:
     # Browseable Player UID extension; strict 1.3 parsers silently drop
     # CHANGED with non-zero Identifier and fall back to polling-only
     # metadata refresh. ICS Table 7 row 24 (Mandatory wire-level).
-    # Gate on database[2] != 0 (Bolt sent RegisterNotification(ev=02) this
+    # Gate on database[2] != 0 (CT sent RegisterNotification(ev=02) this
     # session). Database persistence semantic: zeroed on every
     # libextavrcp_jni.so load (.bss), so ghost-arms from previous sessions
     # don't fire spurious CHANGEDs.
@@ -890,21 +896,22 @@ def _emit_t5(a: Asm) -> None:
     a.blx_imm(PLT_track_changed_rsp)
 
     # database[2] (TRACK_CHANGED subscription gate) stays armed across the
-    # CHANGED emit — universal §5.4.2 reading. The strict §6.7.1 single-
-    # shot semantic gated CHANGEDs on prompt CT re-registration after
-    # each emit, which several CTs didn't reliably do (the first CHANGED
-    # would be received, metadata fetched, but the CT wouldn't re-
-    # RegisterNotification(ev=02) before the next track edge — Y1's
+    # CHANGED emit per AVRCP 1.3 §5.4.2 (CHANGED on every value update
+    # without requiring CT re-registration). A stricter single-shot-per-
+    # registration reading gated CHANGEDs on prompt CT re-RegisterNotif
+    # after each emit, which several CTs didn't reliably do — the first
+    # CHANGED would be received, metadata fetched, but the CT wouldn't
+    # re-RegisterNotification(ev=02) before the next track edge, so Y1's
     # second-track CHANGED would be gated out and the pane stayed frozen
-    # on the first track). Keeping the gate set-once-by-RegNotif-INTERIM
-    # matches extended_T2's INTERIM arm; per-event TID echo correctness
-    # is preserved via the database read in _emit_restore_conn_tid_from_db.
+    # on the first track. Set-once-by-RegNotif-INTERIM matches
+    # extended_T2's INTERIM arm; per-event TID echo correctness is
+    # preserved via the database read in _emit_restore_conn_tid_from_db.
 
     a.label("t5_skip_track_changed")
 
     # ---- emit NowPlayingContentChanged (event 0x09) ----
     # NowPlayingContent CHANGED on every track edge. Gate on database[9] !=
-    # 0 (i.e., Bolt sent RegisterNotification(ev=09) this session). Database
+    # 0 (CT sent RegisterNotification(ev=09) this session). Database
     # is in .bss (wiped on every libextavrcp_jni.so load), so ghost-arms
     # from previous sessions can't trigger spurious CHANGEDs after reboot
     # or process restart. event_subscribed also clobbers r0 (= database
@@ -957,8 +964,8 @@ def _emit_t5(a: Asm) -> None:
     a.str_sp_imm(0, T5_OFF_STATE + 4)
 
     # ---- write updated state[0..7] (track_id) back to .bss ----
-    # state[8] (legacy transId mirror) is dead; T9-owned bytes 9..12 stay
-    # untouched because we narrow the write to 8 bytes.
+    # state[8] is unused; T9-owned bytes 9..12 stay untouched because we
+    # narrow the write to 8 bytes.
     a.add_sp_imm(0, T5_OFF_STATE)
     a.movs_imm8(1, 8)
     a.movs_imm8(2, 0)                         # state_offset = 0
@@ -1656,9 +1663,9 @@ def _emit_t_papp(a: Asm) -> None:
 # Our T-trampolines REPLACE the stock prologues of those notification natives
 # (and dispatch RegisterNotification CMDs via extended_T2 / T8 before stock's
 # inbound handler does its database→conn write), so the conn[+0x11] slot is
-# never populated. Empirically (Bolt 1222 logs): every outbound wire frame
-# emitted by the rsp builders ships with chan+0x39 = 0, breaking the strict
-# §3.3.5 echo and causing CT-side drops.
+# never populated. Empirically: every outbound wire frame emitted by the
+# rsp builders ships with chan+0x39 = 0, breaking the strict §3.3.5 echo
+# and causing CT-side drops.
 #
 # Fix: at every rsp call site in our trampolines, replicate the stock
 # database→conn write immediately before the rsp builder blx.
@@ -1730,8 +1737,8 @@ NR_mmap2 = 192
 def _emit_check_event_subscribed(a: Asm, event_id: int, skip_label: str) -> None:
     """Emit `movs r1, #event_id; bl event_subscribed; beq skip_label`.
 
-    Per-call cost: 8 bytes (2 + 4 + 2). Replaces the legacy state[N] read
-    pattern at every T5/T9 CHANGED emit gate. event_subscribed reads
+    Per-call cost: 8 bytes (2 + 4 + 2). Wraps the subscription-gate check
+    at every T5/T9 CHANGED emit. event_subscribed reads
     g_avrcp_req_event_database[event_id] (.bss, wiped on every .so load)
     and returns Z=1 if it's 0 (no RegisterNotification received this
     session); the beq then skips the CHANGED emit. r0 is clobbered (= the
@@ -1824,10 +1831,10 @@ def _emit_save_event_seq_id_subroutine(a: Asm) -> None:
     (the .bss is zeroed on every libextavrcp_jni.so load). T5/T9 emit
     gates check database[event_id] != 0 before firing CHANGEDs, and
     restore_conn_tid subtracts 1 before writing to conn[+0x11] so the
-    raw seq_id reaches the wire. Without this encoding, state[N]=1
+    raw seq_id reaches the wire. Without this encoding, database[event_id]=1
     ghost-arms from previous-session subscriptions trigger unsolicited
     CHANGEDs in fresh sessions where the CT hasn't actually subscribed,
-    which strict-§3.3.5 CTs (Bolt) reject and disengage over.
+    which strict-§3.3.5 CTs reject and disengage over.
 
     Caller obligation: the `adds r1, #1` inside this subroutine SETS
     flags. If the next instruction in the caller is a conditional
@@ -2118,10 +2125,10 @@ def _emit_read_state_block_subroutine(a: Asm) -> None:
     Post: r0 = nbytes copied. r4..r11 preserved. Clobbers r1, r2, r3, lr.
 
     Loads the state-block absolute vaddr via PC-relative literal + add r,pc,
-    then byte-copies the requested range into dst. Replaces the legacy
-    `open(path_state, O_RDONLY) + read + close` pattern in T4 / T5 / T8 / T9.
-    Per-call savings: 3 syscalls + the FD-management thumb-2 sequence
-    (~30 B per site) — net blob shrinks vs. the prior inline I/O.
+    then byte-copies the requested range into dst. Used by T4 / T5 / T8 /
+    T9 in place of a per-call `open(path_state, O_RDONLY) + read + close`
+    sequence; saves 3 syscalls + the FD-management thumb-2 sequence
+    (~30 B per site) at each call site.
     """
     a.label("read_state_block")
     a.raw(bytes([0xf8, 0xb5]))                  # push {r3, r4-r7, lr}
@@ -2164,8 +2171,9 @@ def _emit_write_state_block_subroutine(a: Asm) -> None:
     Pre: r0 = src, r1 = nbytes (1..13), r2 = state_offset (0..12).
     Post: r0 = nbytes copied. r4..r11 preserved. Clobbers r1, r2, r3, lr.
 
-    Mirror of read_state_block (source / dest reversed). Replaces the legacy
-    `open(path_state, O_WRONLY) + write + close` pattern in T5 / T9.
+    Mirror of read_state_block (source / dest reversed). Used by T5 / T9
+    in place of a per-call `open(path_state, O_WRONLY) + write + close`
+    sequence.
     """
     a.label("write_state_block")
     a.raw(bytes([0xf8, 0xb5]))                  # push {r3, r4-r7, lr}
@@ -2302,9 +2310,9 @@ def _emit_t8(a: Asm) -> None:
 
     # ---- dispatch on event_id (caller's sp+386, post-SUB-SP at T8_EVENT_ID_OFF) ----
     a.ldrb_w(0, 13, T8_EVENT_ID_OFF)          # r0 = event_id
-    # T8reg ev= log dropped 2026-05-19 to free trampoline budget; M5wire
-    # c39= identifies which inbound event the post-fix TID restore writes
-    # for, and Bolt's RegNotif event set is already-known (ev=01..09).
+    # M5wire c39= already identifies which inbound event the TID restore
+    # writes for, and the CT RegNotif event set is already known (ev=01..09);
+    # the redundant T8reg log site was dropped to free trampoline budget.
     a.cmp_imm8(0, 0x01)
     a.bne("t8_check_3")
 
@@ -2975,9 +2983,10 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     a.align(4)
 
     # TRACK_CHANGED Identifier — 8 zero bytes = AVRCP 1.6 §6.7.2 Table 6.32 SELECTED
-    # ("the currently playing track, no specific UID"). Matches what Pixel
-    # 4 ships when there's no Browseable Player Now-Playing queue, and is
-    # strict AVRCP 1.6 §6.7.2 compliant (which Y1's SDP advertises).
+    # ("the currently playing track, no specific UID"). Matches the wire
+    # shape a reference 1.3-as-TG implementation ships when there's no
+    # Browseable Player Now-Playing queue; AVRCP 1.3 §5.4.2 Table 5.30 is
+    # silent on Identifier value, so the 1.6 strict reading applies cleanly.
     a.label("selected_track_id")
     a.raw(bytes([0] * 8))
     a.align(4)
@@ -3014,10 +3023,10 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
         a.asciiz("Y1T")
         a.align(4)
         # Per-event emit markers. No %08x value — the event_id is implicit
-        # in the call site. Used to verify each CHANGED actually fires after
-        # the §6.7.1 loose-clear refactor: if a given event's CHANGED never
-        # appears in a session that should produce one, the state[N] gate
-        # never armed (T8/extended_T2 INTERIM didn't run for that event).
+        # in the call site. Used to verify each CHANGED actually fires: if a
+        # given event's CHANGED never appears in a session that should
+        # produce one, the database[N] gate never armed (T8 / extended_T2
+        # INTERIM didn't run for that event).
         a.label("log_fmt_t9ps")
         a.asciiz("T9ps")
         a.align(4)

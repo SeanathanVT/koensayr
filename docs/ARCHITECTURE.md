@@ -369,7 +369,7 @@ All AVRCP observation, file writes, broadcast emission, and proactive-notificati
                                    │
                                    ▼
               ┌──────────────────────────────────────────┐
-              │ T4 (in blob, vaddr 0xac80)               │  Trampoline #3
+              │ T4 (in blob)                             │  Trampoline #3
               │  Universal non-RegNotif entry            │  GetElementAttributes
               │  in LOAD #1 page-padding region          │
               │  (LOAD #1 FileSiz / MemSiz bumped to     │
@@ -561,7 +561,7 @@ Between LOAD #1's end at file `0xac54` and LOAD #2's start at file `0xbc08`, the
 
 The patcher does this with three PATCHES entries:
 
-1. Write the trampoline blob at file 0xac54. The blob holds T1_extended (relocated from `testparmnum` to host the wider event table), T2_extended, T4, T5, T6, T8, T9, T_charset, T_battery, T_continuation, T_papp, four shared subroutines (`restore_conn_tid` / `save_event_seq_id` / `event_subscribed` / `clear_event_database`), path strings, sentinels, and PApp data tables. Cap is hard-locked at 4020 bytes; the patcher asserts on overflow and prints the exact post-build size on every run. U1 is a separate 4-byte NOP elsewhere in the binary that doesn't grow the blob.
+1. Write the trampoline blob at file 0xac54. The blob holds (in assembly order) T1_extended (relocated from `testparmnum` to host the wider event table), T4, extended_T2, T5, T_charset, T_battery, T_continuation, T6, T_papp, T8, T9, four shared subroutines (`restore_conn_tid` / `save_event_seq_id` / `event_subscribed` / `clear_event_database`), path strings, sentinels, and PApp data tables. Cap is hard-locked at 4020 bytes; the patcher asserts on overflow and prints the exact post-build size on every run. U1 is a separate 4-byte NOP elsewhere in the binary that doesn't grow the blob.
 2. Update LOAD #1 program-header `p_filesz` at file 0x64 from `0xac54` to whatever value the post-build size lands at.
 3. Update LOAD #1 program-header `p_memsz` at file 0x68 to the same value as `p_filesz`.
 
@@ -764,7 +764,7 @@ For all six PDU builders + the event builder: arg2 (reject) follows the same sha
 | R1 | jni 0x6538 (4 B) | `bne.n 0x65bc; movs r5, #9` → `bl.w 0x7308` (redirect into T1 stub) |
 | T1 stub | jni 0x7308 (40 B slot) | Overwrites unused `testparmnum`. 4-byte `b.w T1_extended` bridge; remaining 36 B zero-padded. GetCapabilities body lives in the blob (see T1_extended below). |
 | T2 stub | jni 0x72d0 (8 B) | Overwrites `classInitNative`. 4-byte `return 0` stub at 0x72d0 + 4-byte `b.w extended_T2` at 0x72d4 |
-| T1_extended + extended_T2 + T4 + T5 + T_charset + T_battery + T_continuation + T6 + T_papp + T8 + T9 + shared subroutines | jni 0xac54 | New LOAD #1 extension, dynamically assembled by `_trampolines.py`. Blob size is computed at patch time; current release ~3156 B / debug ~3312 B against a 4020 B hard cap. T4's prologue writes `conn[+0x11] = sp[+0x171]` for §3.3.5 strict TID echo on all non-RegNotif PDUs (RegNotif uses the per-event database via `restore_conn_tid`). Per-trampoline behavior + entry conditions: see [`PATCHES.md`](PATCHES.md) `## patch_libextavrcp_jni.py` (one `###` subsection per trampoline). |
+| T1_extended + T4 + extended_T2 + T5 + T_charset + T_battery + T_continuation + T6 + T_papp + T8 + T9 + shared subroutines | jni 0xac54 | New LOAD #1 extension, dynamically assembled by `_trampolines.py` (order above matches the assembly order). Blob size is computed at patch time; current release ~3156 B / debug ~3312 B against a 4020 B hard cap. T4's prologue writes `conn[+0x11] = sp[+0x171]` for §3.3.5 strict TID echo on all non-RegNotif PDUs (RegNotif uses the per-event database via `restore_conn_tid`). Per-trampoline behavior + entry conditions: see [`PATCHES.md`](PATCHES.md) `## patch_libextavrcp_jni.py` (one `###` subsection per trampoline). |
 | Track-change native stub | jni 0x3bc0 (4 B) | First instruction of `notificationTrackChangedNative` rewritten to `b.w T5`. The Java side (after the MtkBt.odex sswitch_1a3 cardinality NOP) calls this native on every `metachanged` broadcast emitted by the music app; T5 emits CHANGED on the AVRCP wire asynchronously to any inbound query. The remaining 196 B of the original native body are unreachable. |
 | Play-status native stub | jni 0x3c88 (4 B) | First instruction of `notificationPlayStatusChangedNative` rewritten to `b.w T9`. Paired with the MtkBt.odex sswitch_18a cardinality NOP at 0x3c4fe so every `playstatechanged` broadcast emitted by the music app lands in T9. |
 | LOAD#1 filesz | jni 0x64 | Extended to cover the assembled blob. New size computed at patch time. |
@@ -801,7 +801,7 @@ Trampoline edge state (last-emitted track_id, play_status, battery, repeat, shuf
 | `classInitNative` | 0x72d0 | 48 bytes | T2 stub (8 bytes used; remaining 40 zero-filled, unreachable) |
 | `notificationTrackChangedNative` | 0x3bc0 | 200 bytes | T5 entry stub (4 bytes `b.w T5` used; remaining 196 unreachable) |
 | `notificationPlayStatusChangedNative` | 0x3c88 | 200 bytes | T9 entry stub (4 bytes `b.w T9` used; remaining unreachable) |
-| LOAD #1 padding | 0xac54..0xbc07 | 4020 bytes | full trampoline blob: T1_extended (relocated from `testparmnum` to free up the bigger event table), T2_extended, T4, T5, T6, T8, T9, T_charset, T_battery, T_continuation, T_papp + four shared subroutines (`restore_conn_tid`, `save_event_seq_id`, `event_subscribed`, `clear_event_database`). Patcher asserts on overflow; the assert is currently armed at the 4020-byte ceiling. |
+| LOAD #1 padding | 0xac54..0xbc07 | 4020 bytes | full trampoline blob (in assembly order): T1_extended (relocated from `testparmnum` to free up the bigger event table), T4, extended_T2, T5, T_charset, T_battery, T_continuation, T6, T_papp, T8, T9 + four shared subroutines (`restore_conn_tid`, `save_event_seq_id`, `event_subscribed`, `clear_event_database`). Patcher asserts on overflow; the assert is currently armed at the 4020-byte ceiling. |
 | `.bss` (existing) | 0xd2b5..0xd2c3 | 15 bytes | `g_avrcp_req_event_database` — per-event subscription / TID table. Session-scope (cleared on every T1 GetCapabilities via `clear_event_database`). |
 | `getPlayerId` | 0x7300 | 4 bytes | (preserved, returns 0 — not touched) |
 | `getMaxPlayerNum` | 0x7304 | 4 bytes | (preserved, returns 20 — not touched) |

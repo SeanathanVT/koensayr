@@ -211,21 +211,12 @@ BASE_PATCHES = [
         # Region 0x0eb938..0x0eb95b is a 36-byte zero-padded gap between
         # two unrelated SDP data blocks (0xeb928 protocol-id table tail and
         # 0xeb95c next protocol entry). The 4-byte write here is purely
-        # additive into a zero-padded gap; no entry slot currently references
-        # this descriptor, so it sits dormant in the binary until a future
-        # patch can wire it into an SDP record's entry table.
-        #
-        # Originally added in f19ad7c as the data half of a paired patch
-        # (P_PN0 writes the data, P_PN1 was to wire the entry slot pointing
-        # at it). P_PN1 was removed after the dual-bolt-20260520-2154
-        # capture showed that swapping the AVRCP 1.3 TG record's 0x0005
-        # BrowseGroupList slot for 0x0102 ProviderName caused Bolt's CT
-        # to drop into a passthrough-only mode (no RegisterNotification,
-        # no metadata refresh on track skip). The TG record's entry table
-        # is hard-capped at 6 slots and a non-destructive way to add a 7th
-        # wasn't found in deep RE; BrowseGroupList must stay. P_PN0 is kept
-        # so the descriptor bytes are present in the binary for if/when a
-        # safe path to a 7th entry slot is found.
+        # additive into a zero-padded gap; no entry slot currently
+        # references this descriptor, so it sits dormant in the binary.
+        # The AVRCP 1.3 TG record's entry table is hard-capped at 6 slots
+        # (all spec-mandatory or CT-compatibility-critical — BrowseGroupList
+        # must stay); P_PN0 keeps the descriptor bytes present in case a
+        # non-destructive path to a 7th slot is later found.
         "name":   "[P_PN0] write TEXT_STR_8 \" \" SDP descriptor for ProviderName attribute (dormant)",
         "offset": 0x0eb938,
         "before": bytes([0x00, 0x00, 0x00, 0x00]),
@@ -327,9 +318,9 @@ BASE_PATCHES = [
         # The same routine is also called from the info=0 ("a2dp connected
         # with other device") branch at 0xf9b8; we only NOP the info=1 site.
         #
-        # Trigger chain on the wire (dual-bolt-20260520-1543, t=603547):
-        #   1. CT (Bolt) sends AVDTP CLOSE (sig 0x08, SEID 1) on cid 0x42
-        #      — normal stream teardown on track skip.
+        # Trigger chain on the wire:
+        #   1. CT sends AVDTP CLOSE (sig 0x08, SEID 1) on cid 0x42 —
+        #      normal stream teardown on track skip.
         #   2. mtkbt's AVDTP upper layer tears down PSM 0x19 L2CAP channels;
         #      `AvdtpSigMgrConnCallback ... stat:5` fires.
         #   3. mtkbt then calls `AVRCP_HandleA2DPInfo(1, 0)` — wrongly
@@ -559,7 +550,8 @@ BASE_PATCHES = [
     # executing it on inbound. Outbound responses then read the most
     # recent inbound-latched transId at `chan+0x39` via Path B's
     # downstream `add.w r0, r4, 0x14; b.w fcn.0xae5e4 → fcn.0xae418`, and
-    # the wire frame echoes the correct §6.5 / §6.7.2 transId.
+    # the wire frame echoes the correct transId per AVRCP 1.3 §4.2.1
+    # (TID in AVCTP header byte 0 high nibble, AVCTP 1.2 §6.1.1).
     {
         "name":   "[M5] TID echo trampoline call: replace ldrb+strb.w with b.w cave (mtkbt 0x6d186)",
         "offset": 0x6d186,
