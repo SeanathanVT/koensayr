@@ -6,10 +6,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 ### Fixed
+- Broader head-unit coverage for live metadata. Continuous notifications across track, play-state, position, and repeat/shuffle edges; head units detect each new track even when titles repeat; clean subscription state on every fresh connection.
 - Metadata + play / pause indicators now work on the broad class of head units and speakers that strictly require their AVRCP transaction IDs be echoed back. Previously, those head units silently rejected every response Y1 sent and fell back to key-press-only mode — metadata panes stayed blank and play-state indicators drifted out of sync.
 - Head units that gate metadata on AVRCP browse capability now enter full metadata mode. Restored the public-browse-group SDP attribute that some head units use as a "this peer supports full AVRCP" discriminator.
 - Metadata no longer freezes on head units that close the audio stream between tracks. The AVRCP control channel now survives audio open/close cycles, so the metadata view stays in sync without re-handshaking after every skip.
-- Broader head-unit coverage for live metadata. Continuous notifications across track, play-state, position, and repeat/shuffle edges; head units detect each new track even when titles repeat; clean subscription state on every fresh connection.
 - Head-unit play / pause glyphs flip reliably after a head-unit-initiated PAUSE. The music-player Activity was seeding a PLAYING announcement immediately after its own startup-reset PAUSE, racing out to the AVRCP wire as PAUSED → PLAYING; head units saw the trailing PLAYING and refused to flip.
 - Discrete PAUSE on head units with separate Play and Pause buttons pauses idempotently instead of toggling.
 - Spurious paused-state blips during track changes no longer interrupt head-unit playback indicators.
