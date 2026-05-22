@@ -21,7 +21,7 @@ installs a TID-echo cave at 0xf3680 that preserves the per-event TID
 across Path B's outbound IPC packets (M5 — JNI side writes conn[+0x11]
 which mtkbt's stock fcn.0xf0bc:0xf1a8 propagates to chan+0x39), and
 NOPs the `AVRCP_HandleA2DPInfo` info=1 disconnect call so the AVCTP
-control channel survives AVDTP CLOSE/REOPEN cycles per AVRCP V13 §4
+control channel survives AVDTP CLOSE/REOPEN cycles per AVRCP 1.3 §4
 transport independence (M8).
 
 Per-patch byte-level reference (offsets, before/after, rationale, ICS row
@@ -139,7 +139,7 @@ BASE_PATCHES = [
         # (GET_ALL_CAPABILITIES) through the existing sig 0x02 (GET_CAPABILITIES)
         # handler. This is a structural workaround, not a real GET_ALL_CAPABILITIES
         # implementation — the response we emit is the sig 0x02 capability list,
-        # which per AVDTP V13 §8.8 is a wire-compatible SUBSET of the sig 0x0c
+        # which per AVDTP 1.3 §8.8 is a wire-compatible SUBSET of the sig 0x0c
         # response (no extended Service Capabilities). For an SBC-only Source
         # this matches what we'd advertise anyway.
         #
@@ -270,7 +270,7 @@ BASE_PATCHES = [
         #     (T2 / extended_T2 / T8 first-response arms)
         #   ctxt[8] != 0x0F → CHANGED branch → wire ctype 0x0D CHANGED
         #     (T5 / T9 edge emits)
-        # Spec-compliant per AVRCP 1.3 §6.7.1: INTERIM on first response per
+        # Spec-compliant per AVRCP 1.3 §5.4.2: INTERIM on first response per
         # registration, CHANGED on subsequent value updates without
         # re-registration.
         "name":   "[M1] RegNotif INTERIM/CHANGED discriminator: cmp ctxt[8] against 0x0F (mtkbt 0x12230)",
@@ -345,7 +345,7 @@ BASE_PATCHES = [
         #      go silent — CT's UI freezes on stale metadata.
         #
         # AVRCP's transport (AVCTP signaling channel) is independent of
-        # the A2DP audio stream per AVRCP V13 §4. CTs are allowed to
+        # the A2DP audio stream per AVRCP 1.3 §4. CTs are allowed to
         # CLOSE/REOPEN the audio stream without disturbing the AVRCP
         # session. Y1 tearing down AVCTP on every CLOSE is a stack
         # implementation defect; M8 removes the disconnect call so the
@@ -495,7 +495,7 @@ BASE_PATCHES = [
         # reaching the wire at ~6% (vs ~100% for msg=540) when the
         # fcn.0x6ccdc list-contains check at 0x6d110 fails — same gate M2
         # bypasses on Path A. CTs that rely on RegNotif subscriptions
-        # (ev=01/05/08/0A) then retry-storm on the V13 §3.3.5 3 s AVCTP
+        # (ev=01/05/08/0A) then retry-storm on the AVRCP 1.3 §4.2.1 3 s AVCTP
         # retry timer until they disengage AVRCP TG.
         #
         # fcn.0x6d0f0 is byte-for-byte structurally identical to
@@ -531,11 +531,11 @@ BASE_PATCHES = [
     #     every Path B response then encodes as `(0 << 4) + 4 + pkt[8]`,
     #     i.e. transId=0 regardless of the originating command.
     #
-    # CTs that cycle AV/C transIds across the 0-15 range (`AVCTP §6.1`
+    # CTs that cycle AV/C transIds across the 0-15 range (`AVCTP 1.2 §6.1.1`
     # transaction-label rotation, observed via `[AVRCP] transId:%d` btlog
     # entries) see all their RegNotif INTERIM / CHANGED responses with
-    # TID=0, fail the `AVCTP §6.5` command-response TID echo and `§6.7.2`
-    # subscription TID match, and retry-storm on the V13 §3.3.5 3 s AVCTP
+    # TID=0, fail the `AVRCP 1.3 §4.2.1` command-response TID echo and `§6.7.2`
+    # subscription TID match, and retry-storm on the AVRCP 1.3 §4.2.1 3 s AVCTP
     # retry timer until they disengage AVRCP TG. CTs that use transId=0
     # exclusively (no rotation) match accidentally and work pre-M5.
     #

@@ -110,7 +110,7 @@ The advertised set in the GetCapabilities response (T1's `EventsSupported` array
 
 **Subscription gating + §5.4.2 CHANGED cadence:** every inbound `RegisterNotification` CMD writes `g_avrcp_req_event_database[event_id] = seq_id + 1` (vaddr `0xd2b5`, `.bss`, 15 bytes — one byte per event_id). A nonzero byte means "subscribed in this session" *and* "this is the inbound AVCTP TID to echo on the matching CHANGED." T5 / T9 read the table at every CHANGED emit site and skip when the byte is zero. The table is zeroed by `clear_event_database` on every T1 GetCapabilities so a fresh CT-connection cannot inherit stale subscriptions from a previous CT. Within a session, CHANGED emits are continuous — the gate is not cleared after emit — letting Y1's per-edge / per-tick wire cadence match the music app's broadcast rate rather than each CT's individual re-`RegisterNotification` cadence. M1 widens the cmp constant in mtkbt's RegNotif response dispatch (`fcn.0x121d8` at `0x12230`) from 1 to `0x0F`, so the dispatcher routes the JNI's reasonCode byte (IPC offset 8 = `ctxt[8]`) to the matching wire ctype: INTERIM (`0x0F`) for first-response arms, CHANGED (`0x0D`) for edge emits.
 
-**AVCTP §3.3.5 strict TID echo on non-RegNotif PDUs:** every response Y1 emits must echo the inbound CMD's AVCTP transaction label. For RegNotif INTERIM/CHANGED the database mechanism above supplies the TID. For non-RegNotif responses (GetEA / GetPlayStatus / Charset / Battery / PApp / Continuation), T4's prologue writes `conn[+0x11] = sp[+0x171]` (the inbound CMD's seq_id at the empirically-verified pre-`SUB SP` stack offset). All response builders read `conn[+0x11]` and pack it into the outbound AVCTP TL via the wire-emit chain `conn[+0x11] → msg[5] → packet[+0xa] → chan+0x39 → wire byte 0`. The same chain serves GetCapabilities responses via stock JNI's pre-R1 path, which writes `conn[+0x11]` before our hijack takes effect.
+**AVRCP 1.3 §4.2.1 strict TID echo on non-RegNotif PDUs:** every response Y1 emits must echo the inbound CMD's AVCTP transaction label. For RegNotif INTERIM/CHANGED the database mechanism above supplies the TID. For non-RegNotif responses (GetEA / GetPlayStatus / Charset / Battery / PApp / Continuation), T4's prologue writes `conn[+0x11] = sp[+0x171]` (the inbound CMD's seq_id at the empirically-verified pre-`SUB SP` stack offset). All response builders read `conn[+0x11]` and pack it into the outbound AVCTP TL via the wire-emit chain `conn[+0x11] → msg[5] → packet[+0xa] → chan+0x39 → wire byte 0`. The same chain serves GetCapabilities responses via stock JNI's pre-R1 path, which writes `conn[+0x11]` before our hijack takes effect.
 
 | event_id | Name | Spec § | INTERIM | CHANGED on edge |
 |---|---|---|---|---|
@@ -319,11 +319,11 @@ AVRCP 1.3 sits on top of AVCTP, which rides L2CAP. A2DP rides AVDTP, signalled b
 
 ### 9.3 Per-attribute 511-byte hard cap in `…send_get_element_attributes_rsp` — *AVRCP* — SHIPPED
 
-**Spec.** AVRCP 1.3 §5.3.4 places no per-attribute byte cap. TG fragments via §5.5 if the total response exceeds AVCTP MTU.
+**Spec.** AVRCP 1.3 §5.3.1 Table 5.24 places no per-attribute byte cap. TG fragments via §5.5 if the total response exceeds AVCTP MTU.
 
 **OEM TG deviation.** `libextavrcp.so:0x2188` (`btmtk_avrcp_send_get_element_attributes_rsp`) enforces a 511-byte per-attribute hard cap; on overflow it emits `[BT][AVRCP][ERR] too large attr_index:%d` and drops the attribute silently.
 
-**Current state.** The music app's `TrackInfoWriter.putUtf8Padded` caps each string attribute at 240 bytes before it lands in `y1-track-info`. The cap is well below the OEM 511 hard cap so even after multi-byte UTF-8 expansion at the CT side the attribute survives. Truncation is codepoint-safe — if the chosen byte position would split a multi-byte codepoint, the helper walks back to the codepoint boundary so a strict CT never sees a malformed UTF-8 sequence (AVRCP 1.3 §5.3.4 CharacterSet=0x6A). Numeric attributes (TrackNumber 4, TotalNumber 5, PlayingTime 7) are bounded to a 15-byte ASCII slot and unaffected.
+**Current state.** The music app's `TrackInfoWriter.putUtf8Padded` caps each string attribute at 240 bytes before it lands in `y1-track-info`. The cap is well below the OEM 511 hard cap so even after multi-byte UTF-8 expansion at the CT side the attribute survives. Truncation is codepoint-safe — if the chosen byte position would split a multi-byte codepoint, the helper walks back to the codepoint boundary so a strict CT never sees a malformed UTF-8 sequence (AVRCP 1.3 §5.3.1 Table 5.24 CharacterSet=0x6A). Numeric attributes (TrackNumber 4, TotalNumber 5, PlayingTime 7) are bounded to a 15-byte ASCII slot and unaffected.
 
 **Optional follow-up.** Bypass `…send_get_element_attributes_rsp` entirely and build the GetElementAttributes response wire frame directly in the trampoline, using the full §5.5 fragmentation flow from §9.1 above. Removes the 511 cap as a constraint. ~3 days if paired with §9.1 (no value as a standalone change — 240 B already fits everything we'd realistically ship).
 
@@ -422,7 +422,7 @@ GAVDP layer rejects non-SBC SEPs at `GavdpAvdtpEventCallback` per ARCHITECTURE.m
 
 A2DP §3.1: peers consult advertised AVDTP version before GAVDP_ConnectionEstablishment. Per §9.12 AVDTP-1.3 features are Optional at the AVDTP layer; per §9.13 GAVDP 1.3 raises GET_ALL_CAPABILITIES to Mandatory at the Acceptor layer.
 
-Shipped: V3 + V4 + V5. V3/V4 bump A2DP/AVDTP advertisement to 1.3. V5 is a 2-byte TBH jump-table alias routing sig 0x0c through the sig 0x02 GET_CAPABILITIES handler — per AVDTP V13 §8.8, the sig 0x02 response is a wire-compatible subset of the sig 0x0c response, sufficient for an SBC-only Source.
+Shipped: V3 + V4 + V5. V3/V4 bump A2DP/AVDTP advertisement to 1.3. V5 is a 2-byte TBH jump-table alias routing sig 0x0c through the sig 0x02 GET_CAPABILITIES handler — per AVDTP 1.3 §8.8, the sig 0x02 response is a wire-compatible subset of the sig 0x0c response, sufficient for an SBC-only Source.
 
 ### 9.12 AVDTP 1.3 ICS audit — *AVDTP* — VERIFIED, GAP = ADVERTISED VERSION
 
@@ -458,7 +458,7 @@ Table 16 (Message Error Handling): Reporting Capability Error (M) ✓ via `[AVDT
 
 The AVDTP signal dispatcher at file `0xaa72c` (full disassembly in `INVESTIGATION.md`) has a TBH jump table at `0xaa81e` with explicit entries for both sig 0x0c (target `0xab4de`) and sig 0x0d (target `0xab540`). Sig 0x0d DELAYREPORT has substantive handler logic. Sig 0x0c GET_ALL_CAPABILITIES is a stub at `0xab4de` that always falls through to the BAD_LENGTH error path — peer receives an error response, not a General Reject.
 
-V5 patches the jump-table entry for sig 0x0c to redirect to the sig 0x02 GET_CAPABILITIES handler at `0xaa924`. This is a structural workaround, not a real handler — but per AVDTP V13 §8.8 the sig 0x02 response is a wire-compatible subset of the sig 0x0c response, which suffices for an SBC-only Source.
+V5 patches the jump-table entry for sig 0x0c to redirect to the sig 0x02 GET_CAPABILITIES handler at `0xaa924`. This is a structural workaround, not a real handler — but per AVDTP 1.3 §8.8 the sig 0x02 response is a wire-compatible subset of the sig 0x0c response, which suffices for an SBC-only Source.
 
 **Compliance verdict.**
 
@@ -524,7 +524,7 @@ Combining §9.10 (AVCTP) + §9.11 (A2DP) + §9.12 (AVDTP) + §9.13 (GAVDP):
 | AVDTP | 1.0 | 1.3 (paired with A2DP 1.3) | none at AVDTP layer; sig 0x0c is Optional here | V4 (0xeba09 0x00→0x03) | ✓ shipped |
 | GAVDP | not separately advertised; piggybacks AVDTP version | 1.3 (transitive) | Table 5 row 9 (sig 0x0c GET_ALL_CAPABILITIES response, Mandatory at GAVDP-Acceptor) | V5 (TBH jump-table alias at 0xaa834) | ✓ shipped |
 
-**Status: Option C shipped — V3 + V4 + V5 landed together.** V3 + V4 bump A2DP/AVDTP advertisement to 1.3; V5 is the structural workaround for sig 0x0c — it aliases the dispatcher's TBH jump-table entry from the BAD_LENGTH stub at `0xab4de` to the existing GET_CAPABILITIES handler at `0xaa924`. Per AVDTP V13 §8.8 the sig 0x02 response is a wire-compatible **subset** of the sig 0x0c response (no extended Service Capabilities), which is exactly what our SBC-only Source advertises anyway.
+**Status: Option C shipped — V3 + V4 + V5 landed together.** V3 + V4 bump A2DP/AVDTP advertisement to 1.3; V5 is the structural workaround for sig 0x0c — it aliases the dispatcher's TBH jump-table entry from the BAD_LENGTH stub at `0xab4de` to the existing GET_CAPABILITIES handler at `0xaa924`. Per AVDTP 1.3 §8.8 the sig 0x02 response is a wire-compatible **subset** of the sig 0x0c response (no extended Service Capabilities), which is exactly what our SBC-only Source advertises anyway.
 
 **V5 is wire-correct by decoupling.** The AVDTP wire-frame TX site is `fcn.000ae418` (calls `L2CAP_SendData` at file offset `0xae58e`). Byte 1 of the response frame (sig_id) is read at `0xae480` from `txn->[0xe]`, where `txn = *(channel + 0x10)` is the per-channel transaction state populated by the request parser at signal-RX time. The dispatcher (TBH at `0xaa81e`) and per-signal handlers (e.g. `0xaa924`) do not write `txn->[0xe]`. When a peer issues sig 0x0c the parser stores 0x0c in `txn->[0xe]`, V5 routes dispatch through the GET_CAPABILITIES handler, the handler updates state, and `fcn.000ae418` reads `txn->[0xe]=0x0c` and emits a response with `sig_id=0x0c`. Full walk-through in `INVESTIGATION.md`.
 

@@ -482,7 +482,7 @@ def _emit_t4(a: Asm) -> None:
     # track_changed_rsp(conn, 0, REASON_CHANGED, &selected_track_id)
     # r1=0 takes the response builder's spec-correct path; r1!=0 hits the
     # reject-shape path that omits the event payload. r3 → 8 zero bytes per
-    # AVRCP 1.3 §6.7.2: "For TG conforming to AVRCP 1.3, the Identifier
+    # AVRCP 1.6 §6.7.2 Table 6.32: "For TG conforming to AVRCP 1.3, the Identifier
     # shall always be set to 0x00...00." (Non-zero is a 1.4+ Browseable
     # Player UID; strict 1.3 parsers silently drop CHANGED with non-zero
     # Identifier and fall back to polling.) state[0..7] still tracks
@@ -515,7 +515,7 @@ def _emit_t4(a: Asm) -> None:
     # Response builder (libextavrcp.so:0x2188) emits the packed frame when
     # idx+1 == total && total != 0; we accumulate and emit on the final call.
     #
-    # AVRCP 1.3 §6.6.1 Table 6.26: TG returns exactly the requested attribute IDs
+    # AVRCP 1.3 §5.3.1 Table 5.24: TG returns exactly the requested attribute IDs
     # in the requested order (NumAttributes=0 means all). §5.3.4: unsupported
     # attributes emit with length=0. Supported attrs 0x01..0x07 mapped via the
     # inline t4_attr_offset_table; zero-length emit relies on patch_libextavrcp.py E1.
@@ -543,7 +543,7 @@ def _emit_t4(a: Asm) -> None:
     # Save attr_id to r9 (preserved across strlen + rsp calls).
     a.mov_lo_lo(9, 0)
 
-    # If attr_id is 0 or >= 8: unsupported. AVRCP 1.3 §26 Table 26.1 marks 0
+    # If attr_id is 0 or >= 8: unsupported. AVRCP 1.6 §26 Table 26.1 marks 0
     # as "Not Used" and 0x8-0xFFFFFFFF as Reserved.
     a.cmp_imm8(0, 0)
     a.beq("t4_req_unsup")
@@ -643,7 +643,7 @@ def _emit_t4(a: Asm) -> None:
     a.b_w("t4_to_epilogue")
 
     # ---- Inline data: attr_id → file_buf-relative offset lookup ----
-    # Indexed by AVRCP 1.3 §26 Table 26.1 attribute ID (1..7).
+    # Indexed by AVRCP 1.6 §26 Table 26.1 attribute ID (1..7).
     # Index 0 is unused (attr_id 0 = "Not Used"; bounds check above redirects
     # to the unsupported path before reaching this table).
     a.align(4)
@@ -743,7 +743,7 @@ def _emit_extended_t2(a: Asm) -> None:
     # at libextavrcp.so:0x2458 shows `cbnz r5, reject_path` on r1; r1==0 is
     # the spec-correct path that emits reasonCode + event_id + identifier;
     # r1!=0 writes a reject-shape frame that omits the event payload.
-    # r3 → 8 zero bytes per AVRCP 1.3 §6.7.2: 1.3 TGs shall emit
+    # r3 → 8 zero bytes per AVRCP 1.6 §6.7.2 Table 6.32: 1.3 TGs shall emit
     # Identifier=0x00...00 ("selected track"). Non-zero values are a 1.4+
     # Browseable Player UID extension; strict 1.3 parsers reject those.
     a.movs_imm8(1, 0)                         # r1 = 0 (success)
@@ -1335,7 +1335,7 @@ def _emit_t_papp(a: Asm) -> None:
     a.b_w("papp_done")
 
     # ---- 0x13 GetCurrentPlayerApplicationSettingValue ----
-    # Inbound: 1 byte n + n attr_ids. Per AVRCP V13 §6.12, "The TG returns
+    # Inbound: 1 byte n + n attr_ids. Per AVRCP 1.3 §5.2.3, "The TG returns
     # the current value(s) of the player application setting(s) requested by
     # the CT" — strict CTs reject a response whose n field doesn't match the
     # request and close the AVCTP channel. Honor the spec by branching on
@@ -1471,12 +1471,12 @@ def _emit_t_papp(a: Asm) -> None:
     # file write and forwards the change to setMusicRepeatMode /
     # setMusicIsShuffle via SharedPreferencesUtils.
     #
-    # Multi-pair Sets (n > 1) apply only the first pair. AVRCP V13 §5.2.4
+    # Multi-pair Sets (n > 1) apply only the first pair. AVRCP 1.3 §5.2.4
     # lets a TG that supports a subset of attributes acknowledge any Set
     # whose listed attributes it can honor.
     a.label("papp_set")
     # Validate (attr_id, value) against the values we ACTUALLY advertise via
-    # 0x12 ListValues. AVRCP V13 §6.15.2 defines status 0x05 INVALID_PARAMETER
+    # 0x12 ListValues. AVRCP 1.6 §6.15.3 defines status 0x05 INVALID_PARAMETER
     # for "the parameter is invalid" — appropriate when the CT sets a value
     # outside the supported set.
     #   attr_id 0x02 (Repeat): valid values 0x01..0x03 (OFF / SINGLE / ALL)
@@ -1535,7 +1535,7 @@ def _emit_t_papp(a: Asm) -> None:
     a.label("papp_set_skip_write")
 
     # ACK the peer with success. set_player_value_rsp(conn, 0) emits the
-    # spec-correct success reply per AVRCP V13 §5.2.4 / §6.15.2.
+    # spec-correct success reply per AVRCP 1.3 §5.2.4 / §6.15.2.
     a.add_imm_t3(0, 5, 8)                        # r0 = conn
     a.movs_imm8(1, 0)                            # r1 = 0 (success ACK)
     a.blx_imm(PLT_set_player_value_rsp)
@@ -2974,10 +2974,10 @@ def build(debug: bool = False) -> tuple[bytes, dict[str, int]]:
     a.asciiz("/data/data/com.innioasis.y1/files/y1-papp-set")
     a.align(4)
 
-    # TRACK_CHANGED Identifier — 8 zero bytes = AVRCP 1.6 §5.14.1 SELECTED
+    # TRACK_CHANGED Identifier — 8 zero bytes = AVRCP 1.6 §6.7.2 Table 6.32 SELECTED
     # ("the currently playing track, no specific UID"). Matches what Pixel
     # 4 ships when there's no Browseable Player Now-Playing queue, and is
-    # strict-AVRCP-1.3-§6.7.2 compliant (which Y1's SDP advertises).
+    # strict AVRCP 1.6 §6.7.2 compliant (which Y1's SDP advertises).
     a.label("selected_track_id")
     a.raw(bytes([0] * 8))
     a.align(4)
