@@ -11,4 +11,6 @@ Override with `./apply.bash --artifacts-dir <path>` to point at a different dire
 
 The contents of this directory (other than this README) are `.gitignore`d so firmware never lands in commits. **`git clean -dfx` will nuke whatever you stage here** along with other build artifacts — keep a backup of `rom.zip` if you'd rather not re-download.
 
+CI builds use ephemeral directories under `/tmp` via [`tools/ci/build-one.sh`](../tools/ci/build-one.sh), not this folder.
+
 See the top-level [README](../README.md) Quick start for the full flow.

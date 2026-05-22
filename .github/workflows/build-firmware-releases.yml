@@ -1,0 +1,130 @@
+name: Build firmware releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even when upstream digest unchanged
+        type: boolean
+        default: false
+      source_repo:
+        description: Limit to one upstream repo (OWNER/NAME)
+        type: string
+        default: ""
+  schedule:
+    - cron: "0 6 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - "apply.bash"
+      - "src/patches/**"
+      - "src/Y1Bridge/**"
+      - "src/su/**"
+      - ".github/workflows/build-firmware-releases.yml"
+      - ".github/workflows/workflow.md"
+      - "tools/ci/**"
+
+permissions:
+  contents: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.wrap.outputs.matrix }}
+      has_matrix: ${{ steps.wrap.outputs.has_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Discover allowlisted upstream rom.zip releases
+        id: discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x tools/ci/*.sh
+          args=()
+          if [[ -n "${{ github.event.inputs.source_repo }}" ]]; then
+            args+=(--source-repo "${{ github.event.inputs.source_repo }}")
+          fi
+          # Every push to main republishes firmware so patched com.innioasis.y1 APKs stay current.
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            args+=(--force)
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.force }}" == "true" ]]; then
+            args+=(--force)
+          fi
+          ./tools/ci/discover-inputs.sh "${args[@]}" > matrix.json
+          echo "Discovered inputs:"
+          cat matrix.json
+
+      - name: Wrap matrix for strategy
+        id: wrap
+        run: |
+          matrix="$(cat matrix.json)"
+          if [[ "$matrix" == "[]" ]]; then
+            echo "has_matrix=false" >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+          else
+            echo "has_matrix=true" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":${matrix}}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.has_matrix == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            unzip zip curl \
+            android-sdk-libsparse-utils \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi make \
+            openjdk-17-jdk
+
+      - name: Cache tooling
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/mtkclient
+            tools/python-venv
+            tools/android-sdk
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: koensayr-tooling-${{ runner.os }}-${{ hashFiles('tools/setup.sh', 'tools/python-requirements.txt', 'tools/install-android-sdk.sh', 'src/Y1Bridge/**') }}
+          restore-keys: |
+            koensayr-tooling-${{ runner.os }}-
+
+      - name: Build dependencies
+        run: |
+          chmod +x tools/ci/*.sh apply.bash tools/setup.sh tools/install-android-sdk.sh
+          ./tools/setup.sh
+          ( cd src/su && make )
+          ./tools/install-android-sdk.sh
+          # shellcheck disable=SC1091
+          source tools/android-sdk-env.sh
+          ( cd src/Y1Bridge && ./gradlew --stop && ./gradlew assembleDebug )
+
+      - name: Patch and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          args=(
+            --source-repo "${{ matrix.source_repo }}"
+            --source-tag "${{ matrix.source_tag }}"
+            --release-tag "${{ matrix.release_tag }}"
+            --download-url "${{ matrix.download_url }}"
+            --digest "${{ matrix.digest }}"
+            --slug "${{ matrix.slug }}"
+          )
+          if [[ "${{ matrix.force }}" == "true" ]]; then
+            args+=(--force)
+          fi
+          ./tools/ci/build-one.sh "${args[@]}"

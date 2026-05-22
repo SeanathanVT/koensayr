@@ -64,6 +64,10 @@ Override bundled tooling with `--mtkclient-dir <path>` / `--python-venv <path>` 
 | `--remove-apps` | Remove bloatware (`ApplicationGuide`, `BasicDreams`, …). |
 | `--root` | Install `src/su/build/su` at `/system/xbin/su` (mode 06755). Pre-requires `make` in `src/su/`. |
 | `--all` | All of the above. Pre-requires the `src/su/` + `src/Y1Bridge/` builds. |
+| `--no-flash` | Patch only; write `system-*-devel.img` without MTKClient flash (CI / repack). |
+| `--accept-any-firmware` | Skip `KNOWN_FIRMWARES` MD5 checks; use `--firmware-slug` when unknown. Implies `--skip-md5` on patchers. |
+| `--firmware-slug <id>` | Output label when upstream `rom.zip` is not in the manifest (e.g. `y1-stock-rom-2.8.2`). |
+| `--skip-md5` | Bypass stock-binary MD5 gates in `patch_*.py` (diagnostic / CI). |
 
 Run `./apply.bash --help` for full flag detail. Patchers can also be run standalone — see [`src/patches/README.md`](src/patches/README.md).
 
@@ -88,11 +92,11 @@ Known stock firmwares recognised by `KNOWN_FIRMWARES` in the bash. Add a row (sa
 | Version | system.img (raw, extracted) | boot.img (in zip; not consumed since v1.7.0) | rom.zip (input) | Music APK basename in `app/` |
 |---|---|---|---|---|
 | **3.0.2** | `473991dadeb1a8c4d25902dee9ee362b` | `1f7920228a20c01ad274c61c94a8cf36` | `82657db82578a38c6f1877e02407127a` | `com.innioasis.y1_3.0.2.apk` |
-| **3.0.7** | `663baf9f7f2a08caa82e3fba7a9baa28` | `83b946d1799b4f0281ba8e808ed7911b` | `02ae3ae89e20bde0a20e940f73e1ed1b` | `com.innioasis.y1_3.0.7.apk` |
+| **3.0.7** | `663baf9f…` (Innioasis sparse→raw) or `017d62eb…` ([y1-community](https://github.com/y1-community/y1-stock-rom) pre-expanded) | `83b946d1799b4f0281ba8e808ed7911b` | `aa9847088859176c76d8e203970e7032` | `com.innioasis.y1_3.0.7.apk` |
 
 The MediaTek BT stack (`bin/mtkbt`, `lib/libextavrcp*.so`, `lib/libaudio.a2dp.default.so`, `app/MtkBt.odex`) is byte-identical between 3.0.2 and 3.0.7 — every native patch in `--avrcp` / `--bluetooth` applies unchanged. Only the music APK differs (resource-ID shifts + a few additions in `Y1Repository`), and `patch_y1_apk.py`'s smali anchors handle both builds.
 
-Stock sizes: 3.0.2 `rom.zip` 259,502,414 bytes (raw `system.img` inside); 3.0.7 `rom.zip` 189,791,144 bytes (sparse `system.img` inside, auto-de-sparsed via `simg2img`). Both `system.img`s expand to 681,574,400 bytes raw ext4. `boot.img` 4,706,304 bytes on both.
+Stock sizes: 3.0.2 `rom.zip` 259,502,414 bytes (raw `system.img` inside); 3.0.7 `rom.zip` from Innioasis may ship a sparse `system.img` (auto-de-sparsed via `simg2img`), while [y1-community/y1-stock-rom](https://github.com/y1-community/y1-stock-rom) releases use the same `rom.zip` MD5 but a pre-expanded raw `system.img`. Both raw `system.img`s are 681,574,400-byte ext4. `boot.img` 4,706,304 bytes on both.
 
 ## Requirements
 
@@ -104,9 +108,42 @@ Stock sizes: 3.0.2 `rom.zip` 259,502,414 bytes (raw `system.img` inside); 3.0.7 
 - For `--root` only: prebuilt `src/su/build/su` (`cd src/su && make`). Toolchain: `dnf install -y epel-release && dnf install -y gcc-arm-linux-gnu binutils-arm-linux-gnu make` (Rocky/Alma/RHEL/Fedora) or `gcc-arm-linux-gnueabi` on Debian/Ubuntu.
 - For `--avrcp` only: Android SDK + JDK 17+. `tools/install-android-sdk.sh` auto-installs into `tools/android-sdk/` (~1.5 GB, idempotent). Manual instructions: [`docs/ANDROID-SDK.md`](docs/ANDROID-SDK.md).
 
+## Automated releases (GitHub Actions)
+
+Workflow [`.github/workflows/build-firmware-releases.yml`](.github/workflows/build-firmware-releases.yml) builds an allowlisted set of [y1-stock-rom](https://github.com/y1-community/y1-stock-rom) **`rom.zip`** releases only:
+
+- Upstream tags **3.0.2** and **Latest-3.0.7** (published as `{koensayr-version}-koensayr-3.0.2` / `{koensayr-version}-koensayr-3.0.7`)
+
+For each input it downloads upstream `rom.zip`, verifies SHA256 (from the release asset) and MD5 against [`KNOWN_FIRMWARES`](apply.bash), runs `./apply.bash --all --no-flash`, repacks `rom.zip`, and publishes a release on this repo.
+
+**Release tag pattern:** `{koensayr-version}-koensayr-{firmware-version}` (e.g. `2.4.0-koensayr-3.0.7`) for Innioasis Updater compatibility. Release notes start with [`.github/workflows/workflow.md`](.github/workflows/workflow.md). Each release attaches **`rom.zip`** (patched) plus **`build-manifest.json`**.
+
+Download from **this repo’s release tag**, not from [y1-community/y1-stock-rom](https://github.com/y1-community/y1-stock-rom) — upstream `rom.zip` is stock (~238–259 MB). Patched builds are larger (~295–329 MB) and have a different SHA256 (listed in the release notes / manifest).
+
+| Release | Expected `rom.zip` size (approx.) | Patched SHA256 (May 2026 CI) |
+|---------|-----------------------------------|------------------------------|
+| *-koensayr-3.0.2 | 329,015,308 bytes (May 2026 CI) | `2371ac0970c0dbac318077373467859439aa0414caa15e29b90d8e879b8bbd80` |
+| *-koensayr-3.0.7 | 309,073,126 bytes (May 2026 CI) | `2fa3fb7bf9ced11a21d0ce3bd0aec8a521dd3c6f22d9e0be8301b9ca3951dddb` |
+
+**Triggers:** weekly schedule, pushes to `main` that touch patcher/CI paths (always republish both firmware tags; existing releases are deleted and recreated), and manual `workflow_dispatch` (optional `force` / `source_repo` filter).
+
+**Confidence:** Stock **3.0.2** / **3.0.7** OTAs are hardware-verified. See [`docs/SUPPORTED-FIRMWARE-CI.md`](docs/SUPPORTED-FIRMWARE-CI.md).
+
+Local dry-run (no GitHub publish):
+
+```bash
+KOENSAYR_SKIP_PUBLISH=1 ./tools/ci/build-one.sh \
+  --source-repo y1-community/y1-stock-rom --source-tag 3.0.2 \
+  --release-tag 2.4.0-koensayr-3.0.2 \
+  --download-url "$(gh release view 3.0.2 --repo y1-community/y1-stock-rom --json assets -q '.assets[] | select(.name==\"rom.zip\") | .url')" \
+  --digest "$(gh release view 3.0.2 --repo y1-community/y1-stock-rom --json assets -q '.assets[] | select(.name==\"rom.zip\") | .digest' | sed 's/sha256://')" \
+  --slug y1-stock-rom-3.0.2
+```
+
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md) — version history (Keep a Changelog format)
+- [docs/SUPPORTED-FIRMWARE-CI.md](docs/SUPPORTED-FIRMWARE-CI.md) — CI upstream mapping and build expectations
 - [docs/ANDROID-SDK.md](docs/ANDROID-SDK.md) — Android SDK install instructions (only needed for `--avrcp` / Y1Bridge build)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — AVRCP metadata proxy architecture: data-path diagram, trampoline chain, response-builder calling conventions, ELF segment-extension technique, code-cave inventory. Read this first if working on the metadata pipeline.
 - [docs/BT-COMPLIANCE.md](docs/BT-COMPLIANCE.md) — current ICS Table 7 coverage scorecard (every Mandatory + every Optional row)

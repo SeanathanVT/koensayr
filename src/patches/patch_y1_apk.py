@@ -87,11 +87,9 @@ APKTOOL_MD5     = "e28e4b4a413a252617d92b657a33c947"
 # `apt install openjdk-21-jdk` and either `update-alternatives --config java`
 # or invoke /usr/lib/jvm/java-21-openjdk-*/bin/java directly).
 
-# apktool 2.9.3's smali assembler is memory-frugal and runs fine at the
-# default JVM heap on this APK. Newer apktool releases (2.10+) use a parallel
-# ThreadPoolExecutor that may need `-Xmx2g` for large APKs; keeping this
-# slot here so a future bump can wire it up by changing one constant.
-APKTOOL_JVM_FLAGS: list = []
+# apktool 2.9.3's smali assembler is memory-frugal on this APK; CI runners
+# still need headroom when assembling two large DEX trees in one `b` pass.
+APKTOOL_JVM_FLAGS: list = ["-Xmx4g"]
 
 # Stock APK md5s — pulled from /system/app/com.innioasis.y1/ on clean stock
 # devices. The smali pattern matches in this script assume unpatched bytecode,
@@ -149,13 +147,23 @@ def run(cmd, **kw):
     return result
 
 def find_java():
-    for candidate in ["java",
-                      "/usr/lib/jvm/java-21-openjdk-amd64/bin/java",
-                      "/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
-                      "/usr/lib/jvm/default-java/bin/java"]:
-        if shutil.which(candidate):
+    # Prefer JDK 17/21 — apktool 2.9.3's smali assembler is unreliable on Java 22+.
+    env_home = os.environ.get("JAVA_HOME", "").strip()
+    if env_home:
+        env_java = os.path.join(env_home, "bin", "java")
+        if os.path.isfile(env_java):
+            return env_java
+    for candidate in [
+        "/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
+        "/usr/lib/jvm/java-21-openjdk-amd64/bin/java",
+        "/usr/lib/jvm/java-17-openjdk/bin/java",
+        "/usr/lib/jvm/java-21-openjdk/bin/java",
+        "java",
+        "/usr/lib/jvm/default-java/bin/java",
+    ]:
+        if shutil.which(candidate) or os.path.isfile(candidate):
             return candidate
-    sys.exit("ERROR: Java not found. Install Java 11+ and ensure 'java' is on PATH.")
+    sys.exit("ERROR: Java not found. Install Java 11–21 and ensure 'java' is on PATH.")
 
 
 def md5_file(path: str) -> str:
@@ -1057,8 +1065,268 @@ if DEBUG_LOGGING:
 
 
 # ============================================================
-# Patch H: BaseActivity.smali — propagate unhandled discrete media keys
+# Patch H / H': dispatchKeyEvent — AVRCP discrete media key propagation
 # ============================================================
+
+def _patch_h_avrcp_block(key_reg: str, label_prefix: str) -> str:
+    """Smali inserted immediately after getKeyCode move-result (uses v3 scratch)."""
+    L = label_prefix
+    return (
+        f"    const/16 v3, 0x7e\n\n"
+        f"    if-eq {key_reg}, v3, :{L}_avrcp_key\n\n"
+        f"    const/16 v3, 0x7f\n\n"
+        f"    if-eq {key_reg}, v3, :{L}_avrcp_key\n\n"
+        f"    const/16 v3, 0x56\n\n"
+        f"    if-eq {key_reg}, v3, :{L}_avrcp_key\n\n"
+        f"    const/16 v3, 0x57\n\n"
+        f"    if-eq {key_reg}, v3, :{L}_avrcp_key\n\n"
+        f"    const/16 v3, 0x58\n\n"
+        f"    if-eq {key_reg}, v3, :{L}_avrcp_key\n\n"
+        f"    goto :{L}_continue\n\n"
+        f"    :{L}_avrcp_key\n"
+        f"    invoke-virtual {{p1}}, Landroid/view/KeyEvent;->getRepeatCount()I\n\n"
+        f"    move-result v3\n\n"
+        f"    if-eqz v3, :{L}_propagate\n\n"
+        f"    const/4 v0, 0x1\n\n"
+        f"    return v0\n\n"
+        f"    :{L}_propagate\n"
+        f"    const/4 v0, 0x0\n\n"
+        f"    return v0\n\n"
+        f"    :{L}_continue"
+    )
+
+
+def _dispatch_keyevent_anchor(smali_src: str):
+    """Return (insert_pos, key_reg, locals_n) for dispatchKeyEvent getKeyCode, or None."""
+    meth = re.search(
+        r"\.method public dispatchKeyEvent\(Landroid/view/KeyEvent;\)Z.*?(?=\.end method)",
+        smali_src,
+        re.DOTALL,
+    )
+    if not meth:
+        return None
+    body = meth.group(0)
+    anch = re.search(
+        r"invoke-virtual \{p1\}, Landroid/view/KeyEvent;->getKeyCode\(\)I\n+"
+        r"    move-result (v\d+)\n+",
+        body,
+    )
+    if not anch:
+        return None
+    locals_m = re.search(r"    \.locals (\d+)", body)
+    locals_n = int(locals_m.group(1)) if locals_m else 2
+    insert_pos = meth.start() + anch.end()
+    return insert_pos, anch.group(1), locals_n
+
+
+def _apply_dispatch_at_method_entry(smali_src: str, label_prefix: str) -> tuple[str, bool]:
+    """Insert AVRCP key handling at the start of dispatchKeyEvent (Kotlin / unknown layouts)."""
+    hdr = re.search(
+        r"(\.method public dispatchKeyEvent\(Landroid/view/KeyEvent;\)Z\n    \.locals (\d+)\n\n)",
+        smali_src,
+    )
+    if not hdr:
+        return smali_src, False
+
+    insert_at = hdr.end()
+    locals_n = int(hdr.group(2))
+    if locals_n < 4:
+        new_hdr = re.sub(r"\.locals \d+", ".locals 4", hdr.group(1), count=1)
+        smali_src = smali_src[: hdr.start()] + new_hdr + smali_src[hdr.end() :]
+        insert_at = hdr.start() + len(new_hdr)
+
+    meth = re.search(
+        r"\.method public dispatchKeyEvent\(Landroid/view/KeyEvent;\)Z.*?\.end method",
+        smali_src[hdr.start() :],
+        re.DOTALL,
+    )
+    if not meth:
+        return smali_src, False
+
+    kc = re.search(
+        r"invoke-virtual \{p1\}, Landroid/view/KeyEvent;->getKeyCode\(\)I\n\s+move-result (v\d+)",
+        meth.group(0),
+    )
+    key_reg = kc.group(1) if kc else "v2"
+    block = _patch_h_avrcp_block(key_reg, label_prefix) + "\n\n"
+    return smali_src[:insert_at] + block + smali_src[insert_at:], True
+
+
+def _apply_dispatch_keyevent_patch(smali_src: str, label_prefix: str, exact_pairs):
+    """Try known prologue replacements, then anchor insert after getKeyCode."""
+    for old, new in exact_pairs:
+        if old in smali_src:
+            return smali_src.replace(old, new, 1), True
+
+    anchor = _dispatch_keyevent_anchor(smali_src)
+    if anchor:
+        insert_pos, key_reg, locals_n = anchor
+        if locals_n < 4:
+            smali_src = re.sub(
+                r"(\.method public dispatchKeyEvent\(Landroid/view/KeyEvent;\)Z\n"
+                r"    \.locals )\d+",
+                r"\g<1>4",
+                smali_src,
+                count=1,
+            )
+            anchor = _dispatch_keyevent_anchor(smali_src)
+            if anchor:
+                insert_pos, key_reg, locals_n = anchor
+
+        block = _patch_h_avrcp_block(key_reg, label_prefix) + "\n\n"
+        return smali_src[:insert_pos] + block + smali_src[insert_pos:], True
+
+    return _apply_dispatch_at_method_entry(smali_src, label_prefix)
+
+
+def _dispatch_head_with_avrcp_block(key_reg: str, label_prefix: str, suffix: str) -> str:
+    return _patch_h_avrcp_block(key_reg, label_prefix) + "\n\n    " + suffix
+
+
+def _dispatch_after_get_keycode(key_reg: str, label_prefix: str) -> str:
+    """getKeyCode → move-result → AVRCP filter → const/4 v3, 0x3 (Patch H tail)."""
+    return (
+        "    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I\n\n"
+        f"    move-result {key_reg}\n\n"
+        + _patch_h_avrcp_block(key_reg, label_prefix)
+        + "\n\n"
+        "    const/4 v3, 0x3"
+    )
+
+
+# Stock Java (3.0.2 / 3.0.7) — includes .line debug comments.
+_OLD_DISPATCH_JAVA_LINES = """\
+    .line 673
+    :cond_0
+    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I
+
+    move-result v1
+
+    .line 674
+    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I
+
+    move-result v2
+
+    const/4 v3, 0x3"""
+
+# Same logic without .line comments (EN_2.8.x and other Kotlin builds).
+_OLD_DISPATCH_JAVA = """\
+    :cond_0
+    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I
+
+    move-result v1
+
+    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I
+
+    move-result v2
+
+    const/4 v3, 0x3"""
+
+_OLD_DISPATCH_KOTLIN = """\
+    :cond_0
+    invoke-static {p1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNull(Ljava/lang/Object;)V
+
+    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I
+
+    move-result v1
+
+    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I
+
+    move-result v2
+
+    const/4 v3, 0x3"""
+
+
+def _base_activity_dispatch_pairs():
+    prefix = """\
+.method public dispatchKeyEvent(Landroid/view/KeyEvent;)Z
+    .locals 7
+
+    const/4 v0, 0x1
+
+    if-nez p1, :cond_0
+
+    return v0
+
+"""
+    pairs = []
+    for old_mid in (_OLD_DISPATCH_JAVA_LINES, _OLD_DISPATCH_JAVA, _OLD_DISPATCH_KOTLIN):
+        kc = "    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I"
+        if kc not in old_mid:
+            continue
+        head, _, _ = old_mid.partition(kc)
+        pairs.append((
+            prefix + old_mid,
+            prefix + head + _dispatch_after_get_keycode("v2", "patch_h"),
+        ))
+    # Kotlin 2.8.x prologue with a low .locals count — AVRCP block needs v3.
+    prefix_l4 = prefix.replace(".locals 7", ".locals 4", 1)
+    kc = "    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I"
+    head, _, _ = _OLD_DISPATCH_KOTLIN.partition(kc)
+    pairs.append((
+        prefix_l4 + _OLD_DISPATCH_KOTLIN,
+        prefix_l4 + head + _dispatch_after_get_keycode("v2", "patch_h"),
+    ))
+    return pairs
+
+
+def _base_player_dispatch_pairs():
+    pairs = []
+
+    def _player_new_head(line304: str) -> str:
+        return (
+            ".method public dispatchKeyEvent(Landroid/view/KeyEvent;)Z\n"
+            "    .locals 4\n\n"
+            "    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I\n\n"
+            "    move-result v0\n\n"
+            + _patch_h_avrcp_block("v0", "patch_h2")
+            + "\n\n"
+            + line304
+            + "    invoke-static {p1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNull(Ljava/lang/Object;)V\n\n"
+            "    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I\n\n"
+            "    move-result v0"
+        )
+
+    old_with_line = (
+        ".method public dispatchKeyEvent(Landroid/view/KeyEvent;)Z\n"
+        "    .locals 2\n\n"
+        "    .line 304\n"
+        "    invoke-static {p1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNull(Ljava/lang/Object;)V\n\n"
+        "    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I\n\n"
+        "    move-result v0"
+    )
+    pairs.append((old_with_line, _player_new_head("    .line 304\n")))
+    pairs.append((
+        old_with_line.replace("    .line 304\n", ""),
+        _player_new_head(""),
+    ))
+
+    # EN_2.8.x: getKeyCode already appears before getAction (anchor / in-place block).
+    old_kc_first = (
+        ".method public dispatchKeyEvent(Landroid/view/KeyEvent;)Z\n"
+        "    .locals 2\n\n"
+        "    invoke-static {p1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNull(Ljava/lang/Object;)V\n\n"
+        "    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I\n\n"
+        "    move-result v0\n\n"
+        "    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I\n\n"
+        "    move-result v1"
+    )
+    new_kc_first = (
+        ".method public dispatchKeyEvent(Landroid/view/KeyEvent;)Z\n"
+        "    .locals 4\n\n"
+        "    invoke-static {p1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNull(Ljava/lang/Object;)V\n\n"
+        "    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I\n\n"
+        "    move-result v0\n\n"
+        + _patch_h_avrcp_block("v0", "patch_h2")
+        + "\n\n"
+        "    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I\n\n"
+        "    move-result v1"
+    )
+    pairs.append((old_kc_first, new_kc_first))
+    return pairs
+
+
+# Patch H: BaseActivity.smali — propagate unhandled discrete media keys
 # Stock dispatchKeyEvent always returns TRUE, swallowing AVRCP-derived
 # KEYCODE_MEDIA_PLAY/_PAUSE/_STOP/_NEXT/_PREVIOUS that don't match the
 # device's KeyMap. We early-return FALSE on those keycodes for repeatCount==0
@@ -1077,97 +1345,15 @@ if not os.path.exists(base_activity_path):
 with open(base_activity_path, 'r') as f:
     base_activity_src = f.read()
 
-OLD_DISPATCH_HEAD = """\
-.method public dispatchKeyEvent(Landroid/view/KeyEvent;)Z
-    .locals 7
-
-    const/4 v0, 0x1
-
-    if-nez p1, :cond_0
-
-    return v0
-
-    .line 673
-    :cond_0
-    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I
-
-    move-result v1
-
-    .line 674
-    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I
-
-    move-result v2
-
-    const/4 v3, 0x3"""
-
-NEW_DISPATCH_HEAD = """\
-.method public dispatchKeyEvent(Landroid/view/KeyEvent;)Z
-    .locals 7
-
-    const/4 v0, 0x1
-
-    if-nez p1, :cond_0
-
-    return v0
-
-    .line 673
-    :cond_0
-    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I
-
-    move-result v1
-
-    .line 674
-    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I
-
-    move-result v2
-
-    const/16 v3, 0x7e
-
-    if-eq v2, v3, :patch_h_avrcp_key
-
-    const/16 v3, 0x7f
-
-    if-eq v2, v3, :patch_h_avrcp_key
-
-    const/16 v3, 0x56
-
-    if-eq v2, v3, :patch_h_avrcp_key
-
-    const/16 v3, 0x57
-
-    if-eq v2, v3, :patch_h_avrcp_key
-
-    const/16 v3, 0x58
-
-    if-eq v2, v3, :patch_h_avrcp_key
-
-    goto :patch_h_continue
-
-    :patch_h_avrcp_key
-    invoke-virtual {p1}, Landroid/view/KeyEvent;->getRepeatCount()I
-
-    move-result v3
-
-    if-eqz v3, :patch_h_propagate
-
-    return v0
-
-    :patch_h_propagate
-    const/4 v0, 0x0
-
-    return v0
-
-    :patch_h_continue
-    const/4 v3, 0x3"""
-
-if OLD_DISPATCH_HEAD not in base_activity_src:
+base_activity_src, patch_h_ok = _apply_dispatch_keyevent_patch(
+    base_activity_src, "patch_h", _base_activity_dispatch_pairs()
+)
+if not patch_h_ok:
     sys.exit(
         "ERROR: BaseActivity dispatchKeyEvent prologue not found.\n"
         f"  File: {base_activity_path}\n"
         "  The smali shape may differ from supported stock builds."
     )
-
-base_activity_src = base_activity_src.replace(OLD_DISPATCH_HEAD, NEW_DISPATCH_HEAD, 1)
 
 if DEBUG_LOGGING:
     base_activity_src = _inject_log_d(
@@ -1205,82 +1391,15 @@ if not os.path.exists(base_player_activity_path):
 with open(base_player_activity_path, 'r') as f:
     base_player_activity_src = f.read()
 
-OLD_PLAYER_DISPATCH_HEAD = """\
-.method public dispatchKeyEvent(Landroid/view/KeyEvent;)Z
-    .locals 2
-
-    .line 304
-    invoke-static {p1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNull(Ljava/lang/Object;)V
-
-    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I
-
-    move-result v0"""
-
-NEW_PLAYER_DISPATCH_HEAD = """\
-.method public dispatchKeyEvent(Landroid/view/KeyEvent;)Z
-    .locals 2
-
-    invoke-virtual {p1}, Landroid/view/KeyEvent;->getKeyCode()I
-
-    move-result v0
-
-    const/16 v1, 0x7e
-
-    if-eq v0, v1, :patch_h2_avrcp_key
-
-    const/16 v1, 0x7f
-
-    if-eq v0, v1, :patch_h2_avrcp_key
-
-    const/16 v1, 0x56
-
-    if-eq v0, v1, :patch_h2_avrcp_key
-
-    const/16 v1, 0x57
-
-    if-eq v0, v1, :patch_h2_avrcp_key
-
-    const/16 v1, 0x58
-
-    if-eq v0, v1, :patch_h2_avrcp_key
-
-    goto :patch_h2_continue
-
-    :patch_h2_avrcp_key
-    invoke-virtual {p1}, Landroid/view/KeyEvent;->getRepeatCount()I
-
-    move-result v0
-
-    if-eqz v0, :patch_h2_propagate
-
-    const/4 v0, 0x1
-
-    return v0
-
-    :patch_h2_propagate
-    const/4 v0, 0x0
-
-    return v0
-
-    :patch_h2_continue
-
-    .line 304
-    invoke-static {p1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNull(Ljava/lang/Object;)V
-
-    invoke-virtual {p1}, Landroid/view/KeyEvent;->getAction()I
-
-    move-result v0"""
-
-if OLD_PLAYER_DISPATCH_HEAD not in base_player_activity_src:
+base_player_activity_src, patch_h2_ok = _apply_dispatch_keyevent_patch(
+    base_player_activity_src, "patch_h2", _base_player_dispatch_pairs()
+)
+if not patch_h2_ok:
     sys.exit(
         "ERROR: BasePlayerActivity dispatchKeyEvent prologue not found.\n"
         f"  File: {base_player_activity_path}\n"
         "  The smali shape may differ from supported stock builds."
     )
-
-base_player_activity_src = base_player_activity_src.replace(
-    OLD_PLAYER_DISPATCH_HEAD, NEW_PLAYER_DISPATCH_HEAD, 1
-)
 
 if DEBUG_LOGGING:
     base_player_activity_src = _inject_log_d(
@@ -2721,9 +2840,9 @@ for rel in PATCHED_SMALI_FILES:
 # -- Step 4: Reassemble DEX with apktool -------------------------------------
 print(f"\n[4/4] Reassembling smali -> DEX (this takes ~30 seconds)...")
 # apktool builds smali->DEX first, then tries aapt for resources.
-# Since we decoded with --no-res, the aapt step fails -- but the DEX
-# is already built by that point. We ignore the exit code intentionally.
-subprocess.run(
+# Since we decoded with --no-res, the aapt step often fails after DEX
+# assembly; we still require classes.dex + classes2.dex under build/apk/.
+build_result = subprocess.run(
     [java, *APKTOOL_JVM_FLAGS, "-jar", APKTOOL_JAR, "b", UNPACKED_DIR],
     capture_output=True, text=True
 )
@@ -2731,7 +2850,16 @@ subprocess.run(
 dex1 = os.path.join(UNPACKED_DIR, "build", "apk", "classes.dex")
 dex2 = os.path.join(UNPACKED_DIR, "build", "apk", "classes2.dex")
 if not os.path.exists(dex1) or not os.path.exists(dex2):
-    sys.exit("ERROR: DEX assembly failed -- classes.dex or classes2.dex not produced.")
+    tail = (build_result.stdout or "") + (build_result.stderr or "")
+    if tail.strip():
+        print("  apktool build output (last 4000 chars):")
+        print(tail[-4000:])
+    sys.exit(
+        "ERROR: DEX assembly failed -- classes.dex or classes2.dex not produced.\n"
+        f"  apktool exit code: {build_result.returncode}\n"
+        "  Typical causes: smali register overflow (.locals too small), method-id\n"
+        "  cap, or Java 22+ smali-assembler quirks — use JDK 17/21."
+    )
 print(f"  classes.dex  {os.path.getsize(dex1):,} bytes")
 print(f"  classes2.dex {os.path.getsize(dex2):,} bytes")
 

@@ -38,6 +38,16 @@ FLAGS:
   --all          --adb + --avrcp + --bluetooth + --music-apk + --remove-apps
                  + --root. Pre-requires the src/su/ and src/Y1Bridge/ builds
                  (see those flags above).
+  --no-flash     Patch and write system-*-devel.img only; skip MTKClient flash.
+                 Used by CI / headless repack flows.
+  --accept-any-firmware
+                 Do not require rom.zip / system.img MD5s in KNOWN_FIRMWARES.
+                 Use --firmware-slug when rom.zip is not in the manifest.
+  --firmware-slug <id>
+                 Label for output naming (e.g. y1-stock-rom-3.0.2). Required
+                 with --accept-any-firmware when rom.zip MD5 is unknown.
+  --skip-md5     Pass --skip-md5 to every patch_*.py (diagnostic / CI).
+                 Implied by --accept-any-firmware.
   --debug        Build patches with KOENSAYR_DEBUG=1. Build-time switch
                  (reflash to toggle); zero runtime overhead when omitted.
                  Surfaces three independent log streams:
@@ -71,6 +81,10 @@ FLAG_DEBUG=false
 FLAG_MUSIC_APK=false
 FLAG_REMOVE_APPS=false
 FLAG_ROOT=false
+FLAG_NO_FLASH=false
+FLAG_ACCEPT_ANY_FIRMWARE=false
+FLAG_SKIP_MD5=false
+FIRMWARE_SLUG=""
 PATH_ARTIFACTS=""
 
 # Tooling overrides — explicit flag wins over the tools/ default.
@@ -143,6 +157,24 @@ while [[ $# -gt 0 ]]; do
       FLAG_REMOVE_APPS=true
       FLAG_ROOT=true
       FLAG_ANY_SPECIFIED=true
+      shift
+      ;;
+    --no-flash)
+      FLAG_NO_FLASH=true
+      shift
+      ;;
+    --accept-any-firmware)
+      FLAG_ACCEPT_ANY_FIRMWARE=true
+      FLAG_SKIP_MD5=true
+      shift
+      ;;
+    --firmware-slug)
+      require_value --firmware-slug "${2:-}"
+      FIRMWARE_SLUG="$2"
+      shift 2
+      ;;
+    --skip-md5)
+      FLAG_SKIP_MD5=true
       shift
       ;;
     --mtkclient-dir)
@@ -232,11 +264,12 @@ VERSION_FIRMWARE=""
 FILENAME_SYSTEM_IMAGE_TARGET=""
 FILENAME_MUSIC_APK=""
 
-# Schema: <version>|<system.img md5>|<boot.img md5>|<rom.zip md5>|<music APK filename>.
-# system.img md5 is for the RAW image (post-simg2img if input was sparse).
+# Schema: <version>|<system.img md5(s)>|<boot.img md5>|<rom.zip md5>|<music APK filename>.
+# system.img md5 is the RAW ext4 image used for patching (post-simg2img if the zip held a sparse image).
+# Multiple system.img md5s are comma-separated (Innioasis sparse→raw vs y1-community pre-expanded zips).
 KNOWN_FIRMWARES=(
   "3.0.2|473991dadeb1a8c4d25902dee9ee362b|1f7920228a20c01ad274c61c94a8cf36|82657db82578a38c6f1877e02407127a|com.innioasis.y1_3.0.2.apk"
-  "3.0.7|663baf9f7f2a08caa82e3fba7a9baa28|83b946d1799b4f0281ba8e808ed7911b|02ae3ae89e20bde0a20e940f73e1ed1b|com.innioasis.y1_3.0.7.apk"
+  "3.0.7|663baf9f7f2a08caa82e3fba7a9baa28,017d62eb54fe18a4dc0b70d380763c22|83b946d1799b4f0281ba8e808ed7911b|aa9847088859176c76d8e203970e7032|com.innioasis.y1_3.0.7.apk"
 )
 
 # (PATH_SCRIPT_DIR set earlier — used by the --artifacts-dir staging fallback.)
@@ -295,6 +328,20 @@ md5_of() {
   fi
 }
 
+# md5_matches_field <manifest-field-value> <actual-md5>
+# Manifest fields may list comma-separated alternates (e.g. Innioasis vs y1-community system.img).
+md5_matches_field() {
+  local field_value="$1" actual="$2" alt
+  IFS=',' read -ra alts <<< "$field_value"
+  for alt in "${alts[@]}"; do
+    alt="${alt//[[:space:]]/}"
+    if [[ "$actual" == "$alt" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # resolve_version <kind: system|boot|rom> <md5> — echos matching firmware
 # version on stdout, returns 1 on no match.
 resolve_version() {
@@ -308,7 +355,7 @@ resolve_version() {
   local row parts
   for row in "${KNOWN_FIRMWARES[@]}"; do
     IFS='|' read -ra parts <<< "$row"
-    if [[ "${parts[$idx]}" == "$md5" ]]; then
+    if md5_matches_field "${parts[$idx]}" "$md5"; then
       echo "${parts[0]}"
       return 0
     fi
@@ -352,6 +399,32 @@ print_known_firmwares() {
   done
 }
 
+# discover_music_apk — sets FILENAME_MUSIC_APK from /system/app/com.innioasis.y1*.apk
+discover_music_apk() {
+  local matches=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && matches+=("$line")
+  done < <(sudo find "${PATH_MOUNT}/app" -maxdepth 1 -name 'com.innioasis.y1*.apk' -printf '%f\n' 2>/dev/null | sort -u)
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    echo "ERROR: no com.innioasis.y1*.apk under ${PATH_MOUNT}/app" >&2
+    exit 1
+  fi
+  if [[ ${#matches[@]} -gt 1 ]]; then
+    echo "ERROR: multiple music APKs under ${PATH_MOUNT}/app:" >&2
+    printf '  %s\n' "${matches[@]}" >&2
+    exit 1
+  fi
+  FILENAME_MUSIC_APK="${matches[0]}"
+  echo "  → music APK: app/${FILENAME_MUSIC_APK}"
+}
+
+# patcher_extra_args — extra CLI flags for patch_*.py invocations.
+patcher_extra_args() {
+  if [[ "$FLAG_SKIP_MD5" == true ]]; then
+    echo --skip-md5
+  fi
+}
+
 # Stages stock binaries extracted from the mount + their patched output before write-back.
 PATH_TMP_STAGE="$(mktemp -d -t koensayr.XXXXXX)"
 MOUNTED=false
@@ -381,7 +454,8 @@ patch_in_place_bytes() {
   sudo cp "${PATH_MOUNT}/${mount_rel}" "${stock}"
   sudo chown "$(id -u):$(id -g)" "${stock}"
 
-  if ! python3 "${PATH_SCRIPT_DIR}/src/patches/${script}" "${stock}" --output "${patched}"; then
+  # shellcheck disable=SC2046
+  if ! python3 "${PATH_SCRIPT_DIR}/src/patches/${script}" "${stock}" --output "${patched}" $(patcher_extra_args); then
     echo "ERROR: ${script} failed for ${mount_rel}" >&2
     exit 1
   fi
@@ -403,28 +477,38 @@ patch_in_place_y1_apk() {
   local mount_rel="$1"
   local stage_dir="${PATH_TMP_STAGE}/$(basename "${mount_rel}")"
   local stock="${stage_dir}/stock.apk"
-  local patched="${PATH_SCRIPT_DIR}/src/patches/output/com.innioasis.y1_${VERSION_FIRMWARE}-patched.apk"
+  local out_dir="${PATH_SCRIPT_DIR}/src/patches/output"
+  local patched=""
 
-  mkdir -p "${stage_dir}"
+  mkdir -p "${stage_dir}" "${out_dir}"
   echo "  ${mount_rel}: extract → patch_y1_apk.py → write-back"
   sudo cp "${PATH_MOUNT}/${mount_rel}" "${stock}"
   sudo chown "$(id -u):$(id -g)" "${stock}"
 
   local pyvenv
   pyvenv="$(resolve_python_venv)"
+  # shellcheck disable=SC2046
   if ! (
     cd "${PATH_SCRIPT_DIR}/src/patches"
     [[ -n "$pyvenv" ]] && source "${pyvenv}/bin/activate"
-    python3 patch_y1_apk.py "${stock}"
+    python3 patch_y1_apk.py "${stock}" $(patcher_extra_args)
   ); then
     echo "ERROR: patch_y1_apk.py failed for ${mount_rel}" >&2
     exit 1
   fi
 
-  if [[ ! -f "${patched}" ]]; then
-    echo "ERROR: patch_y1_apk.py did not produce ${patched}" >&2
+  shopt -s nullglob
+  local produced=( "${out_dir}"/com.innioasis.y1_*-patched.apk )
+  shopt -u nullglob
+  if (( ${#produced[@]} == 0 )); then
+    echo "ERROR: patch_y1_apk.py did not produce com.innioasis.y1_*-patched.apk in ${out_dir}" >&2
     exit 1
   fi
+  if (( ${#produced[@]} > 1 )); then
+    echo "ERROR: multiple patched APKs in ${out_dir}: ${produced[*]}" >&2
+    exit 1
+  fi
+  patched="${produced[0]}"
 
   if ! sudo cp "${patched}" "${PATH_MOUNT}/${mount_rel}"; then
     echo "ERROR: failed to write patched ${mount_rel} back to mount" >&2
@@ -452,11 +536,23 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Validating rom.zip against stock-firmware manifest.."
 rom_md5=$(md5_of "$rom")
+MANIFEST_MATCH=false
 if VERSION_FIRMWARE=$(resolve_version rom "$rom_md5"); then
+  MANIFEST_MATCH=true
+  echo "Validating rom.zip against stock-firmware manifest.."
   echo "  → matched v${VERSION_FIRMWARE} (rom.zip md5 ${rom_md5})"
+elif [[ "$FLAG_ACCEPT_ANY_FIRMWARE" == true ]]; then
+  echo "Accepting rom.zip without manifest match (md5 ${rom_md5}).."
+  if [[ -z "$FIRMWARE_SLUG" ]]; then
+    echo "ERROR: rom.zip is not in KNOWN_FIRMWARES; pass --firmware-slug <id> with --accept-any-firmware." >&2
+    print_known_firmwares
+    exit 1
+  fi
+  VERSION_FIRMWARE="$FIRMWARE_SLUG"
+  echo "  → firmware slug ${VERSION_FIRMWARE}"
 else
+  echo "Validating rom.zip against stock-firmware manifest.."
   echo "ERROR: ${FILENAME_ROM_ZIP} md5 ${rom_md5} does not match any known stock firmware." >&2
   print_known_firmwares
   exit 1
@@ -501,17 +597,27 @@ EOF
     PATH_SYSTEM_IMG="$raw"
   fi
 
-  sys_md5=$(md5_of "$PATH_SYSTEM_IMG")
-  expected=$(firmware_field "$VERSION_FIRMWARE" system_md5)
-  if [[ "$sys_md5" != "$expected" ]]; then
-    echo "ERROR: extracted system.img md5 ${sys_md5} differs from manifest v${VERSION_FIRMWARE} (expected ${expected})" >&2
-    exit 1
+  if [[ "$MANIFEST_MATCH" == true && "$FLAG_ACCEPT_ANY_FIRMWARE" == false ]]; then
+    sys_md5=$(md5_of "$PATH_SYSTEM_IMG")
+    expected=$(firmware_field "$VERSION_FIRMWARE" system_md5)
+    if ! md5_matches_field "$expected" "$sys_md5"; then
+      echo "ERROR: extracted system.img md5 ${sys_md5} differs from manifest v${VERSION_FIRMWARE} (expected one of: ${expected})" >&2
+      exit 1
+    fi
+  elif [[ "$MANIFEST_MATCH" == true && "$FLAG_ACCEPT_ANY_FIRMWARE" == true ]]; then
+    sys_md5=$(md5_of "$PATH_SYSTEM_IMG")
+    expected=$(firmware_field "$VERSION_FIRMWARE" system_md5)
+    if ! md5_matches_field "$expected" "$sys_md5"; then
+      echo "  WARNING: extracted system.img md5 ${sys_md5} differs from manifest v${VERSION_FIRMWARE} (expected one of: ${expected}); continuing (--accept-any-firmware)"
+    fi
   fi
 fi
 
 # Version-dependent filenames now resolvable.
 FILENAME_SYSTEM_IMAGE_TARGET="system-${VERSION_FIRMWARE}-devel.img"
-FILENAME_MUSIC_APK="$(firmware_field "$VERSION_FIRMWARE" music_apk)"
+if [[ "$MANIFEST_MATCH" == true ]]; then
+  FILENAME_MUSIC_APK="$(firmware_field "$VERSION_FIRMWARE" music_apk)"
+fi
 
 # Copy validated raw system.img into the artifacts dir (mtkclient flashes from there) and mount.
 if [[ "$FLAG_ANY_SYSTEM_PATCH" == true ]]; then
@@ -535,6 +641,10 @@ if [[ "$FLAG_ANY_SYSTEM_PATCH" == true ]]; then
     exit 1
   fi
   MOUNTED=true
+
+  if [[ -z "${FILENAME_MUSIC_APK:-}" ]]; then
+    discover_music_apk
+  fi
 fi
 
 # Enable ADB debugging
@@ -656,34 +766,43 @@ if [[ "$FLAG_ANY_SYSTEM_PATCH" == true ]]; then
   fi
   MOUNTED=false
 
-  # Flash via MTKClient. Resolve location + venv only now (no point checking
-  # earlier — the patch steps don't need MTKClient).
-  PATH_MTKCLIENT="$(resolve_mtkclient_dir)"
-  PATH_VENV_MTKCLIENT="${PATH_MTKCLIENT}/venv"
-  if [[ ! -f "${PATH_VENV_MTKCLIENT}/bin/activate" ]]; then
-    echo "ERROR: MTKClient venv missing at ${PATH_VENV_MTKCLIENT}." >&2
-    echo "       Run: ${PATH_SCRIPT_DIR}/tools/setup.sh" >&2
-    exit 1
-  fi
+  devel_img="${PATH_ARTIFACTS}/${FILENAME_SYSTEM_IMAGE_TARGET}"
+  if [[ "$FLAG_NO_FLASH" == true ]]; then
+    echo "Skipping MTKClient flash (--no-flash). Patched image: ${devel_img}"
+    if [[ "$FLAG_AVRCP" == true ]]; then
+      echo "After flashing this build on-device, clear MultiDex cache once:"
+      echo "  adb shell rm -rf /data/data/com.innioasis.y1/code_cache/secondary-dexes/"
+    fi
+  else
+    # Flash via MTKClient. Resolve location + venv only now (no point checking
+    # earlier — the patch steps don't need MTKClient).
+    PATH_MTKCLIENT="$(resolve_mtkclient_dir)"
+    PATH_VENV_MTKCLIENT="${PATH_MTKCLIENT}/venv"
+    if [[ ! -f "${PATH_VENV_MTKCLIENT}/bin/activate" ]]; then
+      echo "ERROR: MTKClient venv missing at ${PATH_VENV_MTKCLIENT}." >&2
+      echo "       Run: ${PATH_SCRIPT_DIR}/tools/setup.sh" >&2
+      exit 1
+    fi
 
-  echo "Activating MTKClient venv (${PATH_MTKCLIENT}).."
-  if ! cd "${PATH_MTKCLIENT}"; then
-    echo "ERROR: failed to cd into ${PATH_MTKCLIENT} (permissions?)" >&2
-    exit 1
-  fi
-  # shellcheck disable=SC1091
-  source "${PATH_VENV_MTKCLIENT}/bin/activate"
+    echo "Activating MTKClient venv (${PATH_MTKCLIENT}).."
+    if ! cd "${PATH_MTKCLIENT}"; then
+      echo "ERROR: failed to cd into ${PATH_MTKCLIENT} (permissions?)" >&2
+      exit 1
+    fi
+    # shellcheck disable=SC1091
+    source "${PATH_VENV_MTKCLIENT}/bin/activate"
 
-  echo "Writing new system.img (plug in and reset Y1 device using button near USB-C port).."
-  if ! python3 "${PATH_MTKCLIENT}/mtk.py" w android "${PATH_ARTIFACTS}/${FILENAME_SYSTEM_IMAGE_TARGET}"; then
-    echo "ERROR: mtk.py write failed — device left in an unknown state." >&2
-    echo "       Common causes: device not in BROM mode, USB cable not data-capable," >&2
-    echo "                      mtkclient version mismatch, missing libusb." >&2
+    echo "Writing new system.img (plug in and reset Y1 device using button near USB-C port).."
+    if ! python3 "${PATH_MTKCLIENT}/mtk.py" w android "${devel_img}"; then
+      echo "ERROR: mtk.py write failed — device left in an unknown state." >&2
+      echo "       Common causes: device not in BROM mode, USB cable not data-capable," >&2
+      echo "                      mtkclient version mismatch, missing libusb." >&2
+      deactivate
+      exit 1
+    fi
+
+    echo "Deactivating MTKClient venv.."
     deactivate
-    exit 1
   fi
-
-  echo "Deactivating MTKClient venv.."
-  deactivate
 fi
 echo "Done!"
